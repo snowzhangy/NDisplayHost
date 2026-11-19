@@ -1,0 +1,377 @@
+// WVD backend-A control protocol, version 1.
+//
+// Reliable QUIC streams carry length-prefixed `Envelope` messages. Media and cursor positions use
+// fixed little-endian QUIC datagrams instead (see WIRE.md), because they are on the hot path.
+//
+// Normative companion: proto/WIRE.md (flows, framing, datagram layouts, pairing, generations).
+// Every implementation (Windows C++/msquic, macOS host, visionOS client) must match both files.
+
+syntax = "proto3";
+
+package wvd.v1;
+
+option optimize_for = LITE_RUNTIME;
+
+message Envelope {
+  oneof msg {
+    Hello hello = 1;                         // client -> host, first message on the control stream
+    HelloAck hello_ack = 2;                  // host -> client
+    PairingChallenge pairing_challenge = 3;  // host -> client: compare the SAS on both screens
+    PairingConfirm pairing_confirm = 4;      // client -> host: the user confirmed (or rejected)
+    PairingResult pairing_result = 5;        // host -> client
+    SessionState session_state = 6;          // host -> client: input armed state, lock state
+    MonitorLayout monitor_layout = 7;        // host -> client
+    CodecConfig codec_config = 8;            // host -> client, before any media of that codec_gen
+    CursorShape cursor_shape = 9;            // host -> client
+    RecoveryRequest recovery_request = 10;   // client -> host
+    Ping ping = 11;                          // client -> host
+    Pong pong = 12;                          // host -> client
+    ClientStats client_stats = 13;           // client -> host
+    HostStats host_stats = 14;               // host -> client
+    Visibility visibility = 15;              // client -> host
+    ThermalUpdate thermal = 16;              // client -> host
+    InputEvents input = 17;                  // client -> host, input stream only
+    InputRelease input_release = 18;         // client -> host
+    StreamSettings stream_settings = 19;     // client -> host
+    Goodbye goodbye = 20;                    // either direction
+    InputStreamOpen input_stream_open = 21;  // client -> host, first message on the input stream
+    DisplayModes display_modes = 22;         // host -> client: sizes the monitor offers
+    DisplayModeRequest display_mode_request = 23;  // client -> host: run a monitor at a listed size
+  }
+}
+
+enum ThermalState {
+  THERMAL_NOMINAL = 0;
+  THERMAL_FAIR = 1;
+  THERMAL_SERIOUS = 2;
+  THERMAL_CRITICAL = 3;
+}
+
+message DecoderCaps {
+  bool hevc = 1;
+  bool hevc_main10 = 2;
+  bool h264 = 3;
+  bool av1 = 4;
+  uint32 max_width = 5;
+  uint32 max_height = 6;
+  uint64 max_pixel_rate = 7;   // luma samples per second the client is willing to decode
+}
+
+message Hello {
+  uint32 protocol_version = 1;   // 1
+  string device_id = 2;          // stable per-install UUID
+  string device_name = 3;
+  string device_model = 4;
+  bytes device_public_key = 5;   // P-256, ANSI X9.63 uncompressed (65 bytes)
+  bytes auth_signature = 6;      // ECDSA P-256/SHA-256 (DER) over WIRE.md "auth transcript"; empty when pairing
+  bool request_pairing = 7;
+  DecoderCaps decoder = 8;
+  repeated uint32 display_refresh_mhz = 9;  // e.g. 90000, 96000, 100000
+  ThermalState thermal = 10;
+  uint32 max_datagram_size = 11;  // usable QUIC datagram payload on the client path
+}
+
+enum AuthResult {
+  AUTH_OK = 0;
+  AUTH_PAIRING_REQUIRED = 1;   // unknown device and the host is not accepting pairings
+  AUTH_PAIRING_STARTED = 2;    // PairingChallenge follows
+  AUTH_REJECTED = 3;           // bad signature or revoked device
+  AUTH_LOCKED_OUT = 4;         // too many failed pairing attempts
+  AUTH_BUSY = 5;               // another session is active
+}
+
+message HelloAck {
+  uint32 protocol_version = 1;
+  string host_id = 2;
+  string host_name = 3;
+  string host_os = 4;
+  AuthResult auth = 5;
+  uint32 session_gen = 6;
+  uint64 host_time_us = 7;
+}
+
+message PairingChallenge {
+  uint32 sas_digits = 1;   // number of decimal digits to display (6)
+  uint32 timeout_ms = 2;
+}
+
+message PairingConfirm {
+  bool accepted = 1;
+  bytes device_signature = 2;  // ECDSA over the "pair transcript" (WIRE.md); proves the device key
+}
+
+message PairingResult {
+  bool success = 1;
+  string reason = 2;
+  bytes host_cert_sha256 = 3;  // what the client must pin from now on
+}
+
+enum InputArmState {
+  INPUT_DISARMED = 0;
+  INPUT_CONSENT_PENDING = 1;
+  INPUT_ARMED = 2;
+  INPUT_DENIED = 3;
+}
+
+message SessionState {
+  InputArmState input = 1;
+  uint32 input_gen = 2;            // events must carry this generation (plan §4.4)
+  bool workstation_locked = 3;
+  string message = 4;
+  bool media_flow_bound = 5;       // the host received the client's FlowHello datagram
+}
+
+message Monitor {
+  uint32 monitor_id = 1;
+  string name = 2;
+  uint32 width = 3;               // pixels
+  uint32 height = 4;
+  uint32 refresh_mhz = 5;
+  uint32 ppi = 6;
+  sint32 desktop_x = 7;           // virtual-desktop origin, may be negative
+  sint32 desktop_y = 8;
+  bool primary = 9;
+}
+
+message MonitorLayout {
+  uint32 layout_gen = 1;
+  repeated Monitor monitors = 2;
+}
+
+enum Codec {
+  CODEC_UNKNOWN = 0;
+  CODEC_HEVC = 1;
+  CODEC_H264 = 2;
+  CODEC_AV1 = 3;
+}
+
+// Code points from ITU-T H.273 / ISO/IEC 23091-2.
+message ColorInfo {
+  uint32 primaries = 1;        // 1 = BT.709
+  uint32 transfer = 2;         // 13 = IEC 61966-2-1 (sRGB)
+  uint32 matrix = 3;           // 1 = BT.709
+  bool full_range = 4;         // video_full_range_flag
+  uint32 chroma_location = 5;  // 0 = left (HEVC default)
+}
+
+message CodecConfig {
+  uint32 monitor_id = 1;
+  uint32 codec_gen = 2;
+  Codec codec = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  repeated bytes parameter_sets = 6;  // HEVC: VPS, SPS, PPS in that order; H.264: SPS, PPS. No start codes.
+  ColorInfo color = 7;
+  uint32 nal_length_size = 8;         // media payload NAL length prefix size; always 4
+  uint32 frame_rate_mhz = 9;
+}
+
+enum CursorState {
+  CURSOR_SEPARATE = 0;   // the client draws the cursor overlay
+  CURSOR_EMBEDDED = 1;   // positive evidence the cursor is in the video; no overlay
+  CURSOR_HIDDEN = 2;     // application hid the cursor
+}
+
+message CursorShape {
+  uint32 monitor_id = 1;
+  uint32 shape_ver = 2;
+  uint32 layout_gen = 3;
+  uint32 width = 4;       // monitor pixels
+  uint32 height = 5;
+  uint32 hot_x = 6;
+  uint32 hot_y = 7;
+  bytes rgba = 8;         // premultiplied RGBA8, sRGB, row-major, top row first, stride = width * 4
+  CursorState state = 9;
+}
+
+enum RecoveryKind {
+  RECOVERY_IDR = 0;
+  RECOVERY_INVALIDATE = 1;
+  RECOVERY_LTR = 2;
+}
+
+message RecoveryRequest {
+  uint32 monitor_id = 1;
+  uint32 codec_gen = 2;
+  RecoveryKind kind = 3;
+  uint32 last_good_pic_seq = 4;
+  uint32 lost_pic_seq = 5;
+}
+
+message Ping {
+  uint64 client_send_us = 1;
+  uint32 seq = 2;
+}
+
+message Pong {
+  uint64 client_send_us = 1;
+  uint64 host_recv_us = 2;
+  uint64 host_send_us = 3;
+  uint32 seq = 4;
+}
+
+message QueueDepth {
+  string name = 1;
+  uint32 depth = 2;
+  uint32 capacity = 3;
+  uint32 peak = 4;
+  uint64 dropped = 5;
+}
+
+message ClientStats {
+  uint32 monitor_id = 1;
+  uint64 window_us = 2;
+  uint32 frames_received = 3;
+  uint32 frames_decoded = 4;
+  uint32 frames_presented = 5;     // texture write completed on the GPU (not merely submitted)
+  uint32 frames_late = 6;          // decoded after their deadline: dropped, never shown late
+  uint32 frames_lost = 7;
+  uint32 shards_received = 8;
+  uint32 shards_missing = 9;       // before FEC
+  uint32 shards_recovered = 10;    // by FEC
+  uint64 bytes_received = 11;
+  uint32 decode_us_p50 = 12;
+  uint32 decode_us_p95 = 13;
+  uint32 e2e_us_p50 = 14;          // capture -> presented, via clock sync
+  uint32 e2e_us_p95 = 15;
+  uint32 jitter_us = 16;
+  repeated QueueDepth queues = 17;
+  sint64 clock_offset_us = 18;     // host - client
+  uint32 rtt_us = 19;
+  uint32 nacks_sent = 20;
+  uint32 frames_superseded = 21;   // replaced in the presentation mailbox by a newer frame
+  uint32 frames_present_failed = 22;  // could not be submitted, or the GPU reported an error
+}
+
+message HostStats {
+  uint32 monitor_id = 1;
+  uint32 fps_captured = 2;
+  uint32 fps_encoded = 3;
+  uint32 bitrate_kbps = 4;
+  uint32 encode_us_p50 = 5;
+  uint32 encode_us_p95 = 6;
+  repeated QueueDepth queues = 7;
+  uint32 target_bitrate_kbps = 8;
+  uint32 retransmitted_shards = 9;
+  uint32 idr_count = 10;
+}
+
+message Visibility {
+  bool visible = 1;
+  repeated uint32 monitor_ids = 2;
+}
+
+message ThermalUpdate {
+  ThermalState state = 1;
+}
+
+message InputStreamOpen {
+  uint32 session_gen = 1;
+}
+
+enum MouseButton {
+  MOUSE_LEFT = 0;
+  MOUSE_RIGHT = 1;
+  MOUSE_MIDDLE = 2;
+}
+
+message PointerMove {
+  uint32 monitor_id = 1;
+  uint32 layout_gen = 2;
+  float x = 3;            // monitor pixels
+  float y = 4;
+}
+
+message PointerButton {
+  uint32 monitor_id = 1;
+  uint32 layout_gen = 2;
+  float x = 3;
+  float y = 4;
+  MouseButton button = 5;
+  bool down = 6;
+  uint32 click_count = 7;
+}
+
+message Scroll {
+  float dx = 1;           // pixels, positive = content moves right/down
+  float dy = 2;
+  bool precise = 3;       // continuous (trackpad-style) rather than wheel notches
+}
+
+message Key {
+  uint32 hid_usage = 1;   // USB HID usage page 0x07
+  bool down = 2;
+}
+
+message Text {
+  string text = 1;        // Unicode text typed via the software keyboard
+}
+
+message InputEvent {
+  uint32 seq = 1;
+  uint64 client_time_us = 2;
+  oneof kind {
+    PointerMove move = 3;
+    PointerButton button = 4;
+    Scroll scroll = 5;
+    Key key = 6;
+    Text text = 7;
+  }
+}
+
+message InputEvents {
+  uint32 input_gen = 1;
+  repeated InputEvent events = 2;
+}
+
+// Releases every held key, button and contact. The host then raises input_gen (SessionState).
+message InputRelease {
+  uint32 input_gen = 1;
+}
+
+message StreamSettings {
+  uint32 max_bitrate_kbps = 1;
+  uint32 frame_rate = 2;
+  bool prefer_quality = 3;
+  bool audio = 4;            // client wants host audio (audio datagrams, WIRE.md §4); default off
+}
+
+message Goodbye {
+  string reason = 1;
+}
+
+// Display size: the monitor window's size menu (Mac Virtual Display's Standard / Wide / Ultrawide).
+// The host lists what the monitor supports; a request changes it for the rest of the session. A size
+// change then arrives the usual way: MonitorLayout (new layout_gen) and CodecConfig (new codec_gen).
+enum ModeChangeStatus {
+  MODE_CHANGE_NONE = 0;         // unsolicited list (session start, size changed)
+  MODE_CHANGE_APPLIED = 1;
+  MODE_CHANGE_UNCHANGED = 2;    // the monitor already ran that mode
+  MODE_CHANGE_FAILED = 3;       // the host's display stack refused it
+  MODE_CHANGE_UNSUPPORTED = 4;  // not a listed mode, or the host does not allow changes
+}
+
+message DisplayMode {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 refresh_mhz = 3;
+  bool current = 4;
+  bool native = 5;
+  bool scaled_for_encode = 6;   // larger than the encode budget: scaled down before encoding
+}
+
+message DisplayModes {
+  uint32 monitor_id = 1;
+  uint32 layout_gen = 2;
+  repeated DisplayMode modes = 3;
+  uint32 request_id = 4;        // the request this answers (0 = none)
+  ModeChangeStatus status = 5;
+}
+
+message DisplayModeRequest {
+  uint32 monitor_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 refresh_mhz = 4;       // 0 = host chooses
+  uint32 request_id = 5;
+}

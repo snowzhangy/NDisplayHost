@@ -1,0 +1,6 @@
+#include <winuser.h>
+
+// Embed wvd.manifest (per-monitor-v2 DPI awareness) as the application
+// manifest, resource ID 1 (RT_MANIFEST). The linker's own default manifest is
+// disabled (-DCMAKE_EXE_LINKER_FLAGS /MANIFEST:NO) so this is the only one.
+1 RT_MANIFEST "wvd.manifest"

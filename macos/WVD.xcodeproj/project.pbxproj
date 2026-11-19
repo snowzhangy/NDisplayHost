@@ -1,0 +1,370 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C6EDEC01A2086D0351C9554 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 9F417C0402F06B1FC9CBFABD /* PrivacyInfo.xcprivacy */; };
+		39E85A7118474D8B195D4DFC /* WVDHostKit in Frameworks */ = {isa = PBXBuildFile; productRef = D28CE449F8505A19606DAEAE /* WVDHostKit */; };
+		5C68ECFAE7C6D131F5C19A49 /* WVDHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E879760374657E1A9D94509 /* WVDHostApp.swift */; };
+		E93AD97009C28BB592260BCD /* WVDAppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = FAD08DDB38A18A5148C68649 /* WVDAppleCore */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		3B16FEE7E757B605A33A6A62 /* WVDHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WVDHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		6E879760374657E1A9D94509 /* WVDHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WVDHostApp.swift; sourceTree = "<group>"; };
+		9D5EF9FB064CCFB9D3B33164 /* WVDKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = WVDKit; path = WVDKit; sourceTree = SOURCE_ROOT; };
+		9F417C0402F06B1FC9CBFABD /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		490B8FC999BCE32298F9A852 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				39E85A7118474D8B195D4DFC /* WVDHostKit in Frameworks */,
+				E93AD97009C28BB592260BCD /* WVDAppleCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		399142DBC566BB32DC5F8830 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				9D5EF9FB064CCFB9D3B33164 /* WVDKit */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		7F90586E4E866D3398FEF84B /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				9F417C0402F06B1FC9CBFABD /* PrivacyInfo.xcprivacy */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		8E177E6091AD0368BD73E7FF = {
+			isa = PBXGroup;
+			children = (
+				399142DBC566BB32DC5F8830 /* Packages */,
+				7F90586E4E866D3398FEF84B /* Resources */,
+				EC4A9A5D5ABDB4E00FEE1EF1 /* WVDHost */,
+				D8FA0740B6581A4927D5CCCB /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D8FA0740B6581A4927D5CCCB /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				3B16FEE7E757B605A33A6A62 /* WVDHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		EC4A9A5D5ABDB4E00FEE1EF1 /* WVDHost */ = {
+			isa = PBXGroup;
+			children = (
+				6E879760374657E1A9D94509 /* WVDHostApp.swift */,
+			);
+			path = WVDHost;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		62405D514C3AFEC11BD3F8E1 /* WVDHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BCA002D76BCC78C5BACC2B1A /* Build configuration list for PBXNativeTarget "WVDHost" */;
+			buildPhases = (
+				BDAA8FDA3FAFDDA909DE1EA3 /* Sources */,
+				42F222838388702F7D0DA539 /* Resources */,
+				490B8FC999BCE32298F9A852 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = WVDHost;
+			packageProductDependencies = (
+				D28CE449F8505A19606DAEAE /* WVDHostKit */,
+				FAD08DDB38A18A5148C68649 /* WVDAppleCore */,
+			);
+			productName = WVDHost;
+			productReference = 3B16FEE7E757B605A33A6A62 /* WVDHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		C9A868E7859E6324CEBCA53E /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					62405D514C3AFEC11BD3F8E1 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = BBDBD69FD9171878790326E0 /* Build configuration list for PBXProject "WVD" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 8E177E6091AD0368BD73E7FF;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "WVDKit" */,
+			);
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				62405D514C3AFEC11BD3F8E1 /* WVDHost */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		42F222838388702F7D0DA539 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C6EDEC01A2086D0351C9554 /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		BDAA8FDA3FAFDDA909DE1EA3 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5C68ECFAE7C6D131F5C19A49 /* WVDHostApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		032C3752A4FDCAA5126C1E04 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 2;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		3059E0E5D2FDEC8796F7DC9A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = WVDHost/WVDHost.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = WVDHost/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.cinetec.wvm.host;
+				PRODUCT_NAME = "WVD Host";
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		81495550A5CA698379CC0C92 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 2;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		9555D1BF3C7FDC5E12CF3E2C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = WVDHost/WVDHost.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = WVDHost/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.cinetec.wvm.host;
+				PRODUCT_NAME = "WVD Host";
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		BBDBD69FD9171878790326E0 /* Build configuration list for PBXProject "WVD" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				032C3752A4FDCAA5126C1E04 /* Debug */,
+				81495550A5CA698379CC0C92 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		BCA002D76BCC78C5BACC2B1A /* Build configuration list for PBXNativeTarget "WVDHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9555D1BF3C7FDC5E12CF3E2C /* Debug */,
+				3059E0E5D2FDEC8796F7DC9A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "WVDKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = WVDKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D28CE449F8505A19606DAEAE /* WVDHostKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WVDHostKit;
+		};
+		FAD08DDB38A18A5148C68649 /* WVDAppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WVDAppleCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = C9A868E7859E6324CEBCA53E /* Project object */;
+}

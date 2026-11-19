@@ -1,0 +1,91 @@
+; =============================================================================
+;  WVD IddCx virtual display driver (UMDF 2) — driver/wvdidd.inf
+;
+;  Structure follows Microsoft's IndirectDisplay sample (video/IndirectDisplay
+;  in Windows-driver-samples), which is the authoritative UMDF/IddCx layout:
+;    * WUDFRd is the reflector: Include= / Needs= bring in its sections.
+;    * [X.Install.NT.Wdf] carries the UMDF settings (UmdfService, ...).
+;    * The service section [X_Install] carries UmdfLibraryVersion,
+;      ServiceBinary and UmdfExtensions=IddCx0102.
+;    * UpperFilters=IndirectKmd on the hardware device is required by IddCx.
+;  There is no "[...NT.Umf]" section type — that spelling is not recognised.
+; =============================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassVer    = 2.0
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = wvdidd.cat
+DriverVer   = ; set by the stampinf build step
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64.10.0...22000
+
+[Standard.NTamd64.10.0...22000]
+; Created by wvd-owner via SwDeviceCreate (hardware ID "WVDIDD").
+%DeviceName% = WvdIdd_Install, WVDIDD
+; Also allow a plain root-enumerated instance for lab bring-up.
+%DeviceName% = WvdIdd_Install, Root\WVDIDD
+
+[SourceDisksFiles]
+WvdIdd.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; -----------------------------------------------------------------------------
+; UMDF device install
+; -----------------------------------------------------------------------------
+
+[WvdIdd_Install.NT]
+Include = wudfrd.inf
+Needs   = WUDFRD.NT
+CopyFiles = UMDriverCopy
+
+[WvdIdd_Install.NT.hw]
+Include = wudfrd.inf
+Needs   = WUDFRD.NT.HW
+; IddCx requires the IndirectKmd upper filter.
+AddReg = WvdIdd_HardwareDeviceSettings
+
+[WvdIdd_HardwareDeviceSettings]
+HKR,, UpperFilters, %REG_MULTI_SZ%, "IndirectKmd"
+; One device group per adapter instance; keeps our monitors in a single host.
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "WvdIddGroup"
+
+[WvdIdd_Install.NT.Services]
+Include = wudfrd.inf
+Needs   = WUDFRD.NT.Services
+
+[WvdIdd_Install.NT.Wdf]
+UmdfService      = WvdIdd, WvdIdd_Install
+UmdfServiceOrder = WvdIdd
+; IddCx is a kernel-mode client of the UMDF driver.
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+; UMDF pooling is not allowed for IddCx (IddCx 1.9+): the adapter gets its own
+; WUDFHost, so a crash restarts only this process (§4.1 fault isolation).
+UmdfHostProcessSharing = ProcessSharingDisabled
+
+[WvdIdd_Install]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %12%\UMDF\WvdIdd.dll
+; IddCx extension version this driver targets.
+UmdfExtensions     = IddCx0102
+
+[DestinationDirs]
+UMDriverCopy = 12, UMDF
+
+[UMDriverCopy]
+WvdIdd.dll
+
+; -----------------------------------------------------------------------------
+
+[Strings]
+ManufacturerName = "WVD Project"
+DeviceName       = "WVD Virtual Display for Apple Vision Pro"
+DiskName         = "WVD Virtual Display Installation Disk"
+REG_MULTI_SZ     = 0x00010000
+REG_SZ           = 0x00000000

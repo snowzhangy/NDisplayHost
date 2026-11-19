@@ -1,0 +1,25 @@
+name: macOS host build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['macos/**', 'core/**', '.github/workflows/macos-host.yml']
+  pull_request:
+    paths: ['macos/**', 'core/**', '.github/workflows/macos-host.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test Swift package
+        run: swift test --package-path macos/WVDKit
+      - name: Build menu bar app
+        run: xcodebuild -project macos/WVD.xcodeproj -scheme WVDHost -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- WVD hosts capture coordinates from DXGI/the desktop, in PHYSICAL pixels.
+       Without per-monitor-v2 DPI awareness Windows hands DPI-virtualised
+       coordinates to the process, so DXGI_OUTPUT_DESC.DesktopCoordinates comes
+       back scaled (e.g. 1280x800 for a 2560x1600 display at 200%) while Desktop
+       Duplication still delivers 2560x1600 — the copy then fails. (§4.1 Path D) -->
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*"
+                    name="WVD.Host" type="win32"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>

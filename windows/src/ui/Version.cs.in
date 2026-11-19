@@ -1,0 +1,13 @@
+// Generated at configure time from Version.cs.in — the product name and
+// version come from WVM_HOST_* in windows/CMakeLists.txt. Do not edit here.
+namespace WvdHost {
+  public static class HostInfo {
+    public const string Name = "@WVM_HOST_NAME@";
+    public const string Version = "@WVM_HOST_VERSION@";
+    public const string Build = "@WVM_HOST_BUILD@";
+    // "WVM Host 1.0.0" — what the user calls the app, with its version.
+    public const string Product = Name + " " + Version;
+    // "WVM Host 1.0.0 (build 1)" — window title, tray tooltip, activity log.
+    public const string Full = Product + " (build " + Build + ")";
+  }
+}
