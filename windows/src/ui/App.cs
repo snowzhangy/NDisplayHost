@@ -67,7 +67,6 @@ namespace WvdHost {
     Window logWindow;
     TextBox logText;
     bool ready, busy, streaming, inputDisabled, allowClose, closing, lastRunning, initialized;
-    int metricCount;
     string directAddress;
     T Find<T>(string name) where T : class { return window.FindName(name) as T; }
     void Text(string name, string value) { Find<TextBlock>(name).Text = value; }
@@ -90,7 +89,7 @@ namespace WvdHost {
       Find<Button>("StartButton").Click += async delegate { await Run(StartHost); };
       Find<Button>("RefreshDisplaysButton").Click += async delegate { await Run(delegate { return RefreshDisplays(false); }); };
       Find<Button>("StopButton").Click += async delegate { await Run(controller.Stop); };
-      Find<Button>("ReceiverButton").Click += async delegate { await Run(controller.ToggleReceiver); };
+      Find<Button>("ReceiverButton").Click += async delegate { await Run(controller.ProbeListener); };
       Find<Button>("DisableInputButton").Click += async delegate { await Run(controller.DisableInput); };
       Find<Button>("TestCardButton").Click += delegate {
         try { controller.ToggleCard(); } catch (Exception error) { Footer(error.Message); }
@@ -216,11 +215,16 @@ namespace WvdHost {
       if (logText != null && logWindow.IsVisible) { logText.Text = String.Join(Environment.NewLine, activity); logText.ScrollToEnd(); }
       var metrics = Metrics.Parse(line);
       if (metrics != null) {
-        ++metricCount; Text("FpsValue", metrics.Fps); Text("BitrateValue", metrics.Mbps); Text("EncodeValue", metrics.EncodeMs);
+        Text("FpsValue", metrics.Fps); Text("BitrateValue", metrics.Mbps); Text("EncodeValue", metrics.EncodeMs);
         Text("StreamDetail", metrics.Pacing ?? ("Desktop → " + metrics.Encoder + " → connected receiver. Values reflect screen changes."));
       }
       if (line.Contains("media session started:")) { streaming = true; Footer("Receiver connected. Desktop capture and video encoding are running."); }
       if (line.Contains("peer disconnected") || line.Contains("session ended")) { streaming = false; Text("StreamDetail", "Receiver disconnected. Waiting for another connection."); }
+      if (line == "UI_LISTENER_TEST_OK") Footer("The local UDP listener completed a QUIC handshake.");
+      var pairing = System.Text.RegularExpressions.Regex.Match(line, @"^PAIR (\d+) (\d{6}) (.*)$");
+      ulong requestId;
+      if (pairing.Success && !closing && UInt64.TryParse(pairing.Groups[1].Value, out requestId))
+        ConfirmPairing(requestId, pairing.Groups[2].Value, pairing.Groups[3].Value);
       if (line == "UI_HOST_STARTED") { inputDisabled = false; Footer("Host listening. Connect from Vision Pro using the address above."); }
       if (line == "UI_HOST_STOPPED") {
         streaming = false; Text("StreamDetail", "Host stopped. Display capture and input have been released.");
@@ -234,6 +238,17 @@ namespace WvdHost {
       if (line.Contains("session start failed")) { streaming = false; Footer("Capture could not start. See Activity log for details."); }
       Refresh();
     }
+    async void ConfirmPairing(ulong requestId, string code, string deviceName) {
+      if (!controller.Running) return;
+      RestoreWindow();
+      bool accepted = MessageBox.Show(window,
+          "Pair with " + deviceName + " only if the headset shows the same code.\n\n" + code,
+          "Confirm headset pairing", MessageBoxButton.YesNo, MessageBoxImage.Question,
+          MessageBoxResult.No) == MessageBoxResult.Yes;
+      try { await controller.DecidePairing(requestId, accepted); }
+      catch (Exception error) { Footer("Pairing decision could not be sent. " + error.Message); }
+    }
+
     void Refresh() {
       bool running = controller.Running, direct = controller.NetworkRunning;
       if (lastRunning && !running && !busy && !closing) Footer("The host exited. See Activity log, then start it again.");
@@ -242,9 +257,8 @@ namespace WvdHost {
       foreach (string name in new [] {"AllowInput","SendAudio","ScreenOff"}) Find<CheckBox>(name).IsEnabled = ready && !running && !busy;
       Find<Button>("StartButton").IsEnabled = ready && !running && !busy;
       Find<Button>("RefreshDisplaysButton").IsEnabled = ready && !running && !busy;
-      Find<Button>("StopButton").IsEnabled = (running || controller.InputAvailable || controller.ReceiverRunning) && !busy;
+      Find<Button>("StopButton").IsEnabled = (running || controller.InputAvailable) && !busy;
       Find<Button>("ReceiverButton").IsEnabled = running && !busy;
-      Find<Button>("ReceiverButton").Content = controller.ReceiverRunning ? "Stop local test" : "Local test";
       Find<Button>("DisableInputButton").IsEnabled = running && controller.InputAvailable && !inputDisabled && !busy;
       Find<Button>("DisableInputButton").Visibility = controller.InputAvailable ? Visibility.Visible : Visibility.Collapsed;
       Find<Button>("DirectButton").IsEnabled = ready && !busy;
@@ -291,26 +305,24 @@ namespace WvdHost {
         Find<ComboBox>("DisplayChoice").SelectedIndex = 0;
         await RefreshDisplays(true);
         if (Options().Display != "") throw new Exception("Automatic display selection became a fixed GDI name.");
-        var reservation = new TcpListener(IPAddress.Loopback, 0); reservation.Start();
-        int port = ((IPEndPoint)reservation.LocalEndpoint).Port; reservation.Stop();
+        int port;
+        using (var reservation = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)))
+          port = ((IPEndPoint)reservation.Client.LocalEndPoint).Port;
         var options = Options(); options.Port = port; options.AllowInput = true; options.Synthetic = true;
         await controller.Start(options);
-        await controller.ToggleReceiver();
-        await Task.Delay(3500);
-        if (!controller.Running || !controller.ReceiverRunning || metricCount < 2) throw new Exception("No live stream telemetry.");
-        int beforeMinimize = metricCount;
+        await controller.ProbeListener();
         window.WindowState = WindowState.Minimized;
-        await Task.Delay(1500);
-        if (window.IsVisible || window.ShowInTaskbar || !tray.Visible || !controller.Running ||
-            !controller.ReceiverRunning || metricCount <= beforeMinimize)
-          throw new Exception("Minimize-to-tray interrupted streaming or left the panel visible.");
+        await Task.Delay(800);
+        if (window.IsVisible || window.ShowInTaskbar || !tray.Visible || !controller.Running)
+          throw new Exception("Minimize-to-tray interrupted the listener or left the panel visible.");
+        await controller.ProbeListener();
         RestoreWindow();
         if (!window.IsVisible || !window.ShowInTaskbar || window.WindowState != WindowState.Normal)
           throw new Exception("The tray could not restore the control panel.");
         await controller.DisableInput();
         await controller.Stop();
-        if (controller.Running || controller.InputAvailable || controller.ReceiverRunning) throw new Exception("Owned processes did not stop.");
-        File.WriteAllText(output, "PASS: UI display refresh/identity selection, live telemetry, minimize-to-tray with uninterrupted streaming, restore, input disarm and graceful process cleanup.");
+        if (controller.Running || controller.InputAvailable) throw new Exception("Owned processes did not stop.");
+        File.WriteAllText(output, "PASS: UI display refresh/identity selection, QUIC listener probe, minimize-to-tray with uninterrupted listening, restore, input disarm and graceful process cleanup.");
       } catch (Exception error) { File.WriteAllText(output, "FAIL: " + error); }
       window.Close();
     }

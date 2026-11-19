@@ -6,9 +6,8 @@
 //
 // Usage:
 //   wvd-media --demo 10                 local pipeline check, prints stats
-//   wvd-media --listen 50001            wait for the headset (TCP dev transport)
-//   wvd-media --quic 47800              wait for the headset over QUIC (WIRE v1)
-// Both listeners may run at once; each advertises its own service. Options:
+//   wvd-media --listen 47800         WIRE v1 over QUIC
+// Options:
 //   --monitor \\.\DISPLAY2 --fps 60 --bitrate 60000 --codec auto|null
 //   --input \\.\pipe\wvd.input  forward input to privileged helper
 #include <atomic>
@@ -21,22 +20,16 @@
 #include "session/media_session.h"
 #include "wvd/logging.h"
 #include "wvd/stop_signal.h"
-#include "wvd/transport.h"
 
-#ifdef WVD_HAVE_MSQUIC
 #include "identity.h"
 #include "wdauth.h"
 #include "wire1_channel.h"
-#endif
 
 using namespace wvd;
 
 namespace {
 
 std::atomic<bool> g_quit{false};
-
-// WIRE.md §2: the UDP port the headset connects to by default.
-constexpr int kDefaultQuicPort = 47800;
 
 BOOL WINAPI CtrlHandler(DWORD type) {
   (void)type;
@@ -48,16 +41,15 @@ BOOL WINAPI CtrlHandler(DWORD type) {
 void Usage() {
   printf(
       "wvd-media — WVD media worker\n"
-      "usage: wvd-media [--demo N] [--listen PORT] [--quic PORT] [--monitor NAME]\n"
+      "usage: wvd-media [--demo N] [--listen PORT] [--monitor NAME]\n"
       "                 [--fps N] [--bitrate KBPS] [--codec auto|hevc|h264|ENCODER]\n"
       "                 [--input PIPE] [--input-token HEX] [--synthetic]\n"
       "                 [--max-pixels N] [--min-bitrate KBPS] [--fixed-bitrate]\n"
       "                 [--gop-sec N] [--box-chroma] [--no-mode-change]\n"
       "                 [--no-audio] [--screen-off] [--no-discovery] [-v]\n"
-      "--listen is the packed TCP host the current headset builds speak;\n"
-      "  --quic is proto/WIRE.md v1 over UDP (default 47800) for Vision Pro\n"
-      "  builds with the QUIC host. Pairing codes appear on stderr and on\n"
-      "  \\\\.\\pipe\\wvm-pairing; --pair-auto accepts without a code check.\n"
+      "Listens on UDP 47800 by default (WIRE v1 over QUIC). --demo runs offline.\n"
+      "  --quic [PORT] is also accepted. Pairing uses the local pipe shown in the log.\n"
+      "  --pair-auto skips the code comparison and is intended for lab use.\n"
       "--no-pair stops new devices pairing (paired headsets still connect)\n"
       "--allow-input lets a paired headset drive mouse and keyboard; without\n"
       "  it a QUIC session streams picture and sound but cannot touch the PC\n"
@@ -76,8 +68,7 @@ void Usage() {
 
 struct Args {
   int demoSeconds = 0;
-  int listenPort = 0;
-  int quicPort = 0;
+  uint16_t listenPort = 0;
   std::wstring monitor;
   uint32_t fps = 60;
   uint32_t bitrate = 60000;
@@ -111,14 +102,20 @@ bool ParseArgs(int argc, char** argv, Args& a) {
       return true;
     };
     std::string v;
-    if (s == "--demo" && next(v))
+    if (s == "--demo" && next(v)) {
       a.demoSeconds = atoi(v.c_str());
-    else if (s == "--listen" && next(v))
-      a.listenPort = atoi(v.c_str());
-    else if (s == "--quic" && next(v))
-      a.quicPort = atoi(v.c_str());
-    else if (s == "--quic" && i + 1 == argc)
-      a.quicPort = kDefaultQuicPort;
+      if (a.demoSeconds <= 0) return false;
+    } else if (s == "--listen" || s == "--quic") {
+      if (s == "--quic" && (i + 1 == argc || argv[i + 1][0] == '-')) {
+        a.listenPort = kQuicDefaultPort;
+      } else {
+        if (!next(v) || v.empty() || v.find_first_not_of("0123456789") != std::string::npos)
+          return false;
+        const auto port = strtoul(v.c_str(), nullptr, 10);
+        if (port == 0 || port > 65535) return false;
+        a.listenPort = static_cast<uint16_t>(port);
+      }
+    }
     else if (s == "--monitor" && next(v))
       a.monitor = Utf8ToWide(v.c_str());
     else if (s == "--fps" && next(v))
@@ -174,101 +171,101 @@ bool ParseArgs(int argc, char** argv, Args& a) {
   return true;
 }
 
-#ifdef WVD_HAVE_MSQUIC
-// The pairing console (docs/PAIRING-CONSOLE.md). One line out per event, so a
-// UI never has to parse the log:
-//   PAIR <request-id> <6-digit code> <device name>   a headset wants to pair
-//   PAIRED <request-id> ok|rejected                  how that request ended
-// and in: "<request-id> accept\n" / "<request-id> deny\n".
+// The UI reads structured events on stdout and submits decisions on a
+// process-specific local pipe. The QUIC worker never waits for the UI.
 class PairingConsole : public IWire1Observer {
  public:
   explicit PairingConsole(Wire1Listener& listener) : listener_(listener) {}
-  ~PairingConsole() { Stop(); }
-
-  bool Start() {
-    pipe_ = CreateNamedPipeW(kPipe, PIPE_ACCESS_DUPLEX,
-                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
-                                 PIPE_REJECT_REMOTE_CLIENTS,
-                             1, 4096, 4096, 0, nullptr);
-    if (pipe_ == INVALID_HANDLE_VALUE) {
-      WVD_LOGW("pairing console: pipe unavailable (err %lu) — use the log instead",
-               GetLastError());
-      return false;
-    }
-    running_ = true;
-    thread_ = std::thread([this] { ReadLoop(); });
-    WVD_LOGI("pairing console: %ls", kPipe);
-    return true;
+  ~PairingConsole() {
+    if (!thread_.joinable()) return;
+    SetEvent(stop_);
+    thread_.join();
+    CloseHandle(pipe_);
+    CloseHandle(stop_);
   }
 
-  void Stop() {
-    running_ = false;
-    if (pipe_ != INVALID_HANDLE_VALUE) {
-      const HANDLE h = pipe_;
-      pipe_ = INVALID_HANDLE_VALUE;
-      CancelSynchronousIo(h);
-      DisconnectNamedPipe(h);
-      CloseHandle(h);
+  bool Start() {
+    const auto name = L"\\\\.\\pipe\\wvm-pairing-" + std::to_wstring(GetCurrentProcessId());
+    stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stop_) return false;
+    pipe_ = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                                 FILE_FLAG_OVERLAPPED,
+                             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+                                 PIPE_REJECT_REMOTE_CLIENTS,
+                             1, 0, 256, 0, nullptr);
+    if (pipe_ == INVALID_HANDLE_VALUE) {
+      CloseHandle(stop_);
+      return false;
     }
-    if (thread_.joinable()) thread_.join();
+    thread_ = std::thread([this] { ReadLoop(); });
+    WVD_LOGI("pairing console: %ls", name.c_str());
+    return true;
   }
 
   void OnPairingRequest(uint64_t requestId, const std::string& deviceName,
                         const std::string& sas) override {
-    WVD_LOGI("PAIRING: %s asks to pair — accept only if it shows the code %s",
-             deviceName.c_str(), sas.c_str());
-    Write("PAIR " + std::to_string(requestId) + " " + sas + " " + deviceName + "\n");
+    auto name = deviceName.substr(0, 160);
+    for (char& ch : name) if (static_cast<unsigned char>(ch) < 32) ch = ' ';
+    printf("PAIR %llu %s %s\n", static_cast<unsigned long long>(requestId), sas.c_str(),
+           name.c_str());
+    fflush(stdout);
   }
 
   void OnPairingDecided(uint64_t requestId, bool success) override {
-    Write("PAIRED " + std::to_string(requestId) + (success ? " ok\n" : " rejected\n"));
+    printf("PAIRED %llu %s\n", static_cast<unsigned long long>(requestId),
+           success ? "ok" : "rejected");
+    fflush(stdout);
   }
 
  private:
-  static constexpr const wchar_t* kPipe = L"\\\\.\\pipe\\wvm-pairing";
-
-  void Write(const std::string& line) {
-    std::lock_guard<std::mutex> lk(m_);
-    if (pipe_ == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    WriteFile(pipe_, line.data(), DWORD(line.size()), &written, nullptr);
+  bool Complete(OVERLAPPED& io, DWORD& bytes) {
+    const HANDLE events[] = {stop_, io.hEvent};
+    if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0) {
+      CancelIoEx(pipe_, &io);
+      GetOverlappedResult(pipe_, &io, &bytes, TRUE);
+      return false;
+    }
+    return GetOverlappedResult(pipe_, &io, &bytes, FALSE) != FALSE;
   }
 
   void ReadLoop() {
-    std::string pending;
-    while (running_) {
-      const HANDLE h = pipe_;
-      if (h == INVALID_HANDLE_VALUE) break;
-      if (!ConnectNamedPipe(h, nullptr)) {
-        const DWORD err = GetLastError();
-        if (err != ERROR_PIPE_CONNECTED && err != ERROR_IO_PENDING && err != ERROR_OPERATION_ABORTED)
-          Sleep(200);
-        continue;
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) return;
+    while (WaitForSingleObject(stop_, 0) == WAIT_TIMEOUT) {
+      OVERLAPPED io{};
+      io.hEvent = event;
+      ResetEvent(event);
+      DWORD bytes = 0;
+      bool connected = ConnectNamedPipe(pipe_, &io) != FALSE;
+      if (!connected) {
+        const DWORD error = GetLastError();
+        connected = error == ERROR_PIPE_CONNECTED ||
+                    (error == ERROR_IO_PENDING && Complete(io, bytes));
       }
-      char buffer[256];
-      DWORD got = 0;
-      while (running_ && ReadFile(h, buffer, sizeof(buffer), &got, nullptr) && got) {
-        pending.append(buffer, got);
-        size_t nl;
-        while ((nl = pending.find('\n')) != std::string::npos) {
-          std::string line = pending.substr(0, nl);
-          pending.erase(0, nl + 1);
-          unsigned long long id = 0;
-          char word[16] = {};
-          if (sscanf(line.c_str(), "%llu %15s", &id, word) == 2)
-            listener_.DecidePairing(id, strcmp(word, "accept") == 0);
+      if (connected) {
+        char text[128] = {};
+        io = {};
+        io.hEvent = event;
+        ResetEvent(event);
+        bool read = ReadFile(pipe_, text, sizeof(text) - 1, &bytes, &io) != FALSE;
+        if (!read && GetLastError() == ERROR_IO_PENDING) read = Complete(io, bytes);
+        unsigned long long id = 0;
+        char choice[16] = {};
+        if (read && sscanf(text, "%llu %15s", &id, choice) == 2 &&
+            (!strcmp(choice, "accept") || !strcmp(choice, "deny"))) {
+          listener_.DecidePairing(id, strcmp(choice, "accept") == 0);
         }
       }
+      DisconnectNamedPipe(pipe_);
     }
+    CloseHandle(event);
   }
 
   Wire1Listener& listener_;
+  HANDLE stop_ = nullptr;
   HANDLE pipe_ = INVALID_HANDLE_VALUE;
-  std::atomic<bool> running_{false};
   std::thread thread_;
-  std::mutex m_;
 };
-#endif  // WVD_HAVE_MSQUIC
 
 }  // namespace
 
@@ -282,26 +279,8 @@ int main(int argc, char** argv) {
   if (!stopSignal.Watch(a.stopEvent, g_quit)) return 1;
   if (g_quit) return 0;
   log::Init("media", a.verbose ? log::Level::Verbose : log::Level::Info);
-  SetConsoleCtrlHandler(
-      [](DWORD type) -> BOOL {
-        if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
-          WVD_LOGI("ctrl-c — stopping");
-          ExitProcess(0);  // threads do bounded waits; P0 keeps it simple
-        }
-        return FALSE;
-      },
-      TRUE);
-
-  if (!a.demoSeconds && !a.listenPort && !a.quicPort) {
-    WVD_LOGI("no mode given — defaulting to --demo 10");
-    a.demoSeconds = 10;
-  }
-
-  WinsockGuard ws;
-  if (!ws.ok()) {
-    WVD_LOGE("winsock init failed");
-    return 1;
-  }
+  SetConsoleCtrlHandler(CtrlHandler, TRUE);
+  if (!a.demoSeconds && !a.listenPort) a.listenPort = kQuicDefaultPort;
 
   SessionConfig cfg;
   cfg.monitorName = a.monitor;
@@ -339,66 +318,48 @@ int main(int argc, char** argv) {
     if (!selected.monitorDevicePath.empty()) cfg.monitorName = selected.monitorDevicePath;
   }
 
-  TcpListener listener;
-  DnsRegistration dns;
-  if (a.listenPort) {
-    if (!listener.Start(uint16_t(a.listenPort))) {
-      WVD_LOGE("listen on %d failed", a.listenPort);
-      return 1;
-    }
-    if (!a.noDiscovery) dns.Start(L"WVD-PC", uint16_t(a.listenPort));
-    WVD_LOGI("waiting for headset on tcp:%d (packed dev transport)", a.listenPort);
-  }
-
-#ifdef WVD_HAVE_MSQUIC
-  // The QUIC host (core/proto/WIRE.md) has pairing rooted in
-  // the TLS exporter rather than in the network being friendly.
   HostIdentity identity;
   PairedDeviceStore devices;
-  Wire1Config wireCfg;
-  Wire1Listener* quicListener = nullptr;
-  std::unique_ptr<Wire1Listener> quicListenerOwner;
+  std::unique_ptr<Wire1Listener> listener;
   std::unique_ptr<PairingConsole> console;
-  if (a.quicPort) {
+  DnsRegistration dns;
+  if (a.listenPort) {
     std::string error;
     if (!identity.Load("WVM Host", &error)) {
-      WVD_LOGE("host identity: %s — the QUIC host stays off", error.c_str());
-    } else {
-      std::string storeError;
-      if (!devices.Load(&storeError))
-        WVD_LOGW("paired devices: %s — starting with an empty list", storeError.c_str());
-      wireCfg.hostId = Wire1HostId(identity.certSha256());
-      wireCfg.hostName = "Windows PC";
-      wireCfg.pairingAllowed = !a.noPair;
-      wireCfg.autoAcceptPairing = a.pairAuto;
-      // A headset may watch the desktop without being allowed to drive it.
-      wireCfg.inputAllowed = a.allowInput;
-      WVD_LOGI("host id %s, %zu paired device(s)", wireCfg.hostId.c_str(), devices.all().size());
-      auto owned = std::make_unique<Wire1Listener>(gens, wireCfg, identity, devices);
-      if (owned->Listen(uint16_t(a.quicPort), &error)) {
-        quicListener = owned.get();
-        quicListenerOwner = std::move(owned);
-        console = std::make_unique<PairingConsole>(*quicListener);
-        console->Start();
-        quicListener->SetObserver(console.get());
-        WVD_LOGI("waiting for headset on udp:%d (WIRE v1 over QUIC, ALPN %s)", a.quicPort,
-                 kQuicAlpn);
-        if (!a.noDiscovery) dns.StartUdp(L"WVM-PC", uint16_t(a.quicPort), wireCfg.hostId);
-      } else {
-        WVD_LOGE("listen on udp:%d failed: %s", a.quicPort, error.c_str());
+      WVD_LOGE("host identity: %s", error.c_str());
+      return 1;
+    }
+    if (!devices.Load(&error))
+      WVD_LOGW("paired devices: %s", error.c_str());
+
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = L"Windows-PC";
+    DWORD nameLength = ARRAYSIZE(name);
+    GetComputerNameW(name, &nameLength);
+    Wire1Config wireCfg;
+    wireCfg.hostId = Wire1HostId(identity.certSha256());
+    wireCfg.hostName = WideToUtf8(name);
+    wireCfg.hostOs = "Windows";
+    wireCfg.deadlineMs = cfg.deadlineMs;
+    wireCfg.pairingAllowed = !a.noPair;
+    wireCfg.autoAcceptPairing = a.pairAuto;
+    wireCfg.inputAllowed = a.allowInput && a.inputToken != 0;
+    listener = std::make_unique<Wire1Listener>(gens, wireCfg, identity, devices);
+    if (wireCfg.pairingAllowed && !wireCfg.autoAcceptPairing) {
+      console = std::make_unique<PairingConsole>(*listener);
+      if (!console->Start()) {
+        WVD_LOGE("could not open the local pairing pipe");
         return 1;
       }
+      listener->SetObserver(console.get());
     }
+    if (!listener->Listen(a.listenPort, &error)) {
+      WVD_LOGE("listen on udp:%u failed: %s", a.listenPort, error.c_str());
+      return 1;
+    }
+    if (!a.noDiscovery) dns.Start(name, a.listenPort, wireCfg.hostId);
+    printf("HOST_READY %u\n", a.listenPort);
+    fflush(stdout);
   }
-  const bool quicListening = quicListener != nullptr;
-#else
-  const bool quicListening = false;
-  if (a.quicPort)
-    WVD_LOGE("--quic requires MsQuic; run windows/scripts/build-msquic.ps1 and rebuild");
-#endif
-  if (a.quicPort && !a.listenPort && !quicListening) return 1;
-
-  SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
   const ULONGLONG startTick = GetTickCount64();
   auto demoExpired = [&] {
@@ -412,45 +373,25 @@ int main(int argc, char** argv) {
   for (;;) {
     if (demoExpired() || g_quit) break;
 
-    // A session's channel is shared: the QUIC transport keeps its own
-    // reference alive while msquic callbacks still fire into it.
-    std::shared_ptr<IReliableChannel> channel;
-    if (a.listenPort || a.quicPort) {
-      for (;;) {
-#ifdef WVD_HAVE_MSQUIC
-        if (quicListener) {
-          auto quicChannel = quicListener->AcceptChannel(200);
-          if (quicChannel) {
-            channel = quicChannel;
-            WVD_LOGI("headset connected over QUIC (%s), input %s",
-                     quicChannel->peerName().c_str(),
-                     quicChannel->inputAllowed() ? "armed" : "disarmed");
-            break;
-          }
-        }
-#endif
-        if (a.listenPort) {
-          channel = listener.Accept(200);
-          if (channel) {
-            WVD_LOGI("headset connected over TCP");
-            break;
-          }
-        }
-        if (demoExpired() || g_quit) break;
-      }
+    std::shared_ptr<Wire1Channel> channel;
+    if (listener) {
+      while (!demoExpired() && !g_quit && !channel)
+        channel = listener->AcceptChannel(200);
       if (!channel) break;
+      WVD_LOGI("headset connected over QUIC (%s), input %s", channel->peerName().c_str(),
+               channel->inputAllowed() ? "armed" : "disarmed");
     }
 
     MediaSession session(cfg, gens);
     session.synthetic = a.synthetic;
-    HRESULT hr = session.Start(std::move(channel));
+    HRESULT hr = session.Start(channel);
     if (FAILED(hr)) {
       WVD_LOGE("session start failed hr=%s", HresultStr(hr).c_str());
       if (hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
         WVD_LOGE("selected display is unavailable; refresh the display list and select an active display");
       else if (hr == E_ACCESSDENIED || hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
         WVD_LOGE("DDA needs an unlocked interactive desktop session; run from your logon");
-      if (!a.listenPort && !a.quicPort) return 1;
+      if (!listener) return 1;
       Sleep(1000);  // keep listening; the next attempt may succeed
       continue;
     }
@@ -471,17 +412,16 @@ int main(int argc, char** argv) {
           int(s.pointerState), s.encoder.c_str(), s.targetKbps, s.encWidth, s.encHeight,
           s.zeroCopy ? "gpu-texture" : "cpu-copy", (unsigned long long)s.skippedForLink,
           s.captureGapMaxMs, s.sendGapMaxMs, s.sendP95Ms);
-#ifdef WVD_HAVE_MSQUIC
-      if (quicListener && quicListener->active()) {
-        const auto link = quicListener->active()->link();
+      if (channel) {
+        const auto link = channel->link();
         WVD_LOGI(
-            "quic: shards=%llu rtx=%llu drops=%llu loss=%.2f%% rtt=%.1fms FEC=%.0f%% "
+             "quic: datagrams-sent=%llu rtx-queued=%llu transport-drops=%llu pacer-dropped=%lluB loss=%.2f%% rtt=%.1fms FEC=%.0f%% "
             "pacer-backlog=%zuB",
-            (unsigned long long)link.shardsSent, (unsigned long long)link.retransmitted,
-            (unsigned long long)(link.datagramDrops + link.pacerDrops), link.lossPercent,
-            link.rttMs, link.fecPercent, quicListener->active()->pacerBacklog());
+            (unsigned long long)link.datagramsSent, (unsigned long long)link.retransmitted,
+            (unsigned long long)link.datagramDrops, (unsigned long long)link.pacerDrops,
+            link.lossPercent,
+            link.rttMs, link.fecPercent, channel->BacklogBytes());
       }
-#endif
       if (session.peerGone()) {
         WVD_LOGW("session ended (peer gone) — re-arming to accept again (§4.2)");
         break;
@@ -489,9 +429,10 @@ int main(int argc, char** argv) {
       if (demoExpired() || g_quit) break;
     }
     session.Stop();
-    if (!a.listenPort && !a.quicPort) break;  // demo mode: one pass is enough
+    if (!listener) break;  // demo mode: one pass is enough
     if (demoExpired() || g_quit) break;
     // fall through and accept the next connection
   }
+  if (listener) listener->Stop();
   return 0;
 }

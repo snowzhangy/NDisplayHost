@@ -3,14 +3,14 @@
   Start the interactive desktop host and input helper from an existing build.
 .DESCRIPTION
   Logs and process IDs go in .local/dev-session. Close the test card normally;
-  stop the recorded media/input/sink processes when done. This does not install
+  stop the recorded media/input processes when done. This does not install
   a driver or service. Run elevated only when testing input into elevated apps.
 #>
 [CmdletBinding()]
 param(
-  [ValidateRange(1024,65535)][int]$Port = 50001,
+  [ValidateRange(1024,65535)][int]$Port = 47800,
   [switch]$NoInput,
-  [switch]$Sink,
+  [switch]$Probe,
   [switch]$TestCard,
   [switch]$ScreenOff,  # black out this PC's screens while the headset is connected
   [switch]$NoAudio     # never send this PC's sound
@@ -41,26 +41,33 @@ try {
     $token = [BitConverter]::ToString($bytes).Replace('-', '')
     $inputProcess = Start-HostComponent (Join-Path $buildRoot 'input/wvd-input.exe') @('--token', $token) 'input'
     $started += $inputProcess
-    $mediaArgs += @('--input', '\\.\pipe\wvd.input', '--input-token', $token)
+    $mediaArgs += @('--input', '\\.\pipe\wvd.input', '--input-token', $token, '--allow-input')
   }
   $mediaProcess = Start-HostComponent $mediaExe $mediaArgs 'media'
   $started += $mediaProcess
-  Start-Sleep -Milliseconds 700
-  if ($mediaProcess.HasExited -or ($inputProcess -and $inputProcess.HasExited)) {
-    throw "A host component exited; see $sessionDir"
-  }
+  $deadline = [DateTime]::UtcNow.AddSeconds(8)
+  $ready = $false
+  do {
+    $mediaProcess.Refresh()
+    if ($mediaProcess.HasExited -or ($inputProcess -and $inputProcess.HasExited)) {
+      throw "A host component exited; see $sessionDir"
+    }
+    $ready = Select-String -LiteralPath (Join-Path $sessionDir 'media.stdout.log') -SimpleMatch "HOST_READY $Port" -Quiet
+    if (!$ready) { Start-Sleep -Milliseconds 50 }
+  } until ($ready -or [DateTime]::UtcNow -ge $deadline)
+  if (!$ready) { throw "The UDP listener did not become ready; see $sessionDir" }
   if ($TestCard) {
     # The test card is an interactive window explicitly requested for testing.
     $started += Start-Process -FilePath (Join-Path $buildRoot 'tools/testcard/wvd-testcard.exe') `
       -WorkingDirectory $workspace -PassThru
   }
-  if ($Sink) {
-    $started += Start-HostComponent (Join-Path $buildRoot 'tools/diag/wvd-diag.exe') @('sink', '--port', "$Port") 'sink'
+  if ($Probe) {
+    & (Join-Path $buildRoot 'tools/diag/wvd-diag.exe') quic-probe $Port
+    if ($LASTEXITCODE) { throw "QUIC handshake check failed; see $sessionDir" }
   }
   $started | Select-Object Id, ProcessName | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $sessionDir 'processes.json')
   $started | Select-Object Id, ProcessName
-  Write-Host "Desktop host listening on TCP $Port. Logs: $sessionDir"
-  if ($Sink) { Write-Host 'The local diagnostic receiver occupies the connection; stop it before connecting a headset.' }
+  Write-Host "Desktop host listening on UDP $Port. Logs: $sessionDir"
 } catch {
   foreach ($process in $started) { if (!$process.HasExited) { $process.Kill() } }
   throw

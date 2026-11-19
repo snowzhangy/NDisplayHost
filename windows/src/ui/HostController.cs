@@ -19,7 +19,7 @@ namespace WvdHost {
   public sealed class HostOptions {
     public string Display = "";
     public string Encoder = "auto";
-    public int Fps = 60, Bitrate = 60000, Port = 50001;
+    public int Fps = 60, Bitrate = 60000, Port = 47800;
     public bool AllowInput, Synthetic, ScreenOff, NoAudio;
   }
 
@@ -29,14 +29,13 @@ namespace WvdHost {
     public event Action<string> Line;
     public readonly string Root;
     private readonly IntPtr job;
-    private Process media, input, receiver, card, network;
+    private Process media, input, card, network;
     private EventWaitHandle mediaStop, inputStop, networkStop;
     private string pipeName;
     private ulong token;
     private bool disposed;
     public int Port { get; private set; }
     public bool Running { get { return Alive(media); } }
-    public bool ReceiverRunning { get { return Alive(receiver); } }
     public bool NetworkRunning { get { return Alive(network); } }
     public bool InputAvailable { get { return Alive(input); } }
 
@@ -52,7 +51,7 @@ namespace WvdHost {
         if (job == IntPtr.Zero || !SetInformationJobObject(job, 9, memory, (uint)size))
           throw new System.ComponentModel.Win32Exception();
       } finally { Marshal.FreeHGlobal(memory); }
-      Port = 50001;
+      Port = 47800;
     }
     public static bool Alive(Process process) {
       try { return process != null && !process.HasExited; } catch { return false; }
@@ -69,7 +68,8 @@ namespace WvdHost {
       return result.Append('\\', slashes * 2).Append('"').ToString();
     }
     private string Exe(string relative) { return Path.Combine(Root, relative); }
-    private Process Spawn(string relative, IEnumerable<string> args, bool captureOutput) {
+    private Process Spawn(string relative, IEnumerable<string> args, bool captureOutput,
+                          Action<string> onOutput = null) {
       string executable = Exe(relative);
       if (!File.Exists(executable)) throw new FileNotFoundException("Build component missing: " + relative);
       var info = new ProcessStartInfo(executable, String.Join(" ", args.Select(Quote))) {
@@ -84,7 +84,9 @@ namespace WvdHost {
       };
       process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) {
         // The injector prints its consent token on stdout: always discard it.
-        if (captureOutput && !String.IsNullOrEmpty(e.Data)) Emit(e.Data);
+        if (!captureOutput || String.IsNullOrEmpty(e.Data)) return;
+        if (onOutput != null) onOutput(e.Data);
+        Emit(e.Data);
       };
       process.Start();
       if (!AssignProcessToJobObject(job, process.Handle) && !process.HasExited) {
@@ -104,10 +106,6 @@ namespace WvdHost {
         if (Running) throw new InvalidOperationException("Host already running.");
         StopCore(); // clean up any helpers left by an unexpected worker exit
         if (options.Port < 1024 || options.Port > 65535) throw new ArgumentException("Port must be 1024–65535.");
-        var reservation = new TcpListener(IPAddress.Any, options.Port);
-        try { reservation.Server.ExclusiveAddressUse = true; reservation.Start(); }
-        catch (SocketException) { throw new InvalidOperationException("TCP port " + options.Port + " is already in use. Stop the earlier host first."); }
-        finally { reservation.Stop(); }
         Port = options.Port;
         try {
           var args = new List<string> {"--listen", Port.ToString(CultureInfo.InvariantCulture),
@@ -124,12 +122,17 @@ namespace WvdHost {
             string auth = token.ToString("X16", CultureInfo.InvariantCulture);
             input = Spawn("input/wvd-input.exe", new [] {"--pipe", "\\\\.\\pipe\\" + pipeName,
               "--token", auth, "--stop-event", NewStopEvent(out inputStop)}, false);
-            args.AddRange(new [] {"--input", "\\\\.\\pipe\\" + pipeName, "--input-token", auth});
+            args.AddRange(new [] {"--input", "\\\\.\\pipe\\" + pipeName, "--input-token", auth, "--allow-input"});
           }
-          media = Spawn("media/wvd-media.exe", args, true);
-          Thread.Sleep(600);
-          if (!Running || (options.AllowInput && !Alive(input)))
-            throw new InvalidOperationException("A host component exited. See the activity log.");
+          var listening = new TaskCompletionSource<bool>();
+          string readyLine = "HOST_READY " + Port.ToString(CultureInfo.InvariantCulture);
+          media = Spawn("media/wvd-media.exe", args, true, line => {
+            if (line == readyLine) listening.TrySetResult(true);
+          });
+          var timeout = Stopwatch.StartNew();
+          while (!listening.Task.Wait(50) && timeout.ElapsedMilliseconds < 8000 && Running) { }
+          if (!listening.Task.IsCompleted || !Running || (options.AllowInput && !Alive(input)))
+            throw new InvalidOperationException("Could not start the UDP listener. See the activity log.");
           Emit("UI_HOST_STARTED");
         } catch { StopCore(); throw; }
       });
@@ -144,20 +147,26 @@ namespace WvdHost {
       if (signal != null) { signal.Dispose(); signal = null; }
     }
     private void StopCore() {
-      EventWaitHandle unused = null;
-      End(ref receiver, ref unused);
       End(ref media, ref mediaStop); // normal shutdown flushes the armed connection
       End(ref input, ref inputStop);
       token = 0; pipeName = null;
     }
     public Task Stop() { return Task.Run(delegate { StopCore(); Emit("UI_HOST_STOPPED"); }); }
-    public Task ToggleReceiver() {
+    public async Task ProbeListener() {
+      if (!Running) throw new InvalidOperationException("Start the host before testing the listener.");
+      await Probe("tools/diag/wvd-diag.exe", "quic-probe " + Port.ToString(CultureInfo.InvariantCulture));
+      Emit("UI_LISTENER_TEST_OK");
+    }
+
+    public Task DecidePairing(ulong requestId, bool accept) {
+      var current = media;
       return Task.Run(delegate {
-        if (ReceiverRunning) { EventWaitHandle unused = null; End(ref receiver, ref unused); Emit("UI_TEST_STOPPED"); }
-        else {
-          if (!Running) throw new InvalidOperationException("Start the host before running a local test.");
-          receiver = Spawn("tools/diag/wvd-diag.exe", new [] {"sink", "--port", Port.ToString()}, true);
-          Emit("UI_TEST_STARTED");
+        if (!Alive(current) || current != media) return;
+        using (var pipe = new NamedPipeClientStream(".", "wvm-pairing-" + current.Id, PipeDirection.Out)) {
+          pipe.Connect(1500);
+          var decision = Encoding.ASCII.GetBytes(requestId.ToString(CultureInfo.InvariantCulture) +
+              (accept ? " accept\n" : " deny\n"));
+          pipe.Write(decision, 0, decision.Length);
         }
       });
     }
@@ -216,6 +225,8 @@ namespace WvdHost {
           var stderr = process.StandardError.ReadToEndAsync();
           if (!process.WaitForExit(10000)) { process.Kill(); throw new TimeoutException("Device probe timed out."); }
           Task.WaitAll(stdout, stderr);
+          if (process.ExitCode != 0 && argument.StartsWith("quic-probe ", StringComparison.Ordinal))
+            throw new IOException((stdout.Result + stderr.Result).Trim());
           return stdout.Result + stderr.Result;
         }
       });

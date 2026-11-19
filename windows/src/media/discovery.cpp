@@ -1,4 +1,5 @@
 #include "discovery.h"
+#include "wvd/platform.h"
 
 #include <iphlpapi.h>
 #include <windns.h>
@@ -30,11 +31,8 @@ struct DnsRegistrationCtx {
   std::atomic<bool> retiring{false};
 };
 
-// Both transports, per WIRE.md §2 and the headset's browser.
-static constexpr wchar_t kTcpService[] = L"_wvd._tcp.local.";
-static constexpr wchar_t kUdpService[] = L"_wvd._udp.local.";
-
-static VOID WINAPI RegisterComplete(DWORD status, PVOID ctx, PDNS_SERVICE_INSTANCE) {
+static VOID WINAPI RegisterComplete(DWORD status, PVOID ctx, PDNS_SERVICE_INSTANCE instance) {
+  if (instance) DnsServiceFreeInstance(instance);
   auto* c = static_cast<DnsRegistrationCtx*>(ctx);
   if (!c) return;
   if (c->retiring.exchange(false)) return;  // the answer to our own de-register
@@ -45,56 +43,49 @@ static VOID WINAPI RegisterComplete(DWORD status, PVOID ctx, PDNS_SERVICE_INSTAN
 }
 
 static bool FirstRoutableIpv4(IP4_ADDRESS& out) {
-  ULONG len = 8 * 1024;
-  PIP_ADAPTER_ADDRESSES addrs = static_cast<PIP_ADAPTER_ADDRESSES>(malloc(len));
-  bool found = false;
-  if (addrs && GetAdaptersAddresses(AF_INET,
-                                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr,
-                                    addrs, &len) == ERROR_SUCCESS) {
-    for (auto* a = addrs; a && !found; a = a->Next) {
-      if (a->OperStatus != IfOperStatusUp) continue;
-      for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
-        auto* in = reinterpret_cast<SOCKADDR_IN*>(ua->Address.lpSockaddr);
-        if (in->sin_family != AF_INET) continue;
-        ULONG addr = in->sin_addr.S_un.S_addr;
-        if ((addr & 0xFF000000u) == 0x7F000000u) continue;  // loopback
-        out = addr;  // already network byte order
-        found = true;
-        break;
-      }
+  ULONG len = 15000;
+  std::vector<uint8_t> bytes(len);
+  auto adapters = [&] { return reinterpret_cast<PIP_ADAPTER_ADDRESSES>(bytes.data()); };
+  constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+  DWORD status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &len);
+  if (status == ERROR_BUFFER_OVERFLOW) {
+    bytes.resize(len);
+    status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &len);
+  }
+  if (status != ERROR_SUCCESS) return false;
+  for (auto* adapter = adapters(); adapter; adapter = adapter->Next) {
+    if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+        adapter->IfType == IF_TYPE_TUNNEL) continue;
+    for (auto* ua = adapter->FirstUnicastAddress; ua; ua = ua->Next) {
+      const auto* address = reinterpret_cast<const SOCKADDR_IN*>(ua->Address.lpSockaddr);
+      if (!address || address->sin_family != AF_INET) continue;
+      out = address->sin_addr.S_un.S_addr;
+      return true;
     }
   }
-  if (addrs) free(addrs);
-  return found;
+  return false;
 }
 
-bool DnsRegistration::Register(const std::wstring& instanceName, const wchar_t* serviceName,
-                               uint16_t port,
-                               const std::vector<std::pair<std::string, std::string>>& txt,
-                               bool udp) {
-  (void)txt;  // DnsServiceConstructInstance takes no TXT records (dwProperties
-              // must be 0), so the hint carries the port only. The host id and
-              // protocol version travel in the authenticated HelloAck instead.
-  for (auto& e : registrations_) {
-    if (e.udp == udp) {
-      StopOne(udp);
-      break;
-    }
-  }
+bool DnsRegistration::Start(const std::wstring& instanceName, uint16_t port,
+                            const std::string& hostId) {
+  if (registration_) return false;
   auto* c = new DnsRegistrationCtx();
-  c->instanceFq = instanceName + L"." + serviceName;
+  c->instanceFq = instanceName + L"._wvd._udp.local.";
 
   wchar_t host[256] = {};
   DWORD hl = 256;
   GetComputerNameExW(ComputerNameDnsHostname, host, &hl);
-  c->hostName = host[0] ? host : L"localhost";
+  c->hostName = std::wstring(host[0] ? host : L"localhost") + L".local.";
 
   if (!FirstRoutableIpv4(c->ip4))
     WVD_LOGW("DNS-SD: no routable IPv4 found; registering with empty address");
 
-  c->inst = DnsServiceConstructInstance(c->instanceFq.c_str(), c->hostName.c_str(), &c->ip4,
-                                        nullptr, port, 0 /*prio*/, 0 /*weight*/, 0, nullptr,
-                                        nullptr);
+  const auto id = Utf8ToWide(hostId.c_str());
+  PCWSTR keys[] = {L"v", L"id"};
+  PCWSTR values[] = {L"1", id.c_str()};
+  c->inst = DnsServiceConstructInstance(c->instanceFq.c_str(), c->hostName.c_str(),
+                                        c->ip4 ? &c->ip4 : nullptr, nullptr,
+                                        port, 0, 0, ARRAYSIZE(keys), keys, values);
   if (!c->inst) {
     WVD_LOGE("DnsServiceConstructInstance failed");
     delete c;
@@ -109,59 +100,23 @@ bool DnsRegistration::Register(const std::wstring& instanceName, const wchar_t* 
   c->req.hCredentials = nullptr;
   c->req.unicastEnabled = FALSE;
 
-  DWORD st = DnsServiceRegister(&c->req, nullptr);
-  if (st != 0 && st != ERROR_IO_PENDING) {
-    WVD_LOGW("DnsServiceRegister status=0x%lx (discovery is a hint only, §4.7-7)", st);
-    // The completion callback still owns this context, so it is kept rather
-    // than freed; it is never de-registered because nothing was registered.
-    // Discovery is a hint, and the contexts are bounded by the two transports
-    // this process announces.
-    c->registered = false;
-    registrations_.push_back(Entry{c, udp});
-    return false;
-  }
-  c->registered = true;
-  registrations_.push_back(Entry{c, udp});
-  WVD_LOGI("DNS-SD announcing %ls on port %u", c->instanceFq.c_str(), port);
-  return true;
+  const DWORD status = DnsServiceRegister(&c->req, nullptr);
+  registration_ = c;
+  c->registered = status == ERROR_SUCCESS || status == DNS_REQUEST_PENDING;
+  if (!c->registered)
+    WVD_LOGW("DNS-SD registration failed (status 0x%lx)", status);
+  return c->registered;
 }
 
-bool DnsRegistration::Start(const std::wstring& instanceName, uint16_t port) {
-  return Register(instanceName, kTcpService, port, {}, false);
-}
-
-bool DnsRegistration::StartUdp(const std::wstring& instanceName, uint16_t port,
-                               const std::string& hostId) {
-  std::vector<std::pair<std::string, std::string>> txt = {
-      {"v", "1"},
-      {"id", hostId},
-  };
-  return Register(instanceName, kUdpService, port, txt, true);
-}
-
-void DnsRegistration::StopOne(bool udp) {
-  for (auto it = registrations_.begin(); it != registrations_.end(); ++it) {
-    if (it->udp != udp) continue;
-    auto* c = static_cast<DnsRegistrationCtx*>(it->ctx);
-    if (c && c->registered) {
-      c->retiring = true;
-      const DWORD st = DnsServiceDeRegister(&c->req, nullptr);
-      if (st != 0 && st != ERROR_IO_PENDING) {
-        WVD_LOGW("DnsServiceDeRegister status=0x%lx", st);
-        c->retiring = false;
-      }
-    }
-    // Neither the instance nor the context is freed: see DnsRegistrationCtx.
-    registrations_.erase(it);
-    return;
-  }
-}
-
-void DnsRegistration::StopTcp() { StopOne(false); }
-void DnsRegistration::StopUdp() { StopOne(true); }
-
-void DnsRegistration::StopAll() {
-  while (!registrations_.empty()) StopOne(registrations_.front().udp);
+DnsRegistration::~DnsRegistration() {
+  auto* c = static_cast<DnsRegistrationCtx*>(registration_);
+  if (!c || !c->registered) return;
+  c->retiring = true;
+  const DWORD status = DnsServiceDeRegister(&c->req, nullptr);
+  if (status != ERROR_SUCCESS && status != DNS_REQUEST_PENDING)
+    WVD_LOGW("DNS-SD deregistration failed (status 0x%lx)", status);
+  // The sole registration's request and instance stay valid for the process.
+  // DNSAPI can complete deregistration after this destructor returns.
 }
 
 }  // namespace wvd

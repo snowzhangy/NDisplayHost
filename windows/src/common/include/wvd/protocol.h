@@ -350,16 +350,16 @@ struct IpcStatusResponse {
 
 static_assert(sizeof(PacketHeader) == 20, "wire header");
 static_assert(sizeof(MediaPayloadHeader) == 52, "wire media header");
-static_assert(sizeof(HelloPayload) == 60, "Apple TCP hello layout");
-static_assert(sizeof(MonitorDesc) == 92, "Apple TCP monitor layout");
-static_assert(sizeof(CodecConfigPayload) == 44, "Apple TCP codec layout");
-static_assert(sizeof(InputEvent) == 24, "Apple TCP input layout");
-static_assert(sizeof(CursorShapePayload) == 32, "Apple TCP cursor shape layout");
-static_assert(sizeof(CursorPosPayload) == 40, "Apple TCP cursor position layout");
-static_assert(sizeof(AudioPayload) == 40, "Apple TCP audio layout");
-static_assert(sizeof(ModeChangeRequest) == 20, "Apple TCP mode change layout");
-static_assert(sizeof(DisplayModesPayload) == 24, "Apple TCP display modes layout");
-static_assert(sizeof(DisplayModeDesc) == 16, "Apple TCP display mode entry layout");
+static_assert(sizeof(HelloPayload) == 60, "hello layout");
+static_assert(sizeof(MonitorDesc) == 92, "monitor layout");
+static_assert(sizeof(CodecConfigPayload) == 44, "codec layout");
+static_assert(sizeof(InputEvent) == 24, "input layout");
+static_assert(sizeof(CursorShapePayload) == 32, "cursor shape layout");
+static_assert(sizeof(CursorPosPayload) == 40, "cursor position layout");
+static_assert(sizeof(AudioPayload) == 40, "audio layout");
+static_assert(sizeof(ModeChangeRequest) == 20, "mode change layout");
+static_assert(sizeof(DisplayModesPayload) == 24, "display modes layout");
+static_assert(sizeof(DisplayModeDesc) == 16, "display mode entry layout");
 
 // ---- builder / view ---------------------------------------------------------
 

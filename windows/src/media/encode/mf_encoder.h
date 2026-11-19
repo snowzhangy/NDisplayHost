@@ -40,7 +40,7 @@ uint32_t MfFrameBufferBytes(uint32_t kbps, uint32_t fpsNum, uint32_t fpsDen);
 std::unique_ptr<IVideoEncoder> CreateMfHardwareEncoder(const EncoderInitDesc& d);
 std::unique_ptr<IVideoEncoder> CreateMfSoftwareEncoder(const EncoderInitDesc& d);
 
-// Annex B helpers shared by the session (codec config) and the diag sink.
+// Annex B helpers shared by the session (codec config) and diagnostics.
 // Returns the concatenated parameter-set NAL units (with start codes) found in
 // `au`: VPS/SPS/PPS for HEVC, SPS/PPS for H.264. Empty when there are none.
 std::vector<uint8_t> ExtractParameterSets(Codec codec, const uint8_t* au, size_t len);

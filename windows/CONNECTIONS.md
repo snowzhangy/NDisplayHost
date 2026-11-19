@@ -1,15 +1,14 @@
 # Connections, pairing and offline use
 
-The control panel starts the Windows development TCP host. The Windows media worker
-can also use [QUIC and authenticated pairing](README.md#quic-transport-wire-v1) from
-the command line when built with MsQuic.
+The control panel and media worker serve [WIRE v1 over QUIC](README.md#quic-transport-wire-v1)
+on UDP port 47800.
 
 ## Existing network
 
 PC and headset need a local route to each other. Ethernet on the PC and Wi-Fi
 on the headset can share the same LAN. Internet access is not required. Guest,
 hotel and airplane Wi-Fi may isolate clients, preventing this connection.
-The present local diagnostic receiver uses TCP port 50001 by default.
+Allow inbound UDP 47800 on the PC network profile used by the headset.
 
 ## Direct Wi-Fi fallback
 
@@ -45,12 +44,11 @@ Implementation references: Microsoft's
 [desktop legacy-AP sample](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/WiFiDirectLegacyAP)
 and [Wi-Fi Direct desktop guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/partnerapps/wi-fi-direct).
 
-## Handshake once Windows implements the shared protocol
+## Pairing
 
 The existing Apple client discovers a host through `_wvd._udp`, opens QUIC/TLS
-and exchanges capabilities. New-device pairing requires an explicitly opened
-pairing window: both devices show the same six-digit authentication string and
-the user confirms both. The headset pins the host certificate; the host stores
+and exchanges capabilities. Both devices display a six-digit code on the first
+connection. Compare the codes and confirm on both devices. The headset pins the host certificate; the host stores
 the client's public key. Reconnect authenticates the remembered identity.
 Keyboard/mouse consent is a separate decision; video does not depend on granting it.
 See [`core/proto/WIRE.md` §7](../core/proto/WIRE.md#7-pairing-and-authentication) for the exact contract.

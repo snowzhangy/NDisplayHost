@@ -7,8 +7,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <deque>
+#include <condition_variable>
 #include <mutex>
+#include <set>
 
 #define QUIC_API_ENABLE_PREVIEW_FEATURES 1  // ConnectionExportKeyingMaterial (WIRE.md §7)
 #include <msquic.h>
@@ -18,6 +19,15 @@
 #include "wvd/logging.h"
 
 namespace wvd {
+
+struct QuicServerState {
+  IQuicSink* sink = nullptr;
+  HQUIC config = nullptr;
+  std::mutex mutex;
+  std::condition_variable drained;
+  std::set<HQUIC> connections;
+};
+
 namespace {
 
 const QUIC_API_TABLE* Api() {
@@ -45,61 +55,20 @@ HQUIC Registration() {
 
 // ---- per-stream send queue -------------------------------------------------
 
-// msquic keeps reading a send buffer until it reports SEND_COMPLETE, so the
-// bytes in flight live here and only here.
-struct StreamCtx {
-  HQUIC conn = nullptr;
-  HQUIC stream = nullptr;
-  IQuicSink* sink = nullptr;
-  std::mutex m;
-  std::deque<std::vector<uint8_t>> out;
-  // The block handed to msquic. Both the bytes and the QUIC_BUFFER that
-  // describes them must outlive the StreamSend call � msquic reads both until
-  // SEND_COMPLETE � so they live in one heap object owned here meanwhile.
-  struct InFlight {
-    std::vector<uint8_t> bytes;
-    QUIC_BUFFER qb;
-  };
-  InFlight* inFlight = nullptr;
-  size_t queued = 0;
-  bool pending = false;  // a StreamSend is outstanding
-  bool closed = false;
+// MsQuic orders the stream writes. Keep their data alive until completion,
+// and bound both unacknowledged and queued reliable control bytes.
+struct StreamSendBlock {
+  std::vector<uint8_t> bytes;
+  QUIC_BUFFER buffer;
 };
 
-// Largest single msquic stream send (QUIC_BUFFER length is 16-bit).
-constexpr size_t kStreamChunk = 60u * 1024u;
-// A peer that lets this much control data pile up has stopped reading.
-constexpr size_t kStreamQueueLimit = 4u << 20;
+struct StreamCtx {
+  HQUIC conn = nullptr;
+  IQuicSink* sink = nullptr;
+  std::atomic<size_t> pendingBytes{0};
+};
 
-// Called without the lock; picks up the next queued block if nothing is in
-// flight. Safe against a completion delivered on this same thread.
-void StreamPump(StreamCtx* sc) {
-  StreamCtx::InFlight* send = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(sc->m);
-    if (sc->closed || sc->pending || sc->out.empty()) return;
-    send = new StreamCtx::InFlight();
-    send->bytes = std::move(sc->out.front());
-    sc->out.pop_front();
-    sc->queued -= send->bytes.size();
-    send->qb.Length = static_cast<UINT32>(send->bytes.size());
-    send->qb.Buffer = send->bytes.data();
-    sc->pending = true;
-    sc->inFlight = send;
-  }
-  const QUIC_STATUS st = Api()->StreamSend(sc->stream, &send->qb, 1, QUIC_SEND_FLAG_NONE, send);
-  if (QUIC_FAILED(st)) {
-    WVD_LOGW("quic: StreamSend failed 0x%x", st);
-    std::lock_guard<std::mutex> lk(sc->m);
-    // No completion is coming for a call that failed outright.
-    if (sc->inFlight == send) {
-      sc->inFlight = nullptr;
-      sc->pending = false;
-      delete send;
-    }
-    sc->closed = true;
-  }
-}
+constexpr size_t kStreamQueueLimit = 4u << 20;
 
 QUIC_STATUS _stdcall StreamCb(HQUIC stream, void* ctx, QUIC_STREAM_EVENT* ev) {
   auto* sc = static_cast<StreamCtx*>(ctx);
@@ -116,40 +85,16 @@ QUIC_STATUS _stdcall StreamCb(HQUIC stream, void* ctx, QUIC_STREAM_EVENT* ev) {
       return QUIC_STATUS_SUCCESS;
     }
     case QUIC_STREAM_EVENT_SEND_COMPLETE: {
-      auto* buf = static_cast<StreamCtx::InFlight*>(ev->SEND_COMPLETE.ClientContext);
-      {
-        std::lock_guard<std::mutex> lk(sc->m);
-        // Only this callback may release the buffer; a shutdown that already
-        // reclaimed it leaves the pointer null.
-        if (sc->inFlight == buf) {
-          sc->inFlight = nullptr;
-          sc->pending = false;
-        } else {
-          buf = nullptr;
-        }
-        if (ev->SEND_COMPLETE.Canceled) sc->closed = true;
-      }
-      delete buf;
-      StreamPump(sc);
+      auto* block = static_cast<StreamSendBlock*>(ev->SEND_COMPLETE.ClientContext);
+      sc->pendingBytes.fetch_sub(block->bytes.size(), std::memory_order_relaxed);
+      delete block;
       return QUIC_STATUS_SUCCESS;
     }
-    case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
-      bool wasClosed = false;
-      StreamCtx::InFlight* stranded = nullptr;
-      {
-        std::lock_guard<std::mutex> lk(sc->m);
-        wasClosed = sc->closed;
-        sc->closed = true;
-        // A send that never completed dies with the stream.
-        stranded = sc->inFlight;
-        sc->inFlight = nullptr;
-      }
-      delete stranded;
-      if (!wasClosed) sc->sink->OnQuicStreamClosed(sc->conn, stream);
+    case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+      sc->sink->OnQuicStreamClosed(sc->conn, stream);
       Api()->StreamClose(stream);
       delete sc;
       return QUIC_STATUS_SUCCESS;
-    }
     default:
       return QUIC_STATUS_SUCCESS;
   }
@@ -157,29 +102,23 @@ QUIC_STATUS _stdcall StreamCb(HQUIC stream, void* ctx, QUIC_STREAM_EVENT* ev) {
 
 // ---- per-connection state --------------------------------------------------
 
-using FinishedFlag = std::shared_ptr<std::atomic<bool>>;
-
 struct ConnCtx {
   HQUIC conn = nullptr;
   IQuicSink* sink = nullptr;
-  bool server = false;
+  QuicServerState* server = nullptr;
+  std::atomic<uint32_t> datagramLimit{0};
+  std::atomic<size_t> datagramPendingBytes{0};
+  std::atomic<uint64_t> datagramsSent{0}, datagramsDropped{0};
   std::vector<uint8_t> pinCertSha256;  // client: refuse any other leaf
   std::vector<uint8_t> peerCertHash;
-  FinishedFlag finished;
   uint32_t lastStatus = 0;  // transport shutdown code, for the sink
-  // A msquic connection handle is closed exactly once, by whichever side ends
-  // last: the callback when the connection is gone, or the owner (a client) if
-  // it has already stopped caring. Connections the listener accepted have no
-  // owner, so their side of that bargain starts closed.
+  // The client keeps its handle until the sink's final callback returns.
   std::mutex m;
-  bool done = false;       // SHUTDOWN_COMPLETE has been handled
-  bool ownerGone = false;  // the owner released it (always true for servers)
+  std::condition_variable finished;
+  bool done = false;
 };
 
-// One datagram in flight. msquic keeps the QUIC_BUFFER array *and* the payload
-// until the send state becomes final, so the descriptor lives beside the bytes
-// and the state-change event frees both; a descriptor on the stack is dead
-// memory by the time the flush actually reads it.
+// The descriptor and bytes live until MsQuic reports sent or canceled.
 struct DatagramBlock {
   std::vector<uint8_t> bytes;
   QUIC_BUFFER qb;
@@ -217,23 +156,35 @@ QUIC_STATUS _stdcall ConnCb(HQUIC conn, void* ctx, QUIC_CONNECTION_EVENT* ev) {
       HQUIC s = ev->PEER_STREAM_STARTED.Stream;
       auto* sc = new StreamCtx();
       sc->conn = conn;
-      sc->stream = s;
       sc->sink = cc->sink;
       Api()->SetCallbackHandler(s, reinterpret_cast<void*>(StreamCb), sc);
       Api()->SetContext(s, sc);
       cc->sink->OnQuicStream(conn, s);
       return QUIC_STATUS_SUCCESS;
     }
+    case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED:
+      cc->datagramLimit.store(ev->DATAGRAM_STATE_CHANGED.SendEnabled ?
+                                  ev->DATAGRAM_STATE_CHANGED.MaxSendLength : 0,
+                              std::memory_order_relaxed);
+      return QUIC_STATUS_SUCCESS;
     case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
       if (ev->DATAGRAM_RECEIVED.Buffer && ev->DATAGRAM_RECEIVED.Buffer->Length)
         cc->sink->OnQuicDatagram(conn, ev->DATAGRAM_RECEIVED.Buffer->Buffer,
                                  ev->DATAGRAM_RECEIVED.Buffer->Length);
       return QUIC_STATUS_SUCCESS;
-    case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED:
-      // Our send block is ours until the state is final.
-      if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(ev->DATAGRAM_SEND_STATE_CHANGED.State))
-        delete static_cast<std::vector<uint8_t>*>(ev->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+    case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
+      auto& report = ev->DATAGRAM_SEND_STATE_CHANGED;
+      auto* block = static_cast<DatagramBlock*>(report.ClientContext);
+      if (block && (report.State == QUIC_DATAGRAM_SEND_SENT ||
+                    QUIC_DATAGRAM_SEND_STATE_IS_FINAL(report.State))) {
+        cc->datagramPendingBytes.fetch_sub(block->bytes.size(), std::memory_order_relaxed);
+        auto& count = report.State == QUIC_DATAGRAM_SEND_SENT ? cc->datagramsSent : cc->datagramsDropped;
+        count.fetch_add(1, std::memory_order_relaxed);
+        delete block;
+        report.ClientContext = nullptr;
+      }
       return QUIC_STATUS_SUCCESS;
+    }
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
       cc->lastStatus = static_cast<uint32_t>(ev->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
       WVD_LOGV("quic: transport shut the connection down (0x%x)",
@@ -246,16 +197,20 @@ QUIC_STATUS _stdcall ConnCb(HQUIC conn, void* ctx, QUIC_CONNECTION_EVENT* ev) {
       // waiting here to know it is safe to destroy it: report first, retire
       // after.
       cc->sink->OnQuicClosed(conn, cc->lastStatus);
-      bool retire = false;
-      {
-        std::lock_guard<std::mutex> lk(cc->m);
-        cc->done = true;
-        retire = cc->ownerGone;  // the owner is gone: the handle and ctx are ours
-      }
-      if (cc->finished) cc->finished->store(true);
-      if (retire) {
+      if (auto* server = cc->server) {
+        {
+          std::lock_guard<std::mutex> lock(server->mutex);
+          server->connections.erase(conn);
+          server->drained.notify_all();
+        }
         Api()->ConnectionClose(conn);
         delete cc;
+        return QUIC_STATUS_SUCCESS;
+      }
+      {
+        std::lock_guard<std::mutex> lock(cc->m);
+        cc->done = true;
+        cc->finished.notify_one();
       }
       return QUIC_STATUS_SUCCESS;
     }
@@ -266,29 +221,28 @@ QUIC_STATUS _stdcall ConnCb(HQUIC conn, void* ctx, QUIC_CONNECTION_EVENT* ev) {
 
 // ---- listener --------------------------------------------------------------
 
-struct ServerCtx {
-  IQuicSink* sink = nullptr;
-  HQUIC config = nullptr;
-};
-
-QUIC_STATUS _stdcall ListenerCb(HQUIC listener, void* ctx, QUIC_LISTENER_EVENT* ev) {
-  if (ev->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) return QUIC_STATUS_NOT_SUPPORTED;
-  auto* s = static_cast<ServerCtx*>(ctx);
-  auto* cc = new ConnCtx();
+QUIC_STATUS _stdcall ListenerCb(HQUIC, void* ctx, QUIC_LISTENER_EVENT* ev) {
+  if (ev->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) return QUIC_STATUS_SUCCESS;
+  auto* server = static_cast<QuicServerState*>(ctx);
+  auto cc = std::make_unique<ConnCtx>();
   cc->conn = ev->NEW_CONNECTION.Connection;
-  cc->sink = s->sink;
-  cc->server = true;
-  cc->ownerGone = true;  // nothing outlives the callback on this side
-  Api()->SetCallbackHandler(cc->conn, reinterpret_cast<void*>(ConnCb), cc);
-  Api()->SetContext(cc->conn, cc);
-  const QUIC_STATUS st = Api()->ConnectionSetConfiguration(cc->conn, s->config);
-  if (QUIC_FAILED(st)) {
-    WVD_LOGW("quic: ConnectionSetConfiguration failed 0x%x", st);
-    Api()->ConnectionClose(cc->conn);
-    delete cc;
-    return st;
+  cc->sink = server->sink;
+  cc->server = server;
+  const HQUIC conn = cc->conn;
+  {
+    std::lock_guard<std::mutex> lock(server->mutex);
+    server->connections.insert(conn);
   }
-  return QUIC_STATUS_SUCCESS;
+  Api()->SetCallbackHandler(conn, reinterpret_cast<void*>(ConnCb), cc.get());
+  const QUIC_STATUS status = Api()->ConnectionSetConfiguration(conn, server->config);
+  if (QUIC_SUCCEEDED(status)) {
+    cc.release();
+  } else {
+    std::lock_guard<std::mutex> lock(server->mutex);
+    server->connections.erase(conn);
+    WVD_LOGW("quic: ConnectionSetConfiguration failed 0x%x", status);
+  }
+  return status;
 }
 
 // Shared settings: datagrams on (RFC 9221), 15 s idle (WIRE.md §2).
@@ -303,8 +257,7 @@ void ApplySettings(QUIC_SETTINGS& settings, uint32_t idleMs, uint32_t handshakeM
   settings.IsSet.DatagramReceiveEnabled = TRUE;
   settings.PeerBidiStreamCount = peerBidiStreams;
   settings.IsSet.PeerBidiStreamCount = TRUE;
-  // Media is throwaway: never let a stalled connection buffer more than a
-  // second of work, and keep the datagram path the priority.
+  // The reliable control queue owns and bounds its send buffers.
   settings.SendBufferingEnabled = FALSE;
   settings.IsSet.SendBufferingEnabled = TRUE;
 }
@@ -347,8 +300,8 @@ bool QuicServer::Start(const QuicServerOptions& options, HostIdentity& identity,
   if (!QuicSharedOpen(error)) return false;
   const QUIC_API_TABLE* api = Api();
 
-  static ServerCtx sctx;  // one listener per process is enough for a host
-  sctx.sink = &sink;
+  auto state = std::make_unique<QuicServerState>();
+  state->sink = &sink;
 
   QUIC_SETTINGS settings;
   ApplySettings(settings, options.idleTimeoutMs, options.handshakeIdleTimeoutMs,
@@ -361,8 +314,7 @@ bool QuicServer::Start(const QuicServerOptions& options, HostIdentity& identity,
     if (error) *error = "quic: ConfigurationOpen failed";
     return false;
   }
-  config_ = config;
-  sctx.config = config;
+  state->config = config;
 
   QUIC_CREDENTIAL_CONFIG cred{};
   cred.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
@@ -372,18 +324,17 @@ bool QuicServer::Start(const QuicServerOptions& options, HostIdentity& identity,
   if (QUIC_FAILED(api->ConfigurationLoadCredential(config, &cred))) {
     if (error) *error = "quic: the host certificate could not be loaded into the TLS stack";
     api->ConfigurationClose(config);
-    config_ = nullptr;
-    sctx.config = nullptr;
     return false;
   }
 
   HQUIC listener = nullptr;
-  if (QUIC_FAILED(api->ListenerOpen(static_cast<HQUIC>(QuicRegistration()), ListenerCb, &sctx,
+  if (QUIC_FAILED(api->ListenerOpen(static_cast<HQUIC>(QuicRegistration()), ListenerCb, state.get(),
                                     &listener))) {
     if (error) *error = "quic: ListenerOpen failed";
-    Stop();
+    api->ConfigurationClose(config);
     return false;
   }
+  state_ = state.release();
   listener_ = listener;
 
   SOCKADDR_INET addr{};
@@ -406,11 +357,11 @@ bool QuicServer::Start(const QuicServerOptions& options, HostIdentity& identity,
   // With port 0 the OS picked one; report what is actually bound (tests).
   port_ = options.port;
   if (port_ == 0) {
-    SOCKADDR_INET addr{};
-    uint32_t len = sizeof(addr);
+    SOCKADDR_INET local{};
+    uint32_t len = sizeof(local);
     if (QUIC_SUCCEEDED(api->GetParam(listener, QUIC_PARAM_LISTENER_LOCAL_ADDRESS, &len,
-                                     &addr)))
-      port_ = ntohs(addr.Ipv6.sin6_port);
+                                     &local)))
+      port_ = ntohs(local.Ipv4.sin_port);
   }
   WVD_LOGI("quic: listening on udp:%u (ALPN %s, idle %u ms)", port_, options.alpn,
            options.idleTimeoutMs);
@@ -418,12 +369,19 @@ bool QuicServer::Start(const QuicServerOptions& options, HostIdentity& identity,
 }
 
 void QuicServer::Stop() {
-  const QUIC_API_TABLE* api = Api();
-  if (!api) return;
-  if (listener_) api->ListenerClose(static_cast<HQUIC>(listener_));
+  if (!state_) return;
+  const auto* api = Api();
+  api->ListenerClose(static_cast<HQUIC>(listener_));
+  {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    for (HQUIC conn : state_->connections)
+      api->ConnectionShutdown(conn, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    state_->drained.wait(lock, [this] { return state_->connections.empty(); });
+  }
+  api->ConfigurationClose(state_->config);
+  delete state_;
+  state_ = nullptr;
   listener_ = nullptr;
-  if (config_) api->ConfigurationClose(static_cast<HQUIC>(config_));
-  config_ = nullptr;
   port_ = 0;
 }
 
@@ -462,9 +420,7 @@ bool QuicClient::Connect(const std::string& host, uint16_t port, IQuicSink& sink
 
   auto* cc = new ConnCtx();
   cc->sink = &sink;
-  cc->server = false;
   cc->pinCertSha256 = verifyPeerCertSha256;
-  cc->finished = std::make_shared<std::atomic<bool>>(false);
   if (QUIC_FAILED(api->ConnectionOpen(static_cast<HQUIC>(QuicRegistration()), ConnCb, cc,
                                       &cc->conn))) {
     if (error) *error = "quic client: ConnectionOpen failed";
@@ -486,27 +442,15 @@ bool QuicClient::Connect(const std::string& host, uint16_t port, IQuicSink& sink
 void QuicClient::Close() {
   const QUIC_API_TABLE* api = Api();
   if (conn_) {
-    ConnCtx* cc = ConnOf(static_cast<HQUIC>(conn_));
-    FinishedFlag flag;
-    bool retire = false;
-    if (cc) {
-      // Declaring that we are done with the connection must be atomic with the
-      // shutdown call: the callback may retire it at any moment afterwards, and
-      // a handle that was closed under us must never be touched again.
-      std::lock_guard<std::mutex> lk(cc->m);
-      cc->ownerGone = true;
-      flag = cc->finished;
-      if (cc->done) retire = true;  // the callback finished first: the handle is ours
-      else api->ConnectionShutdown(static_cast<HQUIC>(conn_), QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    const auto connection = static_cast<HQUIC>(conn_);
+    auto* cc = ConnOf(connection);
+    api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    {
+      std::unique_lock<std::mutex> lock(cc->m);
+      cc->finished.wait(lock, [cc] { return cc->done; });
     }
-    if (retire) {
-      api->ConnectionClose(static_cast<HQUIC>(conn_));
-      delete cc;
-    } else if (flag) {
-      // The callback retires the connection now; the sink belongs to us, so it
-      // must not go away before the callback is through with it.
-      for (int i = 0; i < 500 && !flag->load(); ++i) Sleep(5);
-    }
+    api->ConnectionClose(connection);
+    delete cc;
     conn_ = nullptr;
   }
   if (config_) {
@@ -540,12 +484,16 @@ bool ExportKeyingMaterial(QuicConn conn, const char* label, std::vector<uint8_t>
 }
 
 uint32_t MaxDatagramPayload(QuicConn conn) {
-  // msquic does not expose the negotiated/path limit. The real ceiling comes
-  // from the client's Hello (max_datagram_size) and msquic's own PMTU
-  // discovery, which refuses an oversized send; 1200 is the QUIC minimum
-  // payload and always safe.
-  (void)conn;
-  return 1200;
+  auto* cc = conn ? ConnOf(static_cast<HQUIC>(conn)) : nullptr;
+  return cc ? cc->datagramLimit.load(std::memory_order_relaxed) : 0;
+}
+
+DatagramStats GetDatagramStats(QuicConn conn) {
+  auto* cc = conn ? ConnOf(static_cast<HQUIC>(conn)) : nullptr;
+  if (!cc) return {};
+  return {cc->datagramPendingBytes.load(std::memory_order_relaxed),
+          cc->datagramsSent.load(std::memory_order_relaxed),
+          cc->datagramsDropped.load(std::memory_order_relaxed)};
 }
 
 std::string PeerAddress(QuicConn conn) {
@@ -566,44 +514,56 @@ std::string PeerAddress(QuicConn conn) {
 }
 
 bool SendStream(QuicStream stream, const uint8_t* data, size_t len) {
-  StreamCtx* sc = stream ? StreamOf(static_cast<HQUIC>(stream)) : nullptr;
-  if (!sc) return false;
-  {
-    std::lock_guard<std::mutex> lk(sc->m);
-    if (sc->closed) return false;
-    if (sc->queued + len > kStreamQueueLimit) {
-      WVD_LOGW("quic: stream backlog full (%zu bytes) — peer stopped reading", sc->queued);
-      sc->closed = true;
+  auto* sc = stream ? StreamOf(static_cast<HQUIC>(stream)) : nullptr;
+  if (!sc || !len || len > kStreamQueueLimit) return false;
+  size_t pending = sc->pendingBytes.load(std::memory_order_relaxed);
+  do {
+    if (pending + len > kStreamQueueLimit) return false;
+  } while (!sc->pendingBytes.compare_exchange_weak(pending, pending + len,
+                                                  std::memory_order_relaxed));
+
+  auto* block = new StreamSendBlock{{data, data + len}, {}};
+  block->buffer = {static_cast<uint32_t>(len), block->bytes.data()};
+  const auto status = Api()->StreamSend(static_cast<HQUIC>(stream), &block->buffer, 1,
+                                         QUIC_SEND_FLAG_NONE, block);
+  if (QUIC_SUCCEEDED(status)) return true;
+  sc->pendingBytes.fetch_sub(len, std::memory_order_relaxed);
+  delete block;
+  return false;
+}
+
+bool SendDatagram(QuicConn conn, std::vector<uint8_t> data, bool urgent) {
+  auto* cc = conn ? ConnOf(static_cast<HQUIC>(conn)) : nullptr;
+  if (!cc || data.empty()) return false;
+  const size_t bytes = data.size();
+  // Bound data waiting behind MsQuic's congestion window. Leave room for
+  // cursor/audio and recovery even when video is backlogged.
+  constexpr size_t kVideoQueueLimit = 64 * 1024;
+  constexpr size_t kUrgentReserve = 8 * 1024;
+  const size_t limit = kVideoQueueLimit + (urgent ? kUrgentReserve : 0);
+  if (bytes > cc->datagramLimit.load(std::memory_order_relaxed)) {
+    cc->datagramsDropped.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  size_t pending = cc->datagramPendingBytes.load(std::memory_order_relaxed);
+  do {
+    if (pending + bytes > limit) {
+      cc->datagramsDropped.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
-    // One msquic send at a time, and no block larger than a QUIC_BUFFER.
-    for (size_t off = 0; off < len; off += kStreamChunk) {
-      const size_t n = (std::min)(kStreamChunk, len - off);
-      sc->out.emplace_back(data + off, data + off + n);
-      sc->queued += n;
-    }
-  }
-  StreamPump(sc);
-  return true;
-}
+  } while (!cc->datagramPendingBytes.compare_exchange_weak(
+      pending, pending + bytes, std::memory_order_relaxed));
 
-size_t StreamBacklog(QuicStream stream) {
-  StreamCtx* sc = stream ? StreamOf(static_cast<HQUIC>(stream)) : nullptr;
-  if (!sc) return 0;
-  std::lock_guard<std::mutex> lk(sc->m);
-  return sc->queued;
-}
-
-bool SendDatagram(QuicConn conn, std::vector<uint8_t> data) {
-  if (!conn || data.empty() || data.size() > 0xFFFF) return false;
-  auto* block = new DatagramBlock();
-  block->bytes = std::move(data);
-  block->qb.Length = static_cast<UINT32>(block->bytes.size());
-  block->qb.Buffer = block->bytes.data();
-  const QUIC_STATUS st = Api()->DatagramSend(static_cast<HQUIC>(conn), &block->qb, 1,
-                                             QUIC_SEND_FLAG_DGRAM_PRIORITY, block);
-  if (QUIC_FAILED(st)) delete block;  // refused: nothing was sent, nothing tracked
-  return QUIC_SUCCEEDED(st);
+  auto* block = new DatagramBlock{std::move(data), {}};
+  block->qb = {static_cast<uint32_t>(bytes), block->bytes.data()};
+  const auto flags = urgent ? QUIC_SEND_FLAG_DGRAM_PRIORITY : QUIC_SEND_FLAG_NONE;
+  const QUIC_STATUS status = Api()->DatagramSend(static_cast<HQUIC>(conn), &block->qb, 1,
+                                                flags, block);
+  if (QUIC_SUCCEEDED(status)) return true;
+  delete block;
+  cc->datagramPendingBytes.fetch_sub(bytes, std::memory_order_relaxed);
+  cc->datagramsDropped.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 QuicStream OpenStream(QuicConn conn) {
@@ -618,7 +578,6 @@ QuicStream OpenStream(QuicConn conn) {
     delete sc;
     return nullptr;
   }
-  sc->stream = stream;
   Api()->SetContext(stream, sc);
   if (QUIC_FAILED(Api()->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE))) {
     Api()->StreamClose(stream);

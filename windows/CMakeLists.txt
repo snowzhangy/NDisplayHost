@@ -58,34 +58,19 @@ if(WVD_ENABLE_NVENC AND WVD_NVENC_SDK_DIR)
   endif()
 endif()
 
-# QUIC (the UDP transport, WIRE.md §2) needs MsQuic built with Schannel TLS.
-# Run scripts/build-msquic.ps1 to fetch and build the pinned revision.
-# When it is missing everything still builds and runs over TCP; only the UDP
-# listener is left out, so a machine without the vendored build is not blocked.
-option(WVD_REQUIRE_MSQUIC "Require QUIC support in this build" OFF)
+# The Windows host uses MsQuic with Schannel TLS.
 set(WVD_MSQUIC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msquic" CACHE PATH "MsQuic source and build tree")
 set(WVD_MSQUIC_LIB "${WVD_MSQUIC_ROOT}/build/obj/Release/msquic.lib")
 set(WVD_MSQUIC_DLL "${WVD_MSQUIC_ROOT}/build/bin/Release/msquic.dll")
-if(EXISTS "${WVD_MSQUIC_LIB}" AND EXISTS "${WVD_MSQUIC_DLL}")
-  set(WVD_HAVE_MSQUIC ON)
-elseif(WVD_REQUIRE_MSQUIC)
-  message(FATAL_ERROR "MsQuic is required. Run scripts/build-msquic.ps1 first.")
-else()
-  set(WVD_HAVE_MSQUIC OFF)
-  message(STATUS "msquic is not built in ${WVD_MSQUIC_ROOT} — building WITHOUT the UDP "
-                 "(QUIC) transport. Run scripts/build-msquic.ps1 to enable it.")
+if(NOT EXISTS "${WVD_MSQUIC_ROOT}/src/inc/msquic.h" OR
+   NOT EXISTS "${WVD_MSQUIC_LIB}" OR NOT EXISTS "${WVD_MSQUIC_DLL}")
+  message(FATAL_ERROR "MsQuic is required. Run windows/scripts/build-msquic.ps1 from an x64 Visual Studio developer shell.")
 endif()
 add_library(wvd_msquic INTERFACE)
-if(WVD_HAVE_MSQUIC)
-  target_include_directories(wvd_msquic INTERFACE "${WVD_MSQUIC_ROOT}/src/inc")
-  target_link_directories(wvd_msquic INTERFACE "${WVD_MSQUIC_ROOT}/build/obj/Release")
-  target_link_libraries(wvd_msquic INTERFACE msquic.lib bcrypt crypt32 ncrypt)
-endif()
+target_include_directories(wvd_msquic INTERFACE "${WVD_MSQUIC_ROOT}/src/inc")
+target_link_libraries(wvd_msquic INTERFACE "${WVD_MSQUIC_LIB}" bcrypt crypt32 ncrypt)
 # Link msquic into an executable and put the runtime next to it.
 function(wvd_link_msquic target)
-  if(NOT WVD_HAVE_MSQUIC)
-    return()
-  endif()
   target_link_libraries(${target} PRIVATE wvd_msquic)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WVD_MSQUIC_DLL}"

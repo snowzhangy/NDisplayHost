@@ -6,10 +6,14 @@
 //   wvd-diag modes                   sizes the headset's size menu would offer
 //   wvd-diag capture [--monitor N] [--seconds S] [--write-nv12 F]
 //                                    DDA smoke: fps, dirty stats, pointer state
-//   wvd-diag sink --port P           receive WVD packets (dev headset stub)
 //   wvd-diag owner-ping              IPC to wvd-owner
 //   wvd-diag coords-selftest         §4.4 transform checks
 //   wvd-diag curtain-test            --screen-off curtain stays out of the stream
+#include "quic_host.h"
+
+#include <condition_variable>
+#include <mutex>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -27,7 +31,6 @@
 #include "wvd/logging.h"
 #include "wvd/protocol.h"
 #include "wvd/time.h"
-#include "wvd/transport.h"
 
 // owner/topology.h (compiled into diag directly)
 #include "../../owner/topology.h"
@@ -287,79 +290,54 @@ int CmdCapture(int argc, char** argv) {
   return 0;
 }
 
-int CmdSink(int argc, char** argv) {
-  std::string host = "127.0.0.1";
-  int port = 50001;
-  for (int i = 2; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a == "--host" && i + 1 < argc) host = argv[++i];
-    else if (a == "--port" && i + 1 < argc) port = atoi(argv[++i]);
+class QuicProbe : public IQuicSink {
+ public:
+  void OnQuicConnected(QuicConn, const std::vector<uint8_t>&) override { Finish(true); }
+  void OnQuicClosed(QuicConn, uint32_t) override { Finish(false); }
+  void OnQuicStream(QuicConn, QuicStream) override {}
+  void OnQuicStreamData(QuicConn, QuicStream, const uint8_t*, size_t) override {}
+  void OnQuicStreamClosed(QuicConn, QuicStream) override {}
+  void OnQuicDatagram(QuicConn, const uint8_t*, size_t) override {}
+
+  bool WaitConnected() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(4), [this] { return finished_; }) &&
+           connected_;
   }
-  WinsockGuard ws;
-  TcpChannel ch;
-  if (!ch.Connect(host.c_str(), uint16_t(port), 5000)) {
-    printf("connect %s:%d failed\n", host.c_str(), port);
+
+ private:
+  void Finish(bool connected) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    connected_ = connected;
+    finished_ = true;
+    changed_.notify_one();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool connected_ = false;
+  bool finished_ = false;
+};
+
+int CmdQuicProbe(int argc, char** argv) {
+  char* end = nullptr;
+  const auto port = argc == 3 ? strtoul(argv[2], &end, 10) : 0;
+  if (!port || port > 65535 || !end || *end) {
+    fprintf(stderr, "usage: wvd-diag quic-probe PORT\n");
+    return 2;
+  }
+  QuicProbe probe;
+  QuicClient client;
+  std::string error;
+  if (!client.Connect("127.0.0.1", uint16_t(port), probe, &error, {}, 4000)) {
+    fprintf(stderr, "%s\n", error.c_str());
     return 1;
   }
-  printf("connected; sending Hello\n");
-  PacketWriter hello(PacketKind::Hello);
-  HelloPayload hp{};
-  hp.protocolVersion = kWireVersion;
-  hp.maxDecodedPixelsPerSec = 750'000'000;
-  memcpy(hp.deviceName, "wvd-diag-sink", 13);
-  hello.Append(hp);
-  auto hb = hello.Take();
-  ch.Send(hb.data(), hb.size());
-
-  uint64_t counts[64] = {};
-  uint64_t mediaBytes = 0;
-  int64_t lastReport = QpcNow();
-  uint64_t lastTotal = 0;
-  for (;;) {
-    auto pkt = ch.RecvPacket(2000);
-    if (!pkt) {
-      printf("peer gone / timeout\n");
-      break;
-    }
-    auto pv = PacketView::Parse(pkt->data(), pkt->size());
-    if (!pv) continue;
-    uint16_t k = pv->header().kind;
-    if (k < 64) ++counts[k];
-    if (pv->kind() == PacketKind::Media) {
-      auto mh = pv->Get<MediaPayloadHeader>();
-      if (mh) mediaBytes += mh->dataSize;
-    }
-    if (pv->kind() == PacketKind::CodecConfig) {
-      auto cc = pv->Get<CodecConfigPayload>();
-      if (cc)
-        printf("CodecConfig gen=%llu %ux%u %u/%u bitrate=%ukbps vui(p=%u t=%u m=%u full=%u)\n",
-               (unsigned long long)cc->codecGen, cc->width, cc->height, cc->fpsNum,
-               cc->fpsDen, cc->bitrateKbps, cc->vui.primaries, cc->vui.transfer,
-               cc->vui.matrix, cc->vui.fullRange);
-    }
-    if (pv->kind() == PacketKind::MonitorLayout) {
-      auto ml = pv->Get<MonitorLayoutPayload>();
-      if (ml) {
-        auto mons = pv->ArrayAt<MonitorDesc>(sizeof(MonitorLayoutPayload), ml->count);
-        printf("MonitorLayout gen=%llu count=%u\n", (unsigned long long)ml->layoutGen,
-               ml->count);
-        for (auto& m : mons)
-          printf("  %-16s %6d,%-6d %5ux%-5u%s\n", m.id, m.x, m.y, m.width, m.height,
-                 m.primary ? " primary" : "");
-      }
-    }
-    int64_t now = QpcNow();
-    if (now - lastReport > MsToQpc(1000)) {
-      uint64_t total = 0;
-      for (auto c : counts) total += c;
-      printf("pkt/s=%llu media=%llu curShape=%llu curPos=%llu mediaBytes=%.1fMB\n",
-             (total - lastTotal), counts[uint16_t(PacketKind::Media)],
-             counts[uint16_t(PacketKind::CursorShape)],
-             counts[uint16_t(PacketKind::CursorPos)], mediaBytes / 1e6);
-      lastReport = now;
-      lastTotal = total;
-    }
+  if (!probe.WaitConnected() || !quic::MaxDatagramPayload(client.conn())) {
+    fprintf(stderr, "QUIC datagram handshake failed on UDP port %lu.\n", port);
+    return 1;
   }
+  printf("QUIC datagram handshake succeeded on UDP port %lu.\n", port);
   return 0;
 }
 
@@ -614,7 +592,7 @@ int main(int argc, char** argv) {
 
   log::Init("diag", log::Level::Info);
   if (argc < 2) {
-    printf("wvd-diag: adapters|topology|caps|modes|capture|sink|owner-ping|coords-selftest|curtain-test\n");
+    printf("wvd-diag: adapters|topology|caps|modes|capture|quic-probe|owner-ping|coords-selftest|curtain-test\n");
     return 2;
   }
   std::string c = argv[1];
@@ -623,7 +601,7 @@ int main(int argc, char** argv) {
   if (c == "caps") return CmdCaps();
   if (c == "modes") return CmdModes();
   if (c == "capture") return CmdCapture(argc, argv);
-  if (c == "sink") return CmdSink(argc, argv);
+  if (c == "quic-probe") return CmdQuicProbe(argc, argv);
   if (c == "owner-ping") return CmdOwnerPing();
   if (c == "coords-selftest") return CmdCoordsSelftest();
   if (c == "curtain-test") return CmdCurtainTest();

@@ -10,7 +10,7 @@ struct Received {
   std::mutex mutex;
   std::vector<MediaPayloadHeader> pictures;
 };
-class SlowReceiver : public IReliableChannel {
+class SlowReceiver : public MediaChannel {
  public:
   explicit SlowReceiver(Received& received) : received_(received) {}
   bool Send(const uint8_t* bytes, size_t count) override {
@@ -28,6 +28,8 @@ class SlowReceiver : public IReliableChannel {
     return open_;
   }
   std::optional<std::vector<uint8_t>> RecvPacket(uint32_t) override { Sleep(5); return std::nullopt; }
+  size_t BacklogBytes() const override { return 0; }
+  uint32_t VideoBitrateLimitKbps() const override { return 0; }
   bool IsConnected() const override { return open_; }
   void Close() override { open_ = false; }
  private:

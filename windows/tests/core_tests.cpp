@@ -48,7 +48,7 @@ int main() {
                                 DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL));
     CHECK(!IsVirtualMonitorPath(nullptr, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI));
   }
-  {  // Bitrate over TCP: short Wi-Fi pauses and keyframes keep the target; a slow link lowers it.
+  {  // Link adaptation: short Wi-Fi pauses and keyframes keep the target; a slow link lowers it.
     const double frame = 1000.0 / 60;
     auto run = [&](LinkRate& r, double from, double to, auto waitAt) {
       uint32_t cuts = 0;

@@ -15,29 +15,20 @@ jobs:
   build:
     runs-on: windows-2025
     timeout-minutes: 25
-    strategy:
-      matrix:
-        transport: [tcp, quic]
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Configure and compile MSVC host and tests
         shell: cmd
-        env:
-          WVM_TRANSPORT: ${{ matrix.transport }}
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "WVM_VS_ROOT=%%i"
           if not defined WVM_VS_ROOT exit /b 1
           call "%WVM_VS_ROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64
           if errorlevel 1 exit /b 1
-          set "WVM_REQUIRE_MSQUIC=OFF"
-          if "%WVM_TRANSPORT%"=="quic" (
-            powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows\scripts\build-msquic.ps1
-            if errorlevel 1 exit /b 1
-            set "WVM_REQUIRE_MSQUIC=ON"
-          )
-          cmake -S windows -B windows/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DWVD_ENABLE_NVENC=OFF -DWVD_REQUIRE_MSQUIC=%WVM_REQUIRE_MSQUIC%
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows\scripts\build-msquic.ps1
+          if errorlevel 1 exit /b 1
+          cmake -S windows -B windows/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DWVD_ENABLE_NVENC=OFF
           if errorlevel 1 exit /b 1
           cmake --build windows/build-ci --parallel 4
       - name: Read the host version
@@ -66,20 +57,19 @@ jobs:
             New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
             Copy-Item $_.FullName $target
           }
-          if ('${{ matrix.transport }}' -eq 'quic') {
-            if (!(Test-Path 'windows-host/src/media/msquic.dll')) { throw 'The package is missing MsQuic.' }
-            Copy-Item windows/third_party/msquic/LICENSE windows-host/MsQuic-LICENSE.txt
-            $quic = 'For QUIC, run src/media/wvd-media.exe --quic 47800. See the Windows host README for pairing.'
+          foreach ($dir in 'media', 'tools/diag') {
+            if (!(Test-Path "windows-host/src/$dir/msquic.dll")) { throw "Missing MsQuic in $dir." }
           }
+          Copy-Item windows/third_party/msquic/LICENSE windows-host/MsQuic-LICENSE.txt
           @"
           WVM Host ${{ steps.version.outputs.version }} (build ${{ steps.version.outputs.build }})
 
-          Run src/ui/wvd-host.exe to start the Windows TCP development host (port 50001) on a trusted LAN.
-          $quic
+          Run src/ui/wvd-host.exe to start the host on UDP port 47800.
+          In NDisplayApp, choose Secure QUIC and compare the pairing codes.
           For the separate virtual display driver, see windows/driver/README.md in the source repository.
           "@ | Set-Content windows-host/README.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: WVM-Host-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build }}-${{ matrix.transport }}
+          name: WVM-Host-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build }}
           path: windows-host/
           retention-days: 14

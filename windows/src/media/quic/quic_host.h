@@ -25,6 +25,7 @@
 namespace wvd {
 
 class HostIdentity;
+struct QuicServerState;
 
 // Opaque msquic handles (HQUIC). Valid only until the matching OnQuicClosed /
 // OnQuicStreamClosed; never use one after that.
@@ -86,7 +87,7 @@ class QuicServer {
 
  private:
   void* listener_ = nullptr;  // HQUIC
-  void* config_ = nullptr;    // HQUIC
+  QuicServerState* state_ = nullptr;
   uint16_t port_ = 0;
 };
 
@@ -124,18 +125,20 @@ uint32_t MaxDatagramPayload(QuicConn conn);
 // "a.b.c.d:port" of the peer, for logs.
 std::string PeerAddress(QuicConn conn);
 
-// Queues bytes on a stream. One send is outstanding per stream at a time, so
-// frames leave in the order they were queued (WIRE.md §3 needs that). Copies
-// the data. Returns false when the queue is full (a peer that stopped reading)
-// or the stream is gone.
+// MsQuic orders the writes. Copies the data into a bounded send queue.
 bool SendStream(QuicStream stream, const uint8_t* data, size_t len);
-// Number of bytes waiting to leave on that stream.
-size_t StreamBacklog(QuicStream stream);
 
 // Sends one datagram; takes ownership of `data`. Returns false when datagrams
 // are unavailable or the peer is not reading — the caller counts a loss and
 // moves on (media recovers with FEC/NACK).
-bool SendDatagram(QuicConn conn, std::vector<uint8_t> data);
+bool SendDatagram(QuicConn conn, std::vector<uint8_t> data, bool urgent = false);
+
+struct DatagramStats {
+  size_t pendingBytes = 0;
+  uint64_t sent = 0;
+  uint64_t dropped = 0;  // rejected before submission or canceled before send
+};
+DatagramStats GetDatagramStats(QuicConn conn);
 
 // Opens a client-initiated bidirectional stream; the sink's OnQuicStream is
 // NOT called for it (you own it). Returns null when the peer allows none.

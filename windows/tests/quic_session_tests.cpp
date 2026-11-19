@@ -29,6 +29,7 @@
 #include "wvd/fec.h"
 #include "wvd/logging.h"
 #include "wvd/protocol.h"
+#include "wvd/pacing.h"
 #include "wvd/time.h"
 #include "wvd/wire1.h"
 
@@ -350,7 +351,43 @@ std::vector<uint8_t> FlowHelloBytes(uint32_t sessionGen) {
   return p;
 }
 
-bool Run() {
+// Optional local throughput sample. Control and media traverse the same
+// Schannel/MsQuic path as the regression above. Encoder time is excluded.
+void MeasureDelivery(Wire1Channel& channel, FakeHeadset& headset, uint32_t codecGen) {
+  constexpr uint32_t kFrames = 120, kBytesPerFrame = 125000, kFirstPicture = 1000;
+  size_t received = 0, maxBacklog = 0;
+  const auto before = channel.link();
+  auto drain = [&] {
+    std::vector<std::vector<uint8_t>> batch;
+    headset.DrainDatagrams(kDgMediaShard, 0, &batch);
+    for (const auto& datagram : batch) {
+      dg::MediaShardHeader h{};
+      if (!dg::MediaShardHeader::parse(datagram.data(), datagram.size(), h) ||
+          h.picSeq < kFirstPicture || h.flags & dg::MediaShardHeader::kParity)
+        continue;
+      const uint32_t offset = uint32_t(h.blockFirstShard + h.shardIndex) * h.shardBytes;
+      received += (std::min)(uint32_t(h.shardBytes), h.frameBytes - offset);
+    }
+  };
+  PrecisionSleeper sleeper;
+  const auto start = QpcNow();
+  for (uint32_t i = 0; i < kFrames; ++i) {
+    sleeper.SleepUntilQpc(start + MsToQpc(i * (1000.0 / 60)));
+    channel.SendPacket(PackedMedia(kFirstPicture + i, codecGen, kBytesPerFrame, i == 0));
+    maxBacklog = (std::max)(maxBacklog, channel.BacklogBytes());
+    drain();
+  }
+  sleeper.SleepUntilQpc(start + MsToQpc(2100));
+  drain();
+  const auto link = channel.link();
+  std::printf("QUIC loopback at 60 Mbit/s offered: %.2f%% payload delivered, "
+              "%zu B peak send backlog, %llu transport drops, %llu B expired/rejected\n",
+              received * 100.0 / (size_t(kFrames) * kBytesPerFrame), maxBacklog,
+              static_cast<unsigned long long>(link.datagramDrops - before.datagramDrops),
+              static_cast<unsigned long long>(link.pacerDrops - before.pacerDrops));
+}
+
+bool Run(bool measure) {
   wchar_t tmp[MAX_PATH] = {};
   GetTempPathW(MAX_PATH, tmp);
   const std::wstring home = std::wstring(tmp) + L"wvm-quic-test-" + std::to_wstring(GetTickCount());
@@ -416,7 +453,7 @@ bool Run() {
   hello.hello.deviceModel = "visionOS";
   hello.hello.devicePublicKey = key.x963;
   hello.hello.requestPairing = true;
-  hello.hello.maxDatagramSize = 1200;
+  hello.hello.maxDatagramSize = 1100;
   hello.hello.decoder.hevc = true;
   hello.hello.decoder.maxPixelRate = 3840ull * 2160ull * 60ull;
   headset.SendEnvelope(control, hello);
@@ -470,6 +507,23 @@ bool Run() {
         "no PairingResult");
   CHECK(result.pairingResult.success, "pairing refused: %s", result.pairingResult.reason.c_str());
 
+  msg::Envelope state;
+  CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::SessionState, 8000, &state),
+        "no SessionState");
+  CHECK(state.sessionState.input == msg::InputArmState::Armed, "input should be armed");
+  CHECK(!state.sessionState.mediaFlowBound, "the flow cannot be bound yet");
+
+  CHECK(!listener.AcceptChannel(25), "a session was accepted before UDP flow binding");
+
+  // ---- the datagram flow is usable only after FlowHello (§4.3) -------------
+  CHECK(quic::SendDatagram(client.conn(), FlowHelloBytes(sessionGen + 1)), "send stale FlowHello");
+  CHECK(!listener.AcceptChannel(25), "a stale FlowHello activated the session");
+  CHECK(quic::SendDatagram(client.conn(), FlowHelloBytes(sessionGen)), "send valid FlowHello");
+  msg::Envelope bound;
+  CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::SessionState, 8000, &bound),
+        "no SessionState after FlowHello");
+  CHECK(bound.sessionState.mediaFlowBound, "the media flow stayed unbound");
+
   std::shared_ptr<Wire1Channel> channel = listener.AcceptChannel(8000);
   CHECK(channel != nullptr, "AcceptChannel timed out");
   if (!channel) return false;
@@ -477,19 +531,6 @@ bool Run() {
   CHECK(channel->peerDeviceId() == "test-headset", "peer device id");
   CHECK(channel->peerName() == "Test Vision Pro", "peer name");
   CHECK(listener.active() == channel, "the listener lost its active session");
-
-  msg::Envelope state;
-  CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::SessionState, 8000, &state),
-        "no SessionState");
-  CHECK(state.sessionState.input == msg::InputArmState::Armed, "input should be armed");
-  CHECK(!state.sessionState.mediaFlowBound, "the flow cannot be bound yet");
-
-  // ---- the datagram flow is usable only after FlowHello (§4.3) -------------
-  quic::SendDatagram(client.conn(), FlowHelloBytes(sessionGen));
-  msg::Envelope bound;
-  CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::SessionState, 8000, &bound),
-        "no SessionState after FlowHello");
-  CHECK(bound.sessionState.mediaFlowBound, "the media flow stayed unbound");
 
   // ---- the pipeline's packed packets become WIRE envelopes -----------------
   const std::vector<uint8_t> layout = PackedLayout();
@@ -569,7 +610,7 @@ bool Run() {
   CHECK(sample.flags & dg::MediaShardHeader::kRandomAccess, "an IDR is marked random access");
   CHECK(sample.k >= 4, "block 0 has several data shards (k=%u)", sample.k);
   CHECK(sample.m >= 2, "block 0 carries parity (m=%u)", sample.m);
-  CHECK(sample.shardBytes == 1152, "shard payload for a 1200 B path (%u)", sample.shardBytes);
+  CHECK(sample.shardBytes == 1052, "shard payload for a 1100 B peer limit (%u)", sample.shardBytes);
 
   // Throw two data shards away and let Reed-Solomon put them back.
   if (block0Data.size() >= size_t(sample.k) && block0Parity.size() >= 2) {
@@ -633,6 +674,58 @@ bool Run() {
     }
   }
   CHECK(sawRetransmit, "the NACK produced no retransmission");
+
+  // Audio and cursor are sent from the pipeline while the pacer is active.
+  // A reconfiguration must also publish a second CodecConfig.
+  const auto nextCodec = PackedCodecConfig(codecGen + 1);
+  CHECK(channel->SendPacket(nextCodec), "second codec config send");
+  const auto nextPicture = PackedMedia(picSeq + 1, codecGen + 1, 4096, true);
+  CHECK(channel->SendPacket(nextPicture), "send picture in new codec generation");
+  CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::CodecConfig, 1000, &codecEnv) &&
+        codecEnv.codecConfig.codecGen == codecGen + 1, "second codec config did not arrive");
+
+  msg::Envelope settings;
+  settings.kind = msg::Envelope::Kind::StreamSettings;
+  settings.streamSettings.audio = true;
+  settings.streamSettings.maxBitrateKbps = 16000;
+  headset.SendEnvelope(control, settings);
+  auto audioRequest = channel->RecvPacket(1000);
+  CHECK(audioRequest.has_value(), "stream settings did not enable pipeline audio");
+  CHECK(channel->VideoBitrateLimitKbps() == 16000, "headset bitrate limit was ignored");
+
+  PacketWriter shapePacket(PacketKind::CursorShape);
+  CursorShapePayload shape{};
+  shape.shapeVer = 1;
+  shape.width = shape.height = 1;
+  shape.dataSize = 4;
+  shapePacket.Append(shape);
+  shapePacket.Append(uint32_t(0xffffffff));
+  CHECK(channel->SendPacket(shapePacket.Take()), "cursor shape");
+  PacketWriter cursorPacket(PacketKind::CursorPos);
+  CursorPosPayload cursor{};
+  cursor.shapeVer = 1;
+  cursor.layoutGen = 7;
+  cursor.state = uint8_t(PointerState::Separate);
+  cursorPacket.Append(cursor);
+  CHECK(channel->SendPacket(cursorPacket.Take()), "cursor position");
+  std::vector<std::vector<uint8_t>> cursorDatagrams;
+  CHECK(headset.DrainDatagrams(kDgCursor, 1000, &cursorDatagrams), "cursor datagram did not arrive");
+
+  PacketWriter audioPacket(PacketKind::Audio);
+  AudioPayload audio{};
+  audio.sampleRate = 48000;
+  audio.channels = 2;
+  audio.frames = 240;
+  audio.qpcCapture = QpcNow();
+  audioPacket.Append(audio);
+  std::vector<int16_t> samples(audio.frames * audio.channels, 42);
+  audioPacket.AppendArray(samples);
+  CHECK(channel->SendPacket(audioPacket.Take()), "send PCM");
+  std::vector<std::vector<uint8_t>> audioDatagrams;
+  CHECK(headset.DrainDatagrams(kDgAudio, 1000, &audioDatagrams), "audio datagram did not arrive");
+  if (!audioDatagrams.empty())
+    CHECK(audioDatagrams.front().size() == dg::AudioHeader::kHeaderSize + samples.size() * 2,
+          "PCM audio payload was altered");
 
   // ---- the ping/pong clock probe (§8) --------------------------------------
   msg::Envelope ping;
@@ -727,19 +820,20 @@ bool Run() {
   }
   CHECK(!staleLeaked, "an input stream from another session was accepted");
 
-  // ---- disconnect ---------------------------------------------------------
-  channel->Close();
-  CHECK(headset.WaitClosed(5000), "the headset never saw the connection close");
+  if (measure) MeasureDelivery(*channel, headset, codecGen + 1);
 
-  client.Close();
+  // ---- disconnect ---------------------------------------------------------
   listener.Stop();
+  CHECK(!channel->IsConnected(), "listener stop did not drain the active connection");
+  CHECK(headset.WaitClosed(5000), "the headset never saw the connection close");
+  client.Close();
   QuicSharedClose();
   return g_failures == 0;
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   // Unbuffered: a hard crash must not swallow the line that says how far we got.
   setvbuf(stdout, nullptr, _IONBF, 0);
   // A hard CRT failure (a null %s, a bad memcpy) is a silent fast fail without
@@ -769,7 +863,7 @@ int main() {
     abort();
   });
   log::Init("quic-test", log::Level::Info);
-  const bool ok = Run();
+  const bool ok = Run(argc > 1 && std::strcmp(argv[1], "--measure") == 0);
   std::printf(ok ? "quic session test: OK\n" : "quic session test: %d FAILURE(S)\n", g_failures);
   return ok ? 0 : 1;
 }

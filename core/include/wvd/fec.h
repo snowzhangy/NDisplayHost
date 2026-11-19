@@ -96,6 +96,8 @@ class PacketizedFrame {
   // block a few shards at most.
   std::vector<std::vector<uint8_t>> interleavedData() const;
   std::vector<std::vector<uint8_t>> interleavedParity() const;
+  // Moves parity into the send list. Data shards remain available for NACKs.
+  void AppendInterleavedParity(std::vector<std::vector<uint8_t>>& out);
 
   // Reed-Solomon parity for every block. Idempotent.
   void ComputeParity();
@@ -114,7 +116,6 @@ class PacketizedFrame {
   std::vector<Block> blocks_;
   std::vector<std::vector<uint8_t>> data_;
   std::vector<std::vector<std::vector<uint8_t>>> parity_;
-  std::vector<uint8_t> padded_;  // N * shardBytes, zero-padded AU
   PacketizerConfig cfg_;
 };
 

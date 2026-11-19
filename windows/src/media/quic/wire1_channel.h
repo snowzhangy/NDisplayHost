@@ -1,7 +1,7 @@
 // WIRE.md v1 host session (proto/WIRE.md) — the UDP side of the media worker.
 //
 // A Wire1Channel is one authenticated headset, presented to the existing media
-// pipeline as an IReliableChannel: MediaSession keeps producing its packed
+// pipeline as an MediaChannel: MediaSession keeps producing its packed
 // "backend A" packets and this adapter turns them into what WIRE v1 wants —
 //
 //   MonitorLayout / CodecConfig / CursorShape / DisplayModes / HelloAck /
@@ -14,8 +14,7 @@
 // and back: the headset's Ping, ClientStats, RecoveryRequest, Visibility,
 // StreamSettings, DisplayModeRequest, InputEvents and InputRelease become the
 // small set of packets the pipeline already understands, so capture, encode,
-// generations, recovery and the privileged input helper are shared with the
-// TCP path instead of being written twice.
+// generations, recovery and the privileged input helper stay in the pipeline.
 //
 // The adapter owns everything the packed protocol has no notion of:
 // pairing and pinned-identity authentication (§7), the datagram flow binding
@@ -47,7 +46,7 @@
 #include "wvd/fec.h"
 #include "wvd/gen.h"
 #include "wvd/protocol.h"
-#include "wvd/transport.h"
+#include "wvd/media_channel.h"
 #include "wvd/wire1_msg.h"
 
 namespace wvd {
@@ -98,7 +97,7 @@ class DatagramPacer {
     double minRateBps = 60e6;
     double spreadFraction = 0.5;
     uint32_t quantumUs = 250;
-    size_t maxQueuedBytes = 8u << 20;
+    static constexpr size_t maxQueuedBytes = 2u << 20;
   };
   // Sends one datagram; false when the peer is not reading (a loss).
   using Sender = std::function<bool(std::vector<uint8_t>&&)>;
@@ -108,18 +107,14 @@ class DatagramPacer {
   DatagramPacer(const DatagramPacer&) = delete;
   DatagramPacer& operator=(const DatagramPacer&) = delete;
 
-  void Start(Sender sender, Config config = {});
+  void Start(Sender sender);
   void Stop();
   // One picture's datagrams. Returns false when the queue is full: bounded by
   // design, the receiver notices the gap and asks for recovery.
   bool Enqueue(std::vector<std::vector<uint8_t>>&& datagrams, double frameIntervalUs,
-               double avgBitrateBps);
-  // Urgent datagrams (cursor position, audio) skip the queue.
-  void SendNow(std::vector<uint8_t>&& datagram);
+               double avgBitrateBps, int64_t deadlineQpc);
   size_t BacklogBytes() const;
   uint64_t DroppedBytes() const { return droppedBytes_.load(); }
-  uint64_t SentBytes() const { return sentBytes_.load(); }
-  uint64_t FailedSends() const { return failedSends_.load(); }
 
  private:
   void Run();
@@ -127,21 +122,24 @@ class DatagramPacer {
   Config cfg_;
   Sender sender_;
   struct Item {
-    std::vector<uint8_t> data;
+    std::vector<std::vector<uint8_t>> datagrams;
+    size_t next = 0;
+    size_t remainingBytes = 0;
     double rateBps = 0;
+    int64_t deadlineQpc = 0;
   };
   mutable std::mutex m_;
-  std::vector<Item> queue_;
-  size_t head_ = 0;
+  std::condition_variable available_;
+  std::deque<Item> queue_;
   size_t queuedBytes_ = 0;
   bool running_ = false;
   std::thread th_;
-  std::atomic<uint64_t> sentBytes_{0}, droppedBytes_{0}, failedSends_{0};
+  std::atomic<uint64_t> droppedBytes_{0};
 };
 
 // One headset connection, post-TLS. Not thread safe by itself: every entry
 // point (msquic callbacks, the pipeline's Send, Close) takes its own lock.
-class Wire1Channel : public IReliableChannel,
+class Wire1Channel : public MediaChannel,
                      public std::enable_shared_from_this<Wire1Channel> {
  public:
   struct Context {
@@ -154,7 +152,7 @@ class Wire1Channel : public IReliableChannel,
     uint32_t sessionGen = 1;
     // Host-side pairing store operations, kept out of the channel so the
     // store's file locking lives in one place.
-    std::function<const PairedDevice*(const std::string&)> findDevice;
+    std::function<std::optional<PairedDevice>(const std::string&)> findDevice;
     std::function<void(const PairedDevice&)> saveDevice;
     // One streaming session per host (WIRE.md §1): claim it, false when
     // another headset is already streaming.
@@ -164,26 +162,25 @@ class Wire1Channel : public IReliableChannel,
   explicit Wire1Channel(Context ctx);
   ~Wire1Channel() override;
 
-  // ---- IReliableChannel, used by MediaSession -----------------------------
-  void MarkInteractiveVideo() override {}  // QUIC datagrams: nothing to set
+  // ---- MediaChannel, used by MediaSession -----------------------------
   bool Send(const uint8_t* data, size_t len) override;
   std::optional<std::vector<uint8_t>> RecvPacket(uint32_t timeoutMs) override;
   void Close() override;
   bool IsConnected() const override;
+  size_t BacklogBytes() const override;
+  uint32_t VideoBitrateLimitKbps() const override { return clientBitrateKbps_; }
 
   // ---- driven from the listener's msquic callbacks ------------------------
   void OnConnected(QuicConn conn, const std::vector<uint8_t>& peerCertSha256);
   void OnStream(QuicStream stream);
   void OnStreamData(QuicStream stream, const uint8_t* data, size_t len);
   void OnStreamClosed(QuicStream stream);
-  void OnDatagram(const uint8_t* data, size_t len);
+  bool OnDatagram(const uint8_t* data, size_t len);  // true on initial flow binding
   // The QUIC connection is gone; the pipeline learns through IsConnected().
   void OnClosed(uint32_t status);
 
   // ---- state for the worker / panel ---------------------------------------
   // True once authenticated: only then may the media pipeline start.
-  bool ready() const;
-  bool readyWait(uint32_t timeoutMs);
   const std::string& peerDeviceId() const { return peerDeviceId_; }
   const std::string& peerName() const { return peerName_; }
   const std::string& peerAddress() const { return peerAddress_; }
@@ -191,7 +188,7 @@ class Wire1Channel : public IReliableChannel,
   void DecidePairing(uint64_t requestId, bool accept);
   // Live link numbers for the worker's log line.
   struct Link {
-    uint64_t shardsSent = 0, retransmitted = 0, datagramDrops = 0, pacerDrops = 0;
+    uint64_t datagramsSent = 0, retransmitted = 0, datagramDrops = 0, pacerDrops = 0;
     double lossPercent = 0, rttMs = 0;
     double fecPercent = 10;
   };
@@ -200,7 +197,6 @@ class Wire1Channel : public IReliableChannel,
   // The six digits the operator compares against the headset (§7.2).
   const std::string& pairingSas() const { return pairingSas_; }
   uint64_t pairingRequestId() const { return pairingRequestId_; }
-  size_t pacerBacklog() const { return pacer_.BacklogBytes(); }
   bool inputAllowed() const {
     std::lock_guard<std::mutex> lk(m_);
     return ctx_.cfg.inputAllowed;
@@ -233,9 +229,12 @@ class Wire1Channel : public IReliableChannel,
   void SendGoodbyeAndClose(const std::string& reason);
 
   // media out
-  void SendEnvelope(const msg::Envelope& env);  // control stream
+  void SendEnvelope(const msg::Envelope& env);  // control stream, with m_ held
   void SendEnvelopeOn(QuicStream stream, const msg::Envelope& env, StreamState& st);
-  void OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes);
+  void OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes,
+               std::unique_lock<std::mutex>& lock);
+  uint32_t UsableDatagramPayload() const;
+  void SendUrgent(std::vector<uint8_t> datagram);
   void OnCursorPos(const CursorPosPayload& cp);
   void OnCursorShape(const CursorShapePayload& shape, const uint8_t* pixels, uint32_t pixelBytes);
   void OnAudioPacket(const AudioPayload& a, const int16_t* pcm, uint32_t frames);
@@ -260,7 +259,7 @@ class Wire1Channel : public IReliableChannel,
   uint64_t HostMicroseconds() const;
 
   mutable std::mutex m_;
-  std::condition_variable readyCv_;
+  std::condition_variable statsCv_;
   // The inbound queue has its own lock: a control handler runs under m_ and
   // pushes packets for the pipeline, and std::mutex is not recursive (locking
   // it twice aborts the process).
@@ -276,7 +275,6 @@ class Wire1Channel : public IReliableChannel,
   QuicStream control_ = nullptr;
   QuicStream inputStream_ = nullptr;
   std::map<QuicStream, StreamState> streams_;
-  bool controlHelloSeen_ = false;
 
   // Datagram flow (WIRE.md §3): bound by the client's FlowHello.
   bool mediaFlowBound_ = false;
@@ -287,7 +285,7 @@ class Wire1Channel : public IReliableChannel,
 
   // Picture history for NACK retransmission (WIRE.md §4.4).
   std::map<uint32_t, fec::PacketizedFrame> history_;
-  size_t historyMax_ = 48;
+  size_t historyBytes_ = 0;
 
   // Auth state that only exists during a handshake.
   msg::Hello peerHello_;
@@ -308,11 +306,11 @@ class Wire1Channel : public IReliableChannel,
   // so they are atomic instead of locked.
   std::atomic<bool> peerConnected_{true};
   std::atomic<bool> linked_{false};
-  std::atomic<uint64_t> pacerDrops_{0};
+  std::atomic<uint32_t> clientBitrateKbps_{0};
 
   // Which monitor the media belongs to is only stated on the packed media
   // packet, so a codec configuration or cursor shape that arrives before the
-  // first picture waits here (the headset's TCP client applies the same rule).
+  // first picture waits here.
   bool captureKnown_ = false;
   std::optional<msg::Envelope> pendingCodecConfig_;
   std::vector<msg::Envelope> pendingCursorShapes_;
@@ -330,14 +328,11 @@ class Wire1Channel : public IReliableChannel,
   uint64_t picturesOut_ = 0, bytesOut_ = 0;
   DatagramPacer pacer_;
   std::thread statsThread_;
-  bool statsStop_ = false;
-  uint64_t shardsSent_ = 0, retransmitted_ = 0, datagramDrops_ = 0;
+  uint64_t retransmitted_ = 0;
   uint64_t lastStatsBytes_ = 0, lastStatsPictures_ = 0;
   uint64_t statWindowStartUs_ = 0;
   uint32_t idrCount_ = 0;
-  msg::ClientStats lastClientStats_;
   double lossPercent_ = 0, rttMs_ = 0;
-  std::atomic<uint64_t> nextPairingRequestId_{1};
   // Audio packet splitting: WIRE wants <=5 ms datagrams that fit the path.
   uint32_t audioSeq_ = 0;
 };
@@ -384,7 +379,7 @@ class Wire1Listener : public IQuicSink {
   GenCounters& gens_;
   Wire1Config cfg_;
   HostIdentity& identity_;
-  IWire1Observer* observer_;
+  IWire1Observer* observer_ = nullptr;
   QuicServer server_;
 
   mutable std::mutex m_;
@@ -395,6 +390,7 @@ class Wire1Listener : public IQuicSink {
   // told AUTH_BUSY (WIRE.md §1).
   std::weak_ptr<Wire1Channel> active_;
   PairedDeviceStore& devices_;
+  std::mutex devicesMutex_;
   bool stopping_ = false;
 };
 

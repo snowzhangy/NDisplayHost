@@ -10,25 +10,21 @@ screenshot or a log is enough to say which build a machine is running. Bump
 version.h`) are generated from it. The executable and component names
 (`wvd-host.exe`, `wvd-media.exe`, …) are unchanged.
 
-Windows host for desktop capture, video encoding, cursor updates and remote
-input. The user-mode components build with MSVC and the Windows SDK. The IddCx
-driver requires a separate WDK build and installation. Two transports are built
-in: the framed TCP development transport, and the production QUIC transport of
-[`core/proto/WIRE.md`](../core/proto/WIRE.md) — pairing, datagram media and FEC — which
-is compiled in when msquic is present ([details](#quic-transport-wire-v1)).
+Windows host for desktop capture, video encoding, audio, cursor updates and remote input.
+The user-mode components build with MSVC and the Windows SDK. The IddCx driver
+requires a separate WDK build and installation.
 
-The [Vision Pro app](https://github.com/snowzhangy/WVM) supports this host through its explicit **Windows TCP (development)**
-connection mode on port **50001**. Select that mode in Add Host, or select a discovered Windows PC and
-confirm the development connection. It is unencrypted and defaults to view-only; use a trusted LAN.
-See [TCP interoperability and test coverage](../core/proto/WINDOWS_TCP.md) for that mode; the production
-mode is [QUIC (WIRE v1)](#quic-transport-wire-v1).
+The host serves [WIRE v1](../core/proto/WIRE.md) over QUIC on UDP port **47800**.
+In [NDisplayApp](https://github.com/snowzhangy/NDisplayApp), select the discovered
+PC or add its LAN address using **Secure QUIC**. Compare the six-digit code on
+the PC and headset when pairing.
 
 | Component | Role |
 | --- | --- |
 | `wvd-owner` | Software-device lifetime, topology recovery and keep-awake |
 | `wvd-media` | Desktop Duplication → BT.709 full-range NV12 → encoder → transport |
 | `wvd-input` | Consented, per-session keyboard/mouse injection |
-| `wvd-diag` | Adapter/encoder probes, capture diagnostics and fake headset receiver |
+| `wvd-diag` | Adapter/encoder probes, capture diagnostics and QUIC listener probe |
 | `wvd-testcard` | Animated window for capture and latency testing |
 | `wvd-host` | **WVM Host** control panel for streaming, input consent and connection setup |
 | `wvd-network` | Optional offline Wi-Fi Direct access point, owned by the control panel |
@@ -43,6 +39,7 @@ Use an x64 Visual Studio developer shell with MSVC, the Windows 10/11 SDK,
 CMake ≥ 3.24 and Ninja. From `windows/`:
 
 ```powershell
+scripts\build-msquic.ps1
 scripts\build.ps1
 ctest --test-dir build --output-on-failure
 ```
@@ -103,44 +100,41 @@ Streams carry the control plane, unreliable datagrams carry picture shards, FEC 
 loss, and pairing is derived from the TLS exporter secrets so the six-digit code the operator reads
 binds the headset to this host and to nobody else.
 
-MsQuic is optional. From `windows/` in an x64 Visual Studio developer shell, build the pinned revision:
+The required MsQuic build uses the pinned revision and Schannel TLS. See
+[Build and checks](#build-and-checks) to compile it.
 
 ```powershell
-.\scripts\build-msquic.ps1
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWVD_REQUIRE_MSQUIC=ON
-cmake --build build
-ctest --test-dir build -R 'wire1-codec-and-fec|quic-host-session' --output-on-failure
+wvd-media --listen 47800
 ```
 
-[`windows/CMakeLists.txt`](CMakeLists.txt) looks for
-`windows/third_party/msquic/build/{bin,obj}/Release/msquic.{dll,lib}` and defines `WVD_HAVE_MSQUIC`
-when it finds them. Without msquic everything else still builds, and `--quic` reports that the
-transport is unavailable.
-
-```powershell
-wvd-media --quic 47800               # WIRE v1 on UDP 47800 (the default port)
-```
-
-The host advertises `_wvd._udp` next to the existing `_wvd._tcp`, so a headset discovers both and
-prefers QUIC. Who may connect is explicit:
+The host publishes `_wvd._udp`. Allow inbound UDP 47800 on the Windows network
+profile used by the headset. The application also accepts a different listener
+port via `--listen PORT`.
 
 | Switch | Effect |
 | --- | --- |
 | *(default)* | New devices may pair; the code must match on host and headset |
 | `--pair-auto` | Pair without the code check — trusted network only, and the log says so |
 | `--no-pair` | New devices are refused; paired headsets still connect |
-| `--allow-input` | The headset may drive mouse and keyboard; without it input stays disarmed |
+| `--allow-input` with `--input-token` | Allows a paired headset to drive mouse and keyboard through the local helper |
 
-The pairing code is logged as `PAIR <request id> <code> <device name>`; those lines and the
-`PAIRED` outcomes also go to the named pipe `\\.\pipe\wvm-pairing`, which answers
-`<request id> accept` or `<request id> reject`. The panel has no pairing prompt yet, so today the
-operator reads the code in the media log and answers over the pipe:
+The control panel prompts when a headset pairs. For a command-line session,
+read the code in `PAIR <request id> <code> <device name>` and send one message
+to the local pairing pipe printed by the worker.
 
 ```powershell
-# accept pairing request 1, after checking its digits against the headset
-$s = [System.IO.File]::Open('\\.\pipe\wvm-pairing', 'Open', 'Write', 'None')
-$w = New-Object System.IO.StreamWriter($s); $w.WriteLine('1 accept'); $w.Flush(); $s.Close()
+# Substitute the worker PID from the pairing-pipe log and the matching request ID.
+$pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'wvm-pairing-1234', 'Out')
+try {
+  $pipe.Connect(1500)
+  $decision = [Text.Encoding]::ASCII.GetBytes('1 accept')
+  $pipe.Write($decision, 0, $decision.Length)
+} finally {
+  $pipe.Dispose()
+}
 ```
+
+Use `deny` to reject the request.
 
 Pairings and the host identity live in
 `%LOCALAPPDATA%\WVM` (`paired-devices.txt`, `host-cert.der`); `WVM_HOME` relocates both, which is how
@@ -164,8 +158,8 @@ also refreshes it. Explicit choices use the monitor's device interface when
 available, so Windows renumbering DISPLAY33 to DISPLAY49 does not lose the
 selected monitor. If that monitor is removed, select an available display;
 an explicit selection never silently switches to another screen.
-**Local test** connects the diagnostic receiver and fills the live statistics;
-it checks capture/encoding/transport without displaying decoded video. Input
+**Test listener** checks the local UDP socket, QUIC handshake and datagram negotiation.
+The test can run during an active streaming session. Input
 control is off by default. Enable it before starting only for a trusted client;
 **Disable input** immediately disarms the helper. **Minimize** hides the panel
 in the Windows notification area (system tray) while streaming keeps running.
@@ -194,8 +188,7 @@ same button or close the panel. See [connection details](CONNECTIONS.md).
 The laptop's MediaTek MT7925 driver reports Wi-Fi Direct group-owner and 5 GHz
 group-owner support. The helper compiles and its argument/stop paths are tested;
 actual radio startup and a headset joining still need manual validation. Windows
-Mobile Hotspot conflicts with this mode and must be off. Creating the network
-does **not** implement the remaining Vision Pro QUIC/protobuf pairing protocol.
+Mobile Hotspot conflicts with this mode and must be off.
 
 ### Command-line launcher
 
@@ -205,38 +198,18 @@ From the repository root, in your interactive Windows session:
 powershell -ExecutionPolicy Bypass -File windows/scripts/start-dev.ps1 -TestCard
 ```
 
-This starts the input helper and desktop host listening on TCP **50001**, plus
-the visible test card. Logs and process IDs are in `.local/dev-session/`.
-The desktop panel is a separate launcher with its own tray icon.
-Connect the development receiver on another terminal:
+This starts the input helper, the host on UDP **47800**, and the test card.
+Logs and process IDs are in `.local/dev-session/`. Pass `-Probe` to test the QUIC
+handshake or `-NoInput` to omit the input helper. `-ScreenOff` blacks out the PC's
+screens while a headset is connected. `-NoAudio` keeps the PC's sound off the stream.
 
 ```powershell
-windows/build/src/tools/diag/wvd-diag.exe sink --port 50001
-```
+# From windows/
+build/src/media/wvd-media.exe --listen 47800 --codec auto
+build/src/tools/diag/wvd-diag.exe quic-probe 47800
 
-Alternatively pass `-Sink` to the launcher for a local receiver, or `-NoInput`
-to omit the injector. `-ScreenOff` blacks out the PC's screens while the headset is
-connected and `-NoAudio` keeps the PC's sound off the stream. The receiver consumes the single session: stop it before
-connecting another compatible development client. The diagnostic sink validates plumbing; it does not
-display decoded video. Stop the recorded media/input/sink processes after testing.
-
-For a Vision Pro test, leave the sink stopped, allow TCP 50001 on the PC's private network, and connect
-from the headset using the PC's LAN IP address. The client shows the display captured by this worker.
-Enable keyboard/mouse control explicitly on the headset if desired; the launcher must also have
-started the input helper. Test held-key/button release when taking headset focus away. Software text
-entry, horizontal scrolling and capture-to-present timing are unavailable in the current TCP protocol.
-
-Launch components directly from `windows/`:
-
-```powershell
-build/src/media/wvd-media.exe --listen 50001 --codec auto
-build/src/tools/diag/wvd-diag.exe sink --port 50001
-
-# No desktop or headset required for the synthetic pipeline:
+# Run capture and encoding locally with synthetic input.
 build/src/media/wvd-media.exe --synthetic --demo 5 --codec auto
-
-# Real desktop wire test; requires an interactive desktop:
-python tests/stream_smoke_test.py build/src/media/wvd-media.exe
 ```
 
 `--monitor \\.\DISPLAY2` selects an output; `--fps 60` sets the stream frame
@@ -380,8 +353,7 @@ new `MonitorLayout` and `CodecConfig` and its window takes the new shape.
   when that size supports it. Sizes below 1280×720 are left out, and a rotated
   monitor offers only its current mode.
 * `--no-mode-change` advertises only the current mode, so the menu is hidden.
-  The Windows TCP development transport is unauthenticated, so anyone who can
-  connect can also change the size, for as long as their session lasts.
+  Requests come from the authenticated headset session.
 
 `wvd-diag modes` prints the list each display would offer.
 
@@ -412,13 +384,12 @@ manual launch, copy its printed token into the media worker:
 build/src/input/wvd-input.exe
 
 # Terminal 2; substitute the token printed above:
-build/src/media/wvd-media.exe --listen 50001 --input \\.\pipe\wvd.input --input-token TOKEN
+build/src/media/wvd-media.exe --listen 47800 --allow-input --input \\.\pipe\wvd.input --input-token TOKEN
 ```
 
 The option is **`--input`**, not `--input-pipe`. Without a token, video works
 and input forwarding stays off. The launcher supplies a fresh token itself.
-The token is a development consent mechanism; a production consent UI and
-authenticated session pairing are still required.
+Remote input also requires the operator to enable it and the headset to authenticate.
 
 The hook-free injector thread owns desktop attachment and `SendInput`. A
 separate thread handles desktop/WTS notifications. Switching desktops flushes
@@ -468,7 +439,7 @@ wvd-diag capture         Desktop Duplication probe (--seconds N)
 wvd-diag coords-selftest coordinate transforms
 wvd-diag curtain-test    --screen-off curtain stays out of the stream
 wvd-diag owner-ping      owner control pipe
-wvd-diag sink            fake headset receiver
+wvd-diag quic-probe PORT local QUIC handshake and datagram negotiation
 ```
 
 Monochrome cursor height excludes the second mask. Colour alpha is retained;

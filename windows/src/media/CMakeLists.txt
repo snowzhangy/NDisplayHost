@@ -14,7 +14,6 @@ add_library(wvd_capture_core STATIC
   audio/loopback_capture.cpp
   screen_curtain.cpp
   session/media_session.cpp
-  discovery.cpp
 )
 target_include_directories(wvd_capture_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(wvd_capture_core PUBLIC wvd_common d3d11 dxgi d3dcompiler dnsapi
@@ -26,13 +25,8 @@ if(DEFINED NVENC_INCLUDE_DIR)
   target_compile_definitions(wvd_capture_core PRIVATE WVD_HAVE_NVENC=1)
 endif()
 
-add_executable(wvd-media main.cpp)
-target_link_libraries(wvd-media PRIVATE wvd_capture_core)
-if(WVD_HAVE_MSQUIC)
-  # The UDP (QUIC) host. wvd_quic exports WVD_HAVE_MSQUIC, so main.cpp builds
-  # both ways and a tree without msquic simply has no --quic.
-  target_link_libraries(wvd-media PRIVATE wvd_quic)
-  wvd_link_msquic(wvd-media)
-endif()
+add_executable(wvd-media main.cpp discovery.cpp)
+target_link_libraries(wvd-media PRIVATE wvd_capture_core wvd_quic)
+wvd_link_msquic(wvd-media)
 set_target_properties(wvd-media PROPERTIES OUTPUT_NAME "wvd-media")
 wvd_apply_manifest(wvd-media)

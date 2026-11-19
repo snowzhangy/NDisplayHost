@@ -42,13 +42,12 @@ MediaSession::~MediaSession() {
 // Start / Stop
 // ---------------------------------------------------------------------------
 
-HRESULT MediaSession::Start(std::shared_ptr<IReliableChannel> channel) {
+HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
   if (running_) return E_UNEXPECTED;
   // Coordinates below come from DXGI/the desktop in PHYSICAL pixels; make sure
   // this process is per-monitor DPI aware before reading any of them.
   EnablePerMonitorDpiAwareness();
   channel_ = std::move(channel);
-  if (channel_) channel_->MarkInteractiveVideo();
 
   factory_ = CreateDxgiFactory();
   if (!factory_) return E_FAIL;
@@ -808,47 +807,52 @@ void MediaSession::EncodeLoop() {
   std::vector<uint8_t> nv12buf;
   bool forcedKeyPending = true;  // first picture = random access point (§6.6)
 
-  // Link adaptation. The only congestion signal a reliable stream gives is
-  // that encoded pictures stop leaving. Answer it BEFORE the encoder: hold
-  // the next picture back (the ring keeps the newest desktop, so nothing
-  // stale is ever encoded) and lower the target bitrate. Encoding into a
-  // full queue instead costs a dropped reference and a recovery keyframe —
-  // several pictures' worth of bits pushed into a link that is already behind.
+  // Account for both application and MsQuic queues before encoding more.
+  // Stale captures are superseded by the newest contents of the capture ring.
   const int64_t frameQpc = MsToQpc(1000.0 / double(encDesc_.fpsNum));
   const uint32_t maxKbps = cfg_.bitrateKbps;
   const uint32_t minKbps = (std::min)(
       maxKbps, cfg_.minBitrateKbps ? cfg_.minBitrateKbps : (std::max)(1500u, maxKbps / 8));
-  bool adapt = cfg_.adaptiveBitrate && channel_ != nullptr;
+  bool canSetBitrate = channel_ != nullptr;
+  const bool adapt = cfg_.adaptiveBitrate && channel_ != nullptr;
+  uint32_t appliedKbps = maxKbps;
   // Short Wi-Fi pauses and keyframe bursts only skip pictures; the target
   // moves for a link that keeps falling behind (LinkRate).
   LinkRate linkRate(maxKbps, minKbps);
   const int64_t rateClock = QpcNow();
-  auto applyRate = [&](uint32_t kbps, uint32_t before) {
-    char why[96];
-    if (kbps < before)
-      snprintf(why, sizeof(why), "link behind: pictures waited %.0f ms in 1 s",
-               linkRate.lastCutWaitedMs());
-    else
-      snprintf(why, sizeof(why), "link clear");
-    adapt = ApplyBitrate(kbps, why);
+  auto updateRate = [&] {
+    if (!canSetBitrate) return;
+    const uint32_t peerLimit = channel_->VideoBitrateLimitKbps();
+    const uint32_t kbps = peerLimit ? (std::min)(peerLimit, linkRate.target()) : linkRate.target();
+    if (kbps == appliedKbps) return;
+    canSetBitrate = ApplyBitrate(kbps, peerLimit && kbps == peerLimit ?
+                                      "headset bitrate limit" : "link queue pressure");
+    if (canSetBitrate) appliedKbps = kbps;
   };
 
   while (!stopReq_) {
     auto work = encQueue_.Pop(std::chrono::milliseconds(100));
     if (!work) {
       // A still desktop sends nothing: the target can still climb back.
-      if (adapt) {
-        const uint32_t before = linkRate.target();
-        if (const uint32_t k = linkRate.OnIdle(QpcDeltaMs(rateClock, QpcNow()))) applyRate(k, before);
-      }
+      if (adapt) linkRate.OnIdle(QpcDeltaMs(rateClock, QpcNow()));
+      updateRate();
       continue;
     }
 
     if (channel_) {
       const int64_t waitStart = QpcNow();
-      while (!stopReq_ && sendQueue_.Size() >= kSendBackpressureDepth &&
-             QpcNow() - waitStart < MsToQpc(double(cfg_.backpressureMs)))
+      const size_t transportBudget = (std::max)(size_t(64 * 1024),
+          size_t(appliedKbps) * 250 / (std::max)(1u, cfg_.fps));
+      const int64_t waitBudget = MsToQpc(double(cfg_.backpressureMs));
+      while (!stopReq_) {
+        const int64_t elapsed = QpcNow() - waitStart;
+        const bool pipelineBehind = elapsed < waitBudget &&
+                                    sendQueue_.Size() >= kSendBackpressureDepth;
+        const bool transportBehind = elapsed < frameQpc &&
+                                     channel_->BacklogBytes() >= transportBudget;
+        if (!pipelineBehind && !transportBehind) break;
         sleeper.SleepMs(1.0);
+      }
       const int64_t now = QpcNow();
       const bool congested = now - waitStart > frameQpc;
       if (congested) {
@@ -861,12 +865,10 @@ void MediaSession::EncodeLoop() {
         std::lock_guard<std::mutex> lk(statsMutex_);
         skippedForLink_ += skipped;
       }
-      if (adapt) {
-        const uint32_t before = linkRate.target();
-        if (const uint32_t k = linkRate.OnPicture(QpcDeltaMs(rateClock, now), QpcDeltaMs(waitStart, now)))
-          applyRate(k, before);
-      }
+      if (adapt) linkRate.OnPicture(QpcDeltaMs(rateClock, now), QpcDeltaMs(waitStart, now));
+      updateRate();
       if (stopReq_) break;
+      if (congested && channel_->BacklogBytes() >= transportBudget) continue;
     }
 
     // Hold the ring's lifetime guard while using a slot: a mode change on the
@@ -1039,9 +1041,8 @@ void MediaSession::SendLoop() {
       WaitForSingleObject(sendWake_, 50);
       continue;
     }
-    // P0 encoders produce inter-frame references. Every accepted AU must reach
-    // the peer in order, even when late. Freshness drops belong BEFORE encode;
-    // dropping encoded P-frames freezes/corrupts the decoder until the next IDR.
+    // Keep encoder reference order here. The transport expires unsent
+    // shards when their presentation budget is gone and supports recovery.
     const auto sendStarted = QpcNow();
     if (!send(sw->framed)) return;
     const auto sendFinished = QpcNow();

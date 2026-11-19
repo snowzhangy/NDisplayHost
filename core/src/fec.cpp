@@ -1,6 +1,7 @@
 // GF(2^8) Cauchy Reed-Solomon + packetiser. See fec.h for the normative notes.
 #include "wvd/fec.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace wvd {
@@ -173,9 +174,6 @@ PacketizedFrame::PacketizedFrame(const FrameDescriptor& desc, const uint8_t* au,
   totalDataShards_ = n;
   blocks_ = MakeBlocks(n, cfg);
 
-  padded_.assign(static_cast<size_t>(n) * shardBytes_, 0);
-  if (au && auBytes) std::memcpy(padded_.data(), au, auBytes);
-
   uint8_t flags = 0;
   if (desc_.randomAccess) flags |= dg::MediaShardHeader::kRandomAccess;
   if (desc_.refinement) flags |= dg::MediaShardHeader::kRefinement;
@@ -189,8 +187,11 @@ PacketizedFrame::PacketizedFrame(const FrameDescriptor& desc, const uint8_t* au,
       d.resize(dg::MediaShardHeader::kSize + shardBytes_);
       dg::MediaShardHeader h = MakeHeader(flags, static_cast<int>(bi), i);
       h.writeTo(d.data());
-      std::memcpy(d.data() + dg::MediaShardHeader::kSize, padded_.data() + global * shardBytes_,
-                  shardBytes_);
+      const size_t offset = size_t(global) * shardBytes_;
+      if (au && offset < auBytes) {
+        const size_t bytes = std::min(size_t(shardBytes_), auBytes - offset);
+        std::memcpy(d.data() + dg::MediaShardHeader::kSize, au + offset, bytes);
+      }
     }
   }
 }
@@ -219,19 +220,12 @@ dg::MediaShardHeader PacketizedFrame::MakeHeader(uint8_t extraFlags, int blockId
 }
 
 std::vector<std::vector<uint8_t>> PacketizedFrame::interleavedData() const {
-  std::vector<std::vector<std::vector<uint8_t>>> lists(blocks_.size());
-  for (size_t bi = 0; bi < blocks_.size(); bi++) {
-    const Block& blk = blocks_[bi];
-    for (int i = 0; i < blk.k; i++)
-      lists[bi].push_back(data_[blk.firstShard + i]);  // copy-on-send is fine at this size
-  }
   std::vector<std::vector<uint8_t>> out;
-  size_t longest = 0;
-  for (const auto& l : lists) longest = longest > l.size() ? longest : l.size();
   out.reserve(data_.size());
-  for (size_t i = 0; i < longest; i++)
-    for (auto& l : lists)
-      if (i < l.size()) out.push_back(std::move(l[i]));
+  const int longest = blocks_.empty() ? 0 : blocks_.front().k;
+  for (int i = 0; i < longest; ++i)
+    for (const auto& block : blocks_)
+      if (i < block.k) out.push_back(data_[block.firstShard + i]);
   return out;
 }
 
@@ -245,31 +239,45 @@ std::vector<std::vector<uint8_t>> PacketizedFrame::interleavedParity() const {
   return out;
 }
 
+void PacketizedFrame::AppendInterleavedParity(std::vector<std::vector<uint8_t>>& out) {
+  size_t count = 0, longest = 0;
+  for (const auto& block : parity_) {
+    count += block.size();
+    longest = std::max(longest, block.size());
+  }
+  out.reserve(out.size() + count);
+  for (size_t i = 0; i < longest; ++i)
+    for (auto& block : parity_)
+      if (i < block.size()) out.push_back(std::move(block[i]));
+  // Retain only data shards for retransmission.
+  for (auto& block : parity_) block.clear();
+}
+
 void PacketizedFrame::ComputeParity() {
   if (!parity_.empty()) return;  // idempotent
   parity_.resize(blocks_.size());
   uint8_t flags = dg::MediaShardHeader::kParity;
   if (desc_.randomAccess) flags |= dg::MediaShardHeader::kRandomAccess;
   if (desc_.refinement) flags |= dg::MediaShardHeader::kRefinement;
-  std::vector<uint8_t> scratch;
-  for (size_t bi = 0; bi < blocks_.size(); bi++) {
-    const Block& blk = blocks_[bi];
-    if (blk.m == 0) continue;
-    scratch.assign(static_cast<size_t>(blk.m) * shardBytes_, 0);
-    std::vector<const uint8_t*> dataPtrs(blk.k);
-    std::vector<uint8_t*> parityPtrs(blk.m);
-    for (int i = 0; i < blk.k; i++)
-      dataPtrs[i] = padded_.data() + static_cast<size_t>(blk.firstShard + i) * shardBytes_;
-    for (int j = 0; j < blk.m; j++)
-      parityPtrs[j] = scratch.data() + static_cast<size_t>(j) * shardBytes_;
-    if (!Encode(dataPtrs.data(), blk.k, parityPtrs.data(), blk.m, shardBytes_)) continue;
-    for (int j = 0; j < blk.m; j++) {
-      std::vector<uint8_t> d(dg::MediaShardHeader::kSize + shardBytes_);
-      dg::MediaShardHeader h = MakeHeader(flags, static_cast<int>(bi), blk.k + j);
-      h.writeTo(d.data());
-      std::memcpy(d.data() + dg::MediaShardHeader::kSize, parityPtrs[j], shardBytes_);
-      parity_[bi].push_back(std::move(d));
+  std::vector<const uint8_t*> dataPtrs;
+  std::vector<uint8_t*> parityPtrs;
+  for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+    const auto& block = blocks_[bi];
+    if (block.m == 0) continue;
+    dataPtrs.resize(block.k);
+    parityPtrs.resize(block.m);
+    auto& datagrams = parity_[bi];
+    datagrams.resize(block.m);
+    for (int i = 0; i < block.k; ++i)
+      dataPtrs[i] = data_[block.firstShard + i].data() + dg::MediaShardHeader::kSize;
+    for (int j = 0; j < block.m; ++j) {
+      auto& datagram = datagrams[j];
+      datagram.resize(dg::MediaShardHeader::kSize + shardBytes_);
+      MakeHeader(flags, static_cast<int>(bi), block.k + j).writeTo(datagram.data());
+      parityPtrs[j] = datagram.data() + dg::MediaShardHeader::kSize;
     }
+    if (!Encode(dataPtrs.data(), block.k, parityPtrs.data(), block.m, shardBytes_))
+      datagrams.clear();
   }
 }
 

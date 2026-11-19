@@ -34,7 +34,7 @@
 #include "display_modes.h"
 #include "screen_curtain.h"
 #include "wvd/protocol.h"
-#include "wvd/transport.h"
+#include "wvd/media_channel.h"
 
 namespace wvd {
 
@@ -90,7 +90,7 @@ class MediaSession {
 
   // A shared reference: the QUIC transport keeps its own owner alive
 // while msquic callbacks fire, so the session must not own it outright.
-HRESULT Start(std::shared_ptr<IReliableChannel> channel /*may be null*/);
+HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   void Stop();
   bool running() const { return running_; }
   // True once the peer vanished / a send failed. The host tears the session
@@ -217,7 +217,7 @@ HRESULT Start(std::shared_ptr<IReliableChannel> channel /*may be null*/);
   void SetAudioWanted(bool wanted);
   HANDLE sendWake_ = nullptr;
 
-  std::shared_ptr<IReliableChannel> channel_;
+  std::shared_ptr<MediaChannel> channel_;
   KeepAwake keepAwake_;  // display + system stay on while a peer is connected
   ScreenCurtain curtain_;  // --screen-off: this PC's screens black while connected
 

@@ -17,10 +17,14 @@ namespace {
 // proto/WIRE.md §1 protocol version this host speaks.
 constexpr uint32_t kWire1ProtocolVersion = 1;
 
-// Wait for the pacer to drain below this before encoding more: the pipeline's
-// link adaptation (SessionConfig::backpressureMs) only works if the "socket"
-// pushes back, and for datagrams the pacer backlog IS the backlog.
-constexpr size_t kPacerBackpressureBytes = 1u << 20;
+constexpr uint32_t kMinMediaDatagram = dg::MediaShardHeader::kSize + 256;
+constexpr size_t kHistoryMaxBytes = 4u << 20;
+std::atomic<uint64_t> nextPairingRequestId{1};
+
+uint64_t QpcMicroseconds(int64_t qpc) {
+  const auto frequency = static_cast<int64_t>(QpcFreq());
+  return uint64_t(qpc / frequency) * 1000000 + uint64_t(qpc % frequency) * 1000000 / frequency;
+}
 
 template <class T>
 T Clamp(T v, T lo, T hi) {
@@ -64,124 +68,99 @@ std::vector<uint8_t> NextParameterSet(const uint8_t* csd, size_t size, size_t& a
 // DatagramPacer
 // =============================================================================
 
-void DatagramPacer::Start(Sender sender, Config config) {
-  Stop();
-  cfg_ = config;
+void DatagramPacer::Start(Sender sender) {
+  std::lock_guard<std::mutex> lock(m_);
   sender_ = std::move(sender);
-  {
-    std::lock_guard<std::mutex> lk(m_);
-    queue_.clear();
-    head_ = 0;
-    queuedBytes_ = 0;
-    running_ = true;
-    // Started under the lock so that a Stop() racing with this cannot miss the
-    // thread and leave it running.
-    th_ = std::thread([this] { Run(); });
-  }
+  running_ = true;
+  th_ = std::thread([this] { Run(); });
 }
 
 void DatagramPacer::Stop() {
-  // Two paths can stop at once — the app closing the session and the connection
-  // callback — and joining one thread twice throws, so the thread is handed
-  // over under the lock and joined by whoever took it.
-  std::thread taken;
   {
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> lock(m_);
     running_ = false;
-    taken = std::move(th_);
   }
-  if (taken.joinable()) taken.join();
-  std::lock_guard<std::mutex> lk(m_);
+  available_.notify_one();
+  if (th_.joinable()) th_.join();
+  std::lock_guard<std::mutex> lock(m_);
   queue_.clear();
-  head_ = 0;
   queuedBytes_ = 0;
 }
 
 bool DatagramPacer::Enqueue(std::vector<std::vector<uint8_t>>&& datagrams,
-                            double frameIntervalUs, double avgBitrateBps) {
+                            double frameIntervalUs, double avgBitrateBps, int64_t deadlineQpc) {
   if (datagrams.empty()) return true;
   size_t bytes = 0;
   for (const auto& d : datagrams) bytes += d.size();
-  const double spread =
-      std::max(frameIntervalUs * cfg_.spreadFraction, 1000.0) / 1e6;  // seconds
-  const double rate = std::min(cfg_.maxRateBps,
-                               std::max({cfg_.minRateBps, double(bytes * 8) / spread,
-                                         avgBitrateBps * 2.0}));
-  std::lock_guard<std::mutex> lk(m_);
-  if (!running_) {
-    droppedBytes_ += bytes;
-    return false;
+  const double spreadSeconds = (std::max)(frameIntervalUs * cfg_.spreadFraction, 1000.0) / 1e6;
+  const double rate = (std::min)(cfg_.maxRateBps,
+      std::max({cfg_.minRateBps, double(bytes) * 8.0 / spreadSeconds, avgBitrateBps * 2.0}));
+  {
+    std::lock_guard<std::mutex> lock(m_);
+    if (!running_ || bytes > cfg_.maxQueuedBytes - queuedBytes_ || QpcNow() >= deadlineQpc) {
+      droppedBytes_ += bytes;
+      return false;
+    }
+    queue_.push_back(Item{std::move(datagrams), 0, bytes, rate, deadlineQpc});
+    queuedBytes_ += bytes;
   }
-  if (queuedBytes_ + bytes > cfg_.maxQueuedBytes) {
-    // Bounded by design (§6.6): the receiver sees the gap and asks for recovery.
-    droppedBytes_ += bytes;
-    return false;
-  }
-  for (auto& d : datagrams) {
-    Item item;
-    item.data = std::move(d);
-    item.rateBps = rate;
-    queue_.push_back(std::move(item));
-  }
-  queuedBytes_ += bytes;
+  available_.notify_one();
   return true;
 }
 
-void DatagramPacer::SendNow(std::vector<uint8_t>&& datagram) {
-  if (!sender_) return;
-  if (!sender_(std::move(datagram))) failedSends_ += 1;
-}
-
 size_t DatagramPacer::BacklogBytes() const {
-  std::lock_guard<std::mutex> lk(m_);
+  std::lock_guard<std::mutex> lock(m_);
   return queuedBytes_;
 }
 
 void DatagramPacer::Run() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   PrecisionSleeper sleeper;
-  double budget = 0;  // bytes
+  std::vector<std::vector<uint8_t>> batch;
+  batch.reserve(64);
+  double budget = 0;
   int64_t last = QpcNow();
   while (true) {
-    std::vector<std::vector<uint8_t>> batch;
     {
-      std::unique_lock<std::mutex> lk(m_);
+      std::unique_lock<std::mutex> lock(m_);
+      if (queue_.empty()) {
+        available_.wait(lock, [this] { return !queue_.empty() || !running_; });
+        budget = 1400;
+        last = QpcNow();
+      }
       if (!running_) return;
-      if (head_ >= queue_.size()) {
-        lk.unlock();
-        sleeper.SleepMs(cfg_.quantumUs / 1000.0);
-        continue;
-      }
-      const double nowUs = QpcDeltaMs(last, QpcNow()) * 1000.0;
-      last = QpcNow();
-      const double rate = queue_[head_].rateBps;
-      // Token bucket, capped at a few quanta so a pause cannot buy a burst.
-      budget = std::min(budget + nowUs / 1e6 * rate / 8.0,
-                        rate / 8.0 * double(cfg_.quantumUs) * 4.0 / 1e6 + 1500.0);
-      while (head_ < queue_.size()) {
-        const size_t n = queue_[head_].data.size();
-        if (budget < double(n) && !batch.empty()) break;
-        budget -= double(n);
-        batch.push_back(std::move(queue_[head_].data));
-        queue_[head_].data.clear();
-        queuedBytes_ -= n;
-        ++head_;
-        if (budget <= 0) break;
-      }
-      if (head_ > 1024 && head_ * 2 > queue_.size()) {
-        queue_.erase(queue_.begin(), queue_.begin() + long(head_));
-        head_ = 0;
-      } else if (head_ >= queue_.size()) {
-        queue_.clear();
-        head_ = 0;
+
+      const int64_t now = QpcNow();
+      const double bytesPerMs = queue_.front().rateBps / 8000.0;
+      budget = (std::min)(budget + QpcDeltaMs(last, now) * bytesPerMs,
+                          1400.0 + bytesPerMs * cfg_.quantumUs / 500.0);
+      last = now;
+      while (!queue_.empty()) {
+        auto& item = queue_.front();
+        if (now >= item.deadlineQpc) {
+          droppedBytes_ += item.remainingBytes;
+          queuedBytes_ -= item.remainingBytes;
+          queue_.pop_front();
+          continue;
+        }
+        auto& datagram = item.datagrams[item.next];
+        const size_t bytes = datagram.size();
+        if (budget < double(bytes)) break;
+        budget -= double(bytes);
+        item.remainingBytes -= bytes;
+        queuedBytes_ -= bytes;
+        batch.push_back(std::move(datagram));
+        if (++item.next == item.datagrams.size()) {
+          queue_.pop_front();
+          // Each picture has its own rate. Do not spend its unused burst
+          // allowance on a smaller picture with a lower pacing rate.
+          budget = (std::min)(budget, 1400.0);
+          break;
+        }
       }
     }
-    size_t sent = 0;
-    for (auto& datagram : batch) sent += datagram.size();
-    for (auto& datagram : batch) {
-      if (sender_ && !sender_(std::move(datagram))) failedSends_ += 1;
-    }
-    if (sent) sentBytes_ += sent;
+    for (auto& datagram : batch) sender_(std::move(datagram));
+    batch.clear();
     sleeper.SleepMs(cfg_.quantumUs / 1000.0);
   }
 }
@@ -196,15 +175,17 @@ Wire1Channel::Wire1Channel(Context ctx) : ctx_(std::move(ctx)) {
 }
 
 Wire1Channel::~Wire1Channel() {
-  statsStop_ = true;
-  // Handed over before joining for the same reason as the pacer's thread.
-  std::thread stats = std::move(statsThread_);
-  if (stats.joinable()) stats.join();
+  {
+    std::lock_guard<std::mutex> lock(m_);
+    auth_ = Auth::Closed;
+  }
+  statsCv_.notify_one();
+  if (statsThread_.joinable()) statsThread_.join();
   pacer_.Stop();
 }
 
 uint64_t Wire1Channel::HostMicroseconds() const {
-  return uint64_t(QpcNow() * 1000000 / QpcFreq());
+  return QpcMicroseconds(QpcNow());
 }
 
 bool Wire1Channel::IsConnected() const {
@@ -214,15 +195,18 @@ bool Wire1Channel::IsConnected() const {
   return peerConnected_ && linked_;
 }
 
-bool Wire1Channel::ready() const {
-  std::lock_guard<std::mutex> lk(m_);
-  return auth_ == Auth::Ready;
+size_t Wire1Channel::BacklogBytes() const {
+  std::lock_guard<std::mutex> lock(m_);
+  return pacer_.BacklogBytes() + quic::GetDatagramStats(conn_).pendingBytes;
 }
 
-bool Wire1Channel::readyWait(uint32_t timeoutMs) {
-  std::unique_lock<std::mutex> lk(m_);
-  return readyCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                           [this] { return auth_ == Auth::Ready || auth_ == Auth::Closed; });
+uint32_t Wire1Channel::UsableDatagramPayload() const {
+  return std::min({peerMaxDatagram_ ? peerMaxDatagram_ : 1200u, 1400u,
+                   quic::MaxDatagramPayload(conn_)});
+}
+
+void Wire1Channel::SendUrgent(std::vector<uint8_t> datagram) {
+  if (mediaFlowBound_) quic::SendDatagram(conn_, std::move(datagram), true);
 }
 
 // ---- connection lifecycle ---------------------------------------------------
@@ -244,21 +228,7 @@ void Wire1Channel::OnConnected(QuicConn conn, const std::vector<uint8_t>& peerCe
   quic::ExportKeyingMaterial(conn, kExporterPairLabel, pairExporter_);
   WVD_LOGI("quic: %s connected (exporters %s)", peerAddress_.c_str(),
            authExporter_.size() == 32 ? "ok" : "UNAVAILABLE");
-  pacer_.Start([this](std::vector<uint8_t>&& d) {
-    QuicConn c;
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      c = conn_;
-    }
-    if (!c) return false;
-    const bool ok = quic::SendDatagram(c, std::move(d));
-    // Counted atomically: this runs on the pacer thread and, through SendNow,
-    // on the pipeline thread that may already hold m_.
-    if (!ok) pacerDrops_.fetch_add(1, std::memory_order_relaxed);
-    return ok;
-  });
-  statsStop_ = false;
-  statsThread_ = std::thread([this] { StatsLoop(); });
+
 }
 
 void Wire1Channel::OnStream(QuicStream stream) {
@@ -287,16 +257,17 @@ void Wire1Channel::OnStreamData(QuicStream stream, const uint8_t* data, size_t l
     auto it = streams_.find(stream);
     if (it == streams_.end()) it = streams_.emplace(stream, StreamState{}).first;
     if (!it->second.deframer.append(data, len)) {
-      WVD_LOGW("quic: framing error on a peer stream — dropping the connection");
-      peerConnected_ = false;
+      WVD_LOGW("quic: framing error on a peer stream");
+      SendGoodbyeAndClose("invalid stream framing");
+      return;
     }
     std::vector<uint8_t> body;
     while (it->second.deframer.next(body)) {
       msg::Envelope env;
       if (!env.decode(body.data(), body.size())) {
-        WVD_LOGW("quic: malformed envelope — dropping the connection");
-        peerConnected_ = false;
-        break;
+        WVD_LOGW("quic: malformed envelope");
+        SendGoodbyeAndClose("invalid control envelope");
+        return;
       }
       envelopes.push_back(std::move(env));
     }
@@ -314,7 +285,6 @@ void Wire1Channel::RouteEnvelope(QuicStream stream, const msg::Envelope& env) {
     if (env.kind == msg::Envelope::Kind::Hello && control_ == nullptr) {
       control_ = stream;
       st.isInput = false;
-      controlHelloSeen_ = true;
     } else if (env.kind == msg::Envelope::Kind::InputStreamOpen &&
                env.inputStreamOpen.sessionGen == ctx_.sessionGen && auth_ == Auth::Ready) {
       st.isInput = true;
@@ -333,42 +303,30 @@ void Wire1Channel::RouteEnvelope(QuicStream stream, const msg::Envelope& env) {
   else HandleControl(env);
 }
 
-void Wire1Channel::OnDatagram(const uint8_t* data, size_t len) {
-  if (!len) return;
-  switch (data[0]) {
-    case kDgFlowHello: {
-      dg::FlowHello fh;
-      if (!dg::FlowHello::parse(data, len, fh)) return;
-      bool bind = false;
-      {
-        std::lock_guard<std::mutex> lk(m_);
-        if (fh.sessionGen != ctx_.sessionGen) {
-          WVD_LOGV("quic: FlowHello for session %u, this one is %u — ignored", fh.sessionGen,
-                   ctx_.sessionGen);
-          return;
-        }
-        if (!mediaFlowBound_) {
-          mediaFlowBound_ = true;
-          bind = true;
-        }
-      }
-      if (bind) {
-        WVD_LOGI("quic: datagram flow bound to session %u", ctx_.sessionGen);
-        std::lock_guard<std::mutex> lk(m_);
-        SendSessionState();
-      }
-      return;
-    }
-    case kDgNack: {
-      dg::Nack nack;
-      if (!dg::Nack::parse(data, len, nack)) return;
-      std::lock_guard<std::mutex> lk(m_);
-      Retransmit(nack);
-      return;
-    }
-    default:
-      return;  // the host receives nothing else
+bool Wire1Channel::OnDatagram(const uint8_t* data, size_t len) {
+  if (!len) return false;
+  std::lock_guard<std::mutex> lock(m_);
+  if (auth_ != Auth::Ready) return false;
+  if (data[0] == kDgFlowHello) {
+    dg::FlowHello hello;
+    if (!dg::FlowHello::parse(data, len, hello) || hello.sessionGen != sessionGen() ||
+        mediaFlowBound_ || UsableDatagramPayload() < kMinMediaDatagram)
+      return false;
+    mediaFlowBound_ = true;
+    pacer_.Start([this](std::vector<uint8_t>&& datagram) {
+      std::lock_guard<std::mutex> lock(m_);
+      return conn_ && peerConnected_ && quic::SendDatagram(conn_, std::move(datagram));
+    });
+    SendSessionState();
+    WVD_LOGI("quic: datagram flow bound to session %u (payload <= %u B)", sessionGen(),
+             UsableDatagramPayload());
+    return true;
   }
+  if (data[0] == kDgNack && mediaFlowBound_) {
+    dg::Nack nack;
+    if (dg::Nack::parse(data, len, nack)) Retransmit(nack);
+  }
+  return false;
 }
 
 void Wire1Channel::OnClosed(uint32_t status) {
@@ -387,7 +345,7 @@ void Wire1Channel::OnClosed(uint32_t status) {
   // The pacer must be quiet before the msquic handle goes away: it is closed
   // right after this callback returns.
   pacer_.Stop();
-  readyCv_.notify_all();
+  statsCv_.notify_one();
   inboundCv_.notify_all();  // a pipeline waiting in RecvPacket must return
   if (was) WVD_LOGI("quic: connection closed (status 0x%x)", status);
 }
@@ -407,8 +365,7 @@ void Wire1Channel::Close() {
     linked_ = false;
     SendGoodbyeAndClose("host closed the session");
   }
-  pacer_.Stop();
-  readyCv_.notify_all();
+  statsCv_.notify_one();
   inboundCv_.notify_all();
 }
 
@@ -420,7 +377,7 @@ void Wire1Channel::SendGoodbyeAndClose(const std::string& reason) {
   if (conn_) quic::CloseConnection(conn_, 0);
   peerConnected_ = false;
   auth_ = Auth::Closed;
-  readyCv_.notify_all();
+  statsCv_.notify_one();
   inboundCv_.notify_all();
 }
 
@@ -436,13 +393,16 @@ void Wire1Channel::SendEnvelopeOn(QuicStream stream, const msg::Envelope& env, S
   auto framed = framing::frame(env.encode());
   bytes.insert(bytes.end(), framed.begin(), framed.end());
   if (!quic::SendStream(stream, bytes.data(), bytes.size()) && peerConnected_) {
-    WVD_LOGW("quic: control stream backlog exceeded — the peer stopped reading");
+    WVD_LOGW("quic: control stream send failed");
     peerConnected_ = false;
+    auth_ = Auth::Closed;
+    if (conn_) quic::CloseConnection(conn_, 0);
+    statsCv_.notify_one();
+    inboundCv_.notify_all();
   }
 }
 
 void Wire1Channel::SendEnvelope(const msg::Envelope& env) {
-  std::lock_guard<std::mutex> lk(m_);
   auto it = streams_.find(control_);
   if (it == streams_.end()) return;
   SendEnvelopeOn(control_, env, it->second);
@@ -459,8 +419,6 @@ void Wire1Channel::HandleHello(const msg::Hello& hello) {
                                        : hello.deviceName;
   peerModel_ = hello.deviceModel;
   peerMaxDatagram_ = hello.maxDatagramSize;
-  const int usable = Clamp<int>(int(peerMaxDatagram_ ? peerMaxDatagram_ : 1200), 1200, 1400);
-  packetCfg_ = fec::PacketizerConfig::ForDatagramSize(usable);
   thermal_ = hello.thermal;
   WVD_LOGI("quic: hello from '%s' (%s), device %s, max datagram %u B, decoder hevc=%u h264=%u",
            peerName_.c_str(), hello.deviceModel.c_str(), hello.deviceId.c_str(),
@@ -496,8 +454,15 @@ void Wire1Channel::HandleHello(const msg::Hello& hello) {
     return;
   }
 
+  if (peerMaxDatagram_ != 0 && peerMaxDatagram_ < kMinMediaDatagram) {
+    sendAck(msg::AuthResult::Rejected);
+    SendGoodbyeAndClose("headset's datagram limit is too small");
+    return;
+  }
+  statsThread_ = std::thread([this] { StatsLoop(); });
+
   if (!hello.authSignature.empty()) {
-    const PairedDevice* device = ctx_.findDevice ? ctx_.findDevice(hello.deviceId) : nullptr;
+    auto device = ctx_.findDevice ? ctx_.findDevice(hello.deviceId) : std::nullopt;
     bool ok = device && device->publicKeyX963 == hello.devicePublicKey;
     if (ok) {
       const auto transcript = Transcript(AuthPurpose::Auth, authExporter_, ctx_.certSha256,
@@ -534,9 +499,10 @@ void Wire1Channel::HandleHello(const msg::Hello& hello) {
       return;
     }
     sendAck(msg::AuthResult::PairingStarted);
+    if (!peerConnected_) return;
 
     auth_ = Auth::Pairing;
-    pairingRequestId_ = nextPairingRequestId_.fetch_add(1);
+    pairingRequestId_ = nextPairingRequestId.fetch_add(1, std::memory_order_relaxed);
     pairingDeadlineUs_ = HostMicroseconds() + ctx_.cfg.pairingTimeoutMs * 1000ull;
     msg::Envelope challenge;
     challenge.kind = msg::Envelope::Kind::PairingChallenge;
@@ -622,9 +588,10 @@ void Wire1Channel::FinishPairing(bool success, const std::string& reason) {
 }
 
 void Wire1Channel::Authenticated() {
+  if (!peerConnected_) return;
   auth_ = Auth::Ready;
   SendSessionState();
-  readyCv_.notify_all();
+  statsCv_.notify_one();
 }
 
 void Wire1Channel::SendSessionState() {
@@ -666,12 +633,7 @@ void Wire1Channel::HandleControl(const msg::Envelope& env) {
           audioWanted_ = audio;
           QueueHello(audio, peerName_);
         }
-        if (env.streamSettings.maxBitrateKbps > 0) {
-          // The pipeline's own ceiling stays authoritative; this is the peer's
-          // preference, logged rather than silently ignored.
-          WVD_LOGI("quic: headset asks for <= %u kbps (the PC's ceiling is %u)",
-                   env.streamSettings.maxBitrateKbps, bitrateKbpsOut_);
-        }
+        clientBitrateKbps_ = env.streamSettings.maxBitrateKbps;
       }
       break;
     case K::DisplayModeRequest:
@@ -693,7 +655,7 @@ void Wire1Channel::HandleControl(const msg::Envelope& env) {
       linked_ = false;
       auth_ = Auth::Closed;
       if (conn_) quic::CloseConnection(conn_, 0);
-      readyCv_.notify_all();
+      statsCv_.notify_one();
       inboundCv_.notify_all();
       break;
     default:
@@ -733,9 +695,9 @@ void Wire1Channel::SendPong(const msg::Ping& ping) {
 }
 
 void Wire1Channel::UpdateFecFromStats(const msg::ClientStats& stats) {
-  lastClientStats_ = stats;
   const double expected = double(stats.shardsReceived) + double(stats.shardsMissing);
-  const double loss = expected > 0 ? double(stats.shardsMissing) / expected : 0.0;
+  if (expected <= 0) return;
+  const double loss = double(stats.shardsMissing) / expected;
   lossPercent_ = loss * 100.0;
   rttMs_ = double(stats.rttUs) / 1000.0;
   // Reference: ceil-ish loss*3 + 5%, clamped to 6..30%.
@@ -749,19 +711,7 @@ bool Wire1Channel::Send(const uint8_t* data, size_t len) {
   if (!pv) return false;
   const PacketKind kind = pv->kind();
 
-  if (kind == PacketKind::Media) {
-    // Link backpressure: while the pacer is behind, hold the pipeline (its own
-    // SessionConfig::backpressureMs bounds the wait) so it lowers the encoder
-    // instead of overflowing the queue.
-    const int64_t waitUntil = QpcNow() + MsToQpc(250);
-    while (peerConnected_ && pacer_.BacklogBytes() > kPacerBackpressureBytes &&
-           QpcNow() < waitUntil) {
-      if (IsConnected()) Sleep(2);
-      else break;
-    }
-  }
-
-  std::lock_guard<std::mutex> lk(m_);
+  std::unique_lock<std::mutex> lk(m_);
   if (!peerConnected_ || conn_ == nullptr) return false;
   switch (kind) {
     case PacketKind::MonitorLayout:
@@ -802,7 +752,7 @@ bool Wire1Channel::Send(const uint8_t* data, size_t len) {
       if (!mh) return false;
       const size_t maxBytes = pv->payloadSize() - sizeof(MediaPayloadHeader);
       const size_t bytes = (std::min)(size_t(mh->dataSize), maxBytes);
-      OnMedia(*mh, pv->VarAt(uint32_t(sizeof(MediaPayloadHeader))), bytes);
+      OnMedia(*mh, pv->VarAt(uint32_t(sizeof(MediaPayloadHeader))), bytes, lk);
       break;
     }
     case PacketKind::Heartbeat:
@@ -889,12 +839,13 @@ void Wire1Channel::OnLegacyCodecConfig(const uint8_t* payload, uint32_t size) {
   targetBitrateBps_ = double(cc.bitrateKbps) * 1000.0;
   bitrateKbpsOut_ = cc.bitrateKbps;
   codecGenOut_ = uint32_t(cc.codecGen);
-  pendingCodecConfig_ = out;  // held until a picture names the captured monitor
-  WVD_LOGI("quic: codec gen %u %s %ux%u, %zu parameter set(s), shard %d B, FEC %.0f%%",
+  history_.clear();
+  historyBytes_ = 0;
+  WVD_LOGI("quic: codec gen %u %s %ux%u, %zu parameter set(s), FEC %.0f%%",
            out.codecConfig.codecGen,
            out.codecConfig.codec == msg::Codec::H264 ? "H.264" : "HEVC", cc.width, cc.height,
-           out.codecConfig.parameterSets.size(), packetCfg_.shardBytes,
-           packetCfg_.fecRatio * 100.0);
+           out.codecConfig.parameterSets.size(), packetCfg_.fecRatio * 100.0);
+  pendingCodecConfig_ = std::move(out);
 }
 
 void Wire1Channel::OnLegacyDisplayModes(const uint8_t* payload, uint32_t size) {
@@ -984,16 +935,19 @@ void Wire1Channel::OnCursorPos(const CursorPosPayload& cp) {
   d.x = float(cp.x);
   d.y = float(cp.y);
   d.hostTimeUs = HostMicroseconds();
-  pacer_.SendNow(dg::CursorDatagram::encode(d));
+  SendUrgent(dg::CursorDatagram::encode(d));
 }
 
 void Wire1Channel::OnAudioPacket(const AudioPayload& a, const int16_t* pcm, uint32_t frames) {
-  if (!audioWanted_ || !a.channels || !frames) return;
+  if (!mediaFlowBound_ || !audioWanted_ || !a.channels || !frames) return;
   // 5 ms packets, small enough for the path (WIRE.md §4.5).
-  const uint32_t usable = Clamp<uint32_t>(peerMaxDatagram_ ? peerMaxDatagram_ : 1200, 1200, 1400);
+  const uint32_t usable = UsableDatagramPayload();
+  if (usable < kMinMediaDatagram) return;
   const uint32_t fit =
       uint32_t((usable - dg::AudioHeader::kHeaderSize) / (a.channels * sizeof(int16_t)));
-  const uint32_t perPacket = (std::max)(1u, (std::min)(a.sampleRate ? a.sampleRate / 200u : 240u, fit));
+  const uint32_t perPacket = (std::min)(a.sampleRate ? a.sampleRate / 200u : 240u, fit);
+  if (!perPacket) return;
+  const uint64_t packetTimeUs = a.qpcCapture > 0 ? QpcMicroseconds(a.qpcCapture) : HostMicroseconds();
   for (uint32_t off = 0; off < frames; off += perPacket) {
     const uint32_t n = (std::min)(perPacket, frames - off);
     std::vector<uint8_t> out(dg::AudioHeader::kHeaderSize +
@@ -1003,45 +957,43 @@ void Wire1Channel::OnAudioPacket(const AudioPayload& a, const int16_t* pcm, uint
     h.sessionGen = ctx_.sessionGen;
     h.seq = ++audioSeq_;
     h.sampleRate = a.sampleRate;
-    h.hostTimeUs = HostMicroseconds();
+    h.hostTimeUs = packetTimeUs + (a.sampleRate ? uint64_t(off) * 1000000u / a.sampleRate : 0);
     h.frames = uint16_t(n);
     h.writeTo(out.data());
     memcpy(out.data() + dg::AudioHeader::kHeaderSize, pcm + size_t(off) * a.channels,
            size_t(n) * a.channels * sizeof(int16_t));
-    pacer_.SendNow(std::move(out));
+    SendUrgent(std::move(out));
   }
 }
 
-void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes) {
-  if (!auBytes) return;
+void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes,
+                           std::unique_lock<std::mutex>& lock) {
+  if (!mediaFlowBound_ || !auBytes || mh.codecGen != codecGenOut_) return;
+  const auto monitorId = uint16_t(mh.monitor + 1);
+  captureMonitorId_ = monitorId;
+  if (pendingCodecConfig_) {
+    pendingCodecConfig_->codecConfig.monitorId = monitorId;
+    SendEnvelope(*pendingCodecConfig_);
+    pendingCodecConfig_.reset();
+  }
   if (!captureKnown_) {
-    // The packed protocol names the captured monitor only on the media packet
-    // (the same rule the headset's TCP client uses), so this is the moment we
-    // can label the codec configuration and the cursor with a monitor id.
-    captureMonitorId_ = uint16_t(mh.monitor + 1);
     captureKnown_ = true;
-    if (pendingCodecConfig_) {
-      msg::Envelope cfg = *pendingCodecConfig_;
-      cfg.codecConfig.monitorId = captureMonitorId_;
-      SendEnvelopeOn(control_, cfg, streams_[control_]);
-      pendingCodecConfig_.reset();
-    }
     for (auto& shape : pendingCursorShapes_) {
-      shape.cursorShape.monitorId = captureMonitorId_;
-      SendEnvelopeOn(control_, shape, streams_[control_]);
+      shape.cursorShape.monitorId = monitorId;
+      SendEnvelope(shape);
     }
     pendingCursorShapes_.clear();
   }
-  if (pendingCodecConfig_ || mh.codecGen != codecGenOut_) {
-    // Shards the receiver cannot decode yet (its configuration is still
-    // buffered above, or this generation is stale): drop rather than confuse it.
-    WVD_LOGV("quic: media for codec gen %llu before its config (%u) — dropped",
-             (unsigned long long)mh.codecGen, codecGenOut_);
+  const uint32_t usable = UsableDatagramPayload();
+  if (usable < kMinMediaDatagram) return;
+  auto packetConfig = fec::PacketizerConfig::ForDatagramSize(usable);
+  packetConfig.fecRatio = packetCfg_.fecRatio;
+  const int64_t captureQpc = mh.deadlineQpc - MsToQpc(double(ctx_.cfg.deadlineMs));
+  const int64_t deadline = captureQpc + MsToQpc(ctx_.cfg.deadlineBudgetMs);
+  if (QpcNow() >= deadline) {
+    QueueRecovery(codecGenOut_, uint32_t(msg::RecoveryKind::Idr), 0);
     return;
   }
-  // The packed header carries only the absolute deadline; capture_time is
-  // deadline - the pipeline's own deadline window.
-  const int64_t captureQpc = mh.deadlineQpc - MsToQpc(double(ctx_.cfg.deadlineMs));
   fec::FrameDescriptor desc;
   desc.monitorId = uint16_t(mh.monitor + 1);
   desc.sessionGen = ctx_.sessionGen;
@@ -1051,82 +1003,93 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   desc.contentVer = mh.contentVer;
   desc.randomAccess = (mh.flags & 1u) != 0;
   desc.refinement = (mh.flags & 2u) != 0;
-  desc.captureTimeUs = uint64_t((std::max)(1.0, QpcToMs(captureQpc) * 1000.0));
+  desc.captureTimeUs = QpcMicroseconds((std::max)(int64_t(0), captureQpc));
   desc.deadlineBudgetMs = uint16_t(ctx_.cfg.deadlineBudgetMs);
 
-  fec::PacketizedFrame frame(desc, au, auBytes, packetCfg_);
-  auto data = frame.interleavedData();
-  const size_t pictureBytes = data.size() ? data.size() * data[0].size() : 0;
-  pacer_.Enqueue(std::move(data), frameIntervalUs_, targetBitrateBps_);
+  // Packetization and Reed-Solomon parity are CPU work. Keep the QUIC
+  // receive path and the pacer's send path free while this picture is built.
+  lock.unlock();
+  fec::PacketizedFrame frame(desc, au, auBytes, packetConfig);
   frame.ComputeParity();
-  auto parity = frame.interleavedParity();
-  pacer_.Enqueue(std::move(parity), frameIntervalUs_, targetBitrateBps_);
-  shardsSent_ += uint64_t(frame.totalDataShards()) +
-                 (frame.parityDatagrams().empty()
-                      ? 0
-                      : uint64_t(frame.parityDatagrams().size()) * frame.parityDatagrams()[0].size());
+  auto datagrams = frame.interleavedData();
+  frame.AppendInterleavedParity(datagrams);
+  lock.lock();
+
+  if (!peerConnected_ || mh.codecGen != codecGenOut_) return;
+  const size_t pictureBytes = size_t(frame.totalDataShards()) *
+                              (frame.shardBytes() + dg::MediaShardHeader::kSize);
+  if (!pacer_.Enqueue(std::move(datagrams), frameIntervalUs_, targetBitrateBps_, deadline)) {
+    QueueRecovery(codecGenOut_, uint32_t(msg::RecoveryKind::Idr), 0);
+    return;
+  }
   ++picturesOut_;
   if (desc.randomAccess) ++idrCount_;
   bytesOut_ += pictureBytes;
 
-  // Keep it for NACK retransmission (WIRE.md §4.4).
-  history_[mh.picSeq] = std::move(frame);
-  while (history_.size() > historyMax_) history_.erase(history_.begin());
+  const uint64_t now = HostMicroseconds();
+  while (!history_.empty() &&
+         (historyBytes_ + pictureBytes > kHistoryMaxBytes ||
+          now - history_.begin()->second.descriptor().captureTimeUs >=
+              uint64_t(ctx_.cfg.deadlineBudgetMs) * 1000)) {
+    const auto& oldest = history_.begin()->second;
+    historyBytes_ -= size_t(oldest.totalDataShards()) *
+                     (oldest.shardBytes() + dg::MediaShardHeader::kSize);
+    history_.erase(history_.begin());
+  }
+  if (pictureBytes <= kHistoryMaxBytes) {
+    historyBytes_ += pictureBytes;
+    history_.emplace(mh.picSeq, std::move(frame));
+  }
 }
 
 void Wire1Channel::Retransmit(const dg::Nack& nack) {
-  auto it = history_.find(nack.picSeq);
+  const auto it = history_.find(nack.picSeq);
   if (it == history_.end()) return;
-  const uint64_t ageUs = HostMicroseconds() - it->second.descriptor().captureTimeUs;
-  if (ageUs > uint64_t(ctx_.cfg.deadlineBudgetMs) * 1000ull) return;  // too late to help
-  auto shards = it->second.Retransmission(nack.missing);
-  if (shards.empty()) return;
-  retransmitted_ += shards.size();
-  // Urgent: spread over ~2 ms, far below one frame.
-  pacer_.Enqueue(std::move(shards), 2000.0, targetBitrateBps_);
+  const auto& frame = it->second;
+  const auto& desc = frame.descriptor();
+  if (nack.codecGen != desc.codecGen || nack.monitorId != desc.monitorId) return;
+  const uint64_t budgetUs = uint64_t(ctx_.cfg.deadlineBudgetMs) * 1000;
+  const uint64_t ageUs = HostMicroseconds() - desc.captureTimeUs;
+  if (ageUs >= budgetUs || frame.shardBytes() + dg::MediaShardHeader::kSize > UsableDatagramPayload())
+    return;
+  const int64_t deadline = QpcNow() + MsToQpc(double(budgetUs - ageUs) / 1000.0);
+  auto shards = frame.Retransmission(nack.missing);
+  const size_t count = shards.size();
+  if (pacer_.Enqueue(std::move(shards), 2000.0, targetBitrateBps_, deadline))
+    retransmitted_ += count;
 }
 
 void Wire1Channel::StatsLoop() {
-  while (!statsStop_) {
-    Sleep(1000);
-    if (statsStop_) break;
+  std::unique_lock<std::mutex> lock(m_);
+  while (!statsCv_.wait_for(lock, std::chrono::seconds(1), [this] { return auth_ == Auth::Closed; })) {
+    if (auth_ == Auth::Pairing && HostMicroseconds() > pairingDeadlineUs_)
+      FinishPairing(false, "pairing timed out");
+    if (auth_ != Auth::Ready || !mediaFlowBound_) continue;
     msg::Envelope out;
     out.kind = msg::Envelope::Kind::HostStats;
-    bool pairingTimedOut = false;
-    // Read the pacer outside the session lock: its worker thread takes that
-    // lock when a datagram send fails, and the order must never invert.
     const size_t pacerBacklog = pacer_.BacklogBytes();
     const uint64_t pacerDropped = pacer_.DroppedBytes();
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (auth_ == Auth::Pairing && HostMicroseconds() > pairingDeadlineUs_)
-        pairingTimedOut = true;
-      const uint64_t nowUs = HostMicroseconds();
-      const double window =
-          (std::max)(uint64_t(1), nowUs - statWindowStartUs_) / 1e6;
-      out.hostStats.monitorId = captureMonitorId_;
-      out.hostStats.fpsCaptured = 0;  // the pipeline reports this locally
-      out.hostStats.fpsEncoded = uint32_t(double(picturesOut_ - lastStatsPictures_) / window);
-      out.hostStats.bitrateKbps =
-          uint32_t(double(bytesOut_ - lastStatsBytes_) * 8.0 / window / 1000.0);
-      out.hostStats.targetBitrateKbps = bitrateKbpsOut_;
-      out.hostStats.retransmittedShards = uint32_t(retransmitted_);
-      out.hostStats.idrCount = idrCount_;
-      msg::QueueDepth q;
-      q.name = "pacer_bytes";
-      q.depth = uint32_t(pacerBacklog);
-      q.capacity = uint32_t(DatagramPacer::Config{}.maxQueuedBytes);
-      q.dropped = pacerDropped;
-      out.hostStats.queues.push_back(q);
-      lastStatsPictures_ = picturesOut_;
-      lastStatsBytes_ = bytesOut_;
-      statWindowStartUs_ = nowUs;
-      SendEnvelopeOn(control_, out, streams_[control_]);
-    }
-    if (pairingTimedOut) {
-      std::lock_guard<std::mutex> lk(m_);
-      if (auth_ == Auth::Pairing) FinishPairing(false, "pairing timed out");
-    }
+    const uint64_t nowUs = HostMicroseconds();
+    const double window =
+        (std::max)(uint64_t(1), nowUs - statWindowStartUs_) / 1e6;
+    out.hostStats.monitorId = captureMonitorId_;
+    out.hostStats.fpsCaptured = 0;  // the pipeline reports this locally
+    out.hostStats.fpsEncoded = uint32_t(double(picturesOut_ - lastStatsPictures_) / window);
+    out.hostStats.bitrateKbps =
+        uint32_t(double(bytesOut_ - lastStatsBytes_) * 8.0 / window / 1000.0);
+    out.hostStats.targetBitrateKbps = bitrateKbpsOut_;
+    out.hostStats.retransmittedShards = uint32_t(retransmitted_);
+    out.hostStats.idrCount = idrCount_;
+    msg::QueueDepth q;
+    q.name = "pacer_bytes";
+    q.depth = uint32_t(pacerBacklog);
+    q.capacity = uint32_t(DatagramPacer::Config::maxQueuedBytes);
+    q.dropped = pacerDropped;
+    out.hostStats.queues.push_back(q);
+    lastStatsPictures_ = picturesOut_;
+    lastStatsBytes_ = bytesOut_;
+    statWindowStartUs_ = nowUs;
+    SendEnvelope(out);
   }
 }
 
@@ -1134,9 +1097,10 @@ Wire1Channel::Link Wire1Channel::link() const {
   const uint64_t pacerDropped = pacer_.DroppedBytes();
   std::lock_guard<std::mutex> lk(m_);
   Link l;
-  l.shardsSent = shardsSent_;
+  const auto transport = quic::GetDatagramStats(conn_);
+  l.datagramsSent = transport.sent;
   l.retransmitted = retransmitted_;
-  l.datagramDrops = datagramDrops_;
+  l.datagramDrops = transport.dropped;
   l.pacerDrops = pacerDropped;
   l.lossPercent = lossPercent_;
   l.rttMs = rttMs_;
@@ -1219,9 +1183,6 @@ void Wire1Channel::QueueInputRelease(uint32_t reason) {
 }
 
 // WIRE input events -> the packed InputEvent the privileged helper injects.
-// The mapping is the one the headset already uses for the TCP host
-// (mac/WVDKit Net/WindowsTCPConnection.swift writeInput), so behaviour cannot
-// drift between the two transports.
 void Wire1Channel::QueueInput(const msg::InputEvents& batch) {
   std::vector<InputEvent> events;
   events.reserve((std::min)(size_t(256), batch.events.size()));
@@ -1334,11 +1295,13 @@ void Wire1Listener::OnQuicConnected(QuicConn conn, const std::vector<uint8_t>& p
   ctx.cfg = cfg_;
   ctx.certSha256 = identity_.certSha256();
   ctx.observer = observer_;
-  // The store lives in the worker and outlives every channel. `find` returns a
-  // pointer into its vector, which the channel only dereferences while it
-  // handles the Hello — before any pairing could have appended to it.
-  ctx.findDevice = [this](const std::string& id) { return devices_.find(id); };
+  ctx.findDevice = [this](const std::string& id) -> std::optional<PairedDevice> {
+    std::lock_guard<std::mutex> lock(devicesMutex_);
+    if (const auto* device = devices_.find(id)) return *device;
+    return std::nullopt;
+  };
   ctx.saveDevice = [this](const PairedDevice& device) {
+    std::lock_guard<std::mutex> lock(devicesMutex_);
     devices_.save(device);
     std::string error;
     if (!devices_.Save(&error))
@@ -1385,20 +1348,7 @@ void Wire1Listener::OnQuicStreamData(QuicConn conn, QuicStream stream, const uin
   auto channel = Lookup(conn);
   if (!channel) return;
   channel->OnStreamData(stream, data, len);
-  // The reference rule is one session; the Hello handler already refused a
-  // second device while one streams, so nothing else is needed here.
-  // A channel that just finished its handshake becomes available to the worker.
-  if (channel->ready()) {
-    std::lock_guard<std::mutex> lk(m_);
-    bool queued = false;
-    for (const auto& r : ready_)
-      if (r == channel) { queued = true; break; }
-    if (!queued) {
-      ready_.push_back(channel);
-      queued = true;
-    }
-    if (queued) cv_.notify_all();
-  }
+
 }
 
 void Wire1Listener::OnQuicStreamClosed(QuicConn conn, QuicStream stream) {
@@ -1408,7 +1358,11 @@ void Wire1Listener::OnQuicStreamClosed(QuicConn conn, QuicStream stream) {
 
 void Wire1Listener::OnQuicDatagram(QuicConn conn, const uint8_t* data, size_t len) {
   auto channel = Lookup(conn);
-  if (channel) channel->OnDatagram(data, len);
+  if (channel && channel->OnDatagram(data, len)) {
+    std::lock_guard<std::mutex> lock(m_);
+    if (!stopping_) ready_.push_back(std::move(channel));
+    cv_.notify_one();
+  }
 }
 
 void Wire1Listener::OnQuicClosed(QuicConn conn, uint32_t status) {

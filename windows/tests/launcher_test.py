@@ -1,5 +1,9 @@
 """Validate launcher stop events and network arguments without activating Wi-Fi."""
 import ctypes
+import os
+import socket
+import tempfile
+import time
 import subprocess
 import sys
 import uuid
@@ -16,7 +20,7 @@ def run(executable, arguments, text=""):
     return subprocess.run([executable] + arguments, input=text, text=True,
                           capture_output=True, timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
 
-media, injector, network = sys.argv[1:]
+media, injector, network, diagnostic = sys.argv[1:]
 try:
     for executable, extra, stdin in [(media, [], ""), (injector, [], ""),
                                      (network, ["--ssid", "WVD-Stop-Test"], "TestPassword123\n")]:
@@ -28,6 +32,41 @@ try:
         result = run(network, ["--ssid", ssid], password + "\n")
         assert result.returncode == 2, (ssid, result.returncode, result.stderr)
         assert "DIRECT_WIFI_STARTED" not in result.stdout
-    print("launcher stop events and offline-network argument validation passed; radio unchanged")
+    for value in ("0", "65536", "abc", "47800garbage"):
+        assert run(media, ["--listen", value]).returncode == 2, value
+    kernel.ResetEvent.argtypes = [ctypes.c_void_p]
+    kernel.SetEvent.argtypes = [ctypes.c_void_p]
+    assert kernel.ResetEvent(event)
+    # Hold the same number in the TCP namespace throughout startup.
+    # A TCP listener can coexist while the host answers a real UDP handshake.
+    with tempfile.TemporaryDirectory(prefix="wvm-udp-test-") as home, socket.socket() as tcp:
+        tcp.bind(("127.0.0.1", 0))
+        tcp.listen()
+        port = tcp.getsockname()[1]
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as logs:
+            host = subprocess.Popen([media, "--listen", str(port), "--no-discovery", "--no-pair",
+                                       "--stop-event", name],
+                                      stdout=logs, stderr=subprocess.STDOUT, text=True,
+                                      env={**os.environ, "WVM_HOME": home},
+                                      creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and host.poll() is None:
+                    logs.seek(0)
+                    if f"HOST_READY {port}" in logs.read(): break
+                    time.sleep(0.05)
+                else:
+                    logs.seek(0)
+                    raise AssertionError(logs.read())
+                probe = run(diagnostic, ["quic-probe", str(port)])
+                assert probe.returncode == 0, (probe.stdout, probe.stderr)
+                assert "datagram handshake succeeded" in probe.stdout
+                assert kernel.SetEvent(event)
+                assert host.wait(5) == 0
+            finally:
+                if host.poll() is None:
+                    host.kill()
+                    host.wait(5)
+    print("launcher stop events and UDP-only listener and offline-network argument validation passed")
 finally:
     kernel.CloseHandle(event)

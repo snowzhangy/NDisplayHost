@@ -1,5 +1,25 @@
 # Windows validation — 2026-11-15
 
+## UDP-only Windows host
+
+The host uses QUIC over UDP for discovery and sessions. The loopback suite exercises
+the WIRE v1 handshake, code comparison, flow binding, peer datagram limits, FEC,
+retransmission, codec reconfiguration, audio, cursor, input and shutdown. The launcher
+test also reserves the same TCP port and verifies the real worker answers over UDP.
+
+```powershell
+ctest --test-dir windows/build --output-on-failure
+```
+
+To sample software transport under load, run
+`windows/build/tests/wvd-quic-session-tests.exe --measure`. It feeds 60 Mbit/s of
+synthetic access units at 60 fps into WIRE v1, then reports loopback payload
+delivery, peak send backlog and local drops. This measures packetization and
+transport on the PC. Wi-Fi, headset decoding and presentation require a device run.
+
+The entries below are historical results for earlier host builds.
+
+
 Validated on the AMD development PC with MSVC 19.51 and Windows SDK 10.0.26100.
 These checks cover the current development transport and user-mode host.
 
@@ -335,7 +355,7 @@ Still needs manual/hardware validation:
   decoding, cursor rendering and input round trip. The Apple client now has an explicit Windows TCP
   compatibility mode, exercised on macOS with an independent Python wire peer and real synthetic
   HEVC/H.264 decoding. Physical PC/headset interoperability still needs the manual test described in
-  [`core/proto/WINDOWS_TCP.md`](../core/proto/WINDOWS_TCP.md). The QUIC and pairing contract is in
+  [`core/proto/WINDOWS_TCP.md` in Git history. The QUIC and pairing contract is in
   [`core/proto/WIRE.md`](../core/proto/WIRE.md).
 
 XOR cursor compositing is approximated on the overlay plane. QUIC, production

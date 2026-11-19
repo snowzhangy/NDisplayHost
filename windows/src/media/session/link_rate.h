@@ -1,7 +1,7 @@
-// Encoder target bitrate for a reliable (TCP) link, from how long encoded
+// Encoder target bitrate from sustained send-queue pressure, from how long encoded
 // pictures wait for the send queue.
 //
-// A wait is the only congestion signal TCP gives, but most waits are not a
+// A queue wait alone is noisy, and most waits are not a
 // slow link: Wi-Fi pauses for tens of milliseconds (power save, airtime) and a
 // keyframe takes a few frame times to leave. Both drain on their own, and the
 // session already skips to the newest desktop picture while it waits, so
