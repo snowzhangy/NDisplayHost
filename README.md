@@ -4,7 +4,7 @@ Desktop streaming hosts for the WVM Vision Pro client. The Windows host ships as
 
 | Directory | Responsibility |
 | --- | --- |
-| [`core/`](core/) | Platform-independent wire specification and protobuf schema. |
+| [`core/`](core/) | Platform-independent wire contract, C++ framing, message encoding, and forward error correction. |
 | [`windows/`](windows/) | Windows capture, encode, streaming, input, control panel, and virtual display driver. |
 | [`macos/`](macos/) | macOS capture, encode, streaming, input, menu bar app, and CLI. |
 | [`linux/`](linux/) | Reserved for the Linux host. |

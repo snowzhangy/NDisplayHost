@@ -13,7 +13,7 @@ add_library(wvd_quic STATIC
   wdauth.cpp
 )
 target_include_directories(wvd_quic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(wvd_quic PUBLIC wvd_common wvd_msquic ole32 shell32)
+target_link_libraries(wvd_quic PUBLIC wvd_common wvd_wire_core wvd_msquic ole32 shell32)
 # Consumers test WVD_HAVE_MSQUIC; carrying it on the link line means a tree
 # without msquic can never reference code that is not being built.
 target_compile_definitions(wvd_quic PUBLIC WVD_HAVE_MSQUIC=1)

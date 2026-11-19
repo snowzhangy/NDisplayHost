@@ -13,10 +13,6 @@ add_executable(wvd-topology-tests topology_tests.cpp)
 target_link_libraries(wvd-topology-tests PRIVATE wvd_common)
 add_test(NAME topology-regressions COMMAND wvd-topology-tests)
 
-add_executable(wvd-wire1-tests wire1_tests.cpp)
-target_link_libraries(wvd-wire1-tests PRIVATE wvd_common)
-add_test(NAME wire1-codec-and-fec COMMAND wvd-wire1-tests)
-
 if(WVD_HAVE_MSQUIC)
   # The QUIC host, loopback: pair, bind the datagram flow, receive an
   # FEC-protected picture, NACK it, drive input. Needs UDP on localhost.

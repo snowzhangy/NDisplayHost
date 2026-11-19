@@ -2,7 +2,7 @@
 //
 // Normative: primitive polynomial 0x11D, systematic Cauchy matrix
 //   parity_j = XOR_i C[j][i] * data_i,  C[j][i] = 1 / ((k + j) XOR i)
-// The byte-for-byte reference is mac/WVDKit FEC/{ReedSolomon,Packetizer}.swift.
+// The byte-for-byte reference is WVDAppleCore FEC/{ReedSolomon,Packetizer}.swift.
 #pragma once
 
 #include <cstdint>

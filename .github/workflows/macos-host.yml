@@ -20,6 +20,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Test Swift package
-        run: swift test --package-path macos/WVDKit
+        run: swift test --package-path macos/HostKit
       - name: Build menu bar app
         run: xcodebuild -project macos/WVD.xcodeproj -scheme WVDHost -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build

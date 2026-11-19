@@ -7,7 +7,7 @@ Use macOS 26 or later with Xcode and Swift 6.2 or later. From this directory:
 ```sh
 open WVD.xcodeproj
 xcodebuild -project WVD.xcodeproj -scheme WVDHost -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
-swift test --package-path WVDKit
+swift test --package-path HostKit
 ```
 
 Select your development team in Xcode for a signed app. `xcodegen generate` can regenerate the checked-in project from `project.yml`.
@@ -15,9 +15,9 @@ Select your development team in Xcode for a signed app. `xcodegen generate` can 
 The CLI is also available from the same package:
 
 ```sh
-swift run --package-path WVDKit -c release wvd-host serve
-swift run --package-path WVDKit -c release wvd-host serve --display 0 --allow-input
-swift run --package-path WVDKit -c release wvd-host bench
+swift run --package-path HostKit -c release wvd-host serve
+swift run --package-path HostKit -c release wvd-host serve --display 0 --allow-input
+swift run --package-path HostKit -c release wvd-host bench
 ```
 
 Select the discovered host on Vision Pro and compare the pairing code on both devices. The [wire contract](../core/proto/WIRE.md) describes discovery, pairing, and media. Client interoperability tests live in the WVM client repository and can run against this checkout.

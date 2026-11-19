@@ -1,8 +1,8 @@
 // WIRE.md v1 primitives: proto3 wire-format codec, reliable-stream framing
 // and the fixed little-endian datagram layouts.
 //
-// The normative companion is proto/WIRE.md and proto/wvd.proto; the
-// byte-for-byte reference is mac/WVDKit (Wire/Proto.swift, StreamFraming.swift,
+// The normative companion is core/proto/WIRE.md and core/proto/wvd.proto; the
+// byte-for-byte reference is WVDAppleCore (Wire/Proto.swift, StreamFraming.swift,
 // Datagrams.swift). Hand-rolled like the Apple side so the host stays
 // dependency-free; the same schema must encode identically on both ends.
 #pragma once

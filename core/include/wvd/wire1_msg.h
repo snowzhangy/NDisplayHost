@@ -1,6 +1,6 @@
 // wvd.proto v1 message structs + hand-rolled protobuf codec (host side).
 // Field numbers and defaults follow proto/wvd.proto exactly; the reference
-// codec is mac/WVDKit Wire/Messages.swift. Only the messages a host needs
+// codec is WVDAppleCore Wire/Messages.swift. Only the messages a host needs
 // are modelled; unknown fields are skipped on read.
 #pragma once
 

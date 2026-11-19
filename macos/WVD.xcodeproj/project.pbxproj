@@ -16,7 +16,7 @@
 /* Begin PBXFileReference section */
 		3B16FEE7E757B605A33A6A62 /* WVDHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WVDHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		6E879760374657E1A9D94509 /* WVDHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WVDHostApp.swift; sourceTree = "<group>"; };
-		9D5EF9FB064CCFB9D3B33164 /* WVDKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = WVDKit; path = WVDKit; sourceTree = SOURCE_ROOT; };
+		9D5EF9FB064CCFB9D3B33164 /* HostKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = HostKit; path = HostKit; sourceTree = SOURCE_ROOT; };
 		9F417C0402F06B1FC9CBFABD /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -36,7 +36,7 @@
 		399142DBC566BB32DC5F8830 /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				9D5EF9FB064CCFB9D3B33164 /* WVDKit */,
+				9D5EF9FB064CCFB9D3B33164 /* HostKit */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -124,7 +124,7 @@
 			mainGroup = 8E177E6091AD0368BD73E7FF;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "WVDKit" */,
+				DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "HostKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
@@ -349,9 +349,9 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "WVDKit" */ = {
+		DFB0CCB3D9CE9DB3CE79E54A /* XCLocalSwiftPackageReference "HostKit" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = WVDKit;
+			relativePath = HostKit;
 		};
 /* End XCLocalSwiftPackageReference section */
 

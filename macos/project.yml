@@ -7,8 +7,8 @@ options:
   createIntermediateGroups: true
   developmentLanguage: en
 packages:
-  WVDKit:
-    path: WVDKit
+  HostKit:
+    path: HostKit
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -32,9 +32,9 @@ targets:
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
     dependencies:
-      - package: WVDKit
+      - package: HostKit
         product: WVDHostKit
-      - package: WVDKit
+      - package: HostKit
         product: WVDAppleCore
     settings:
       base:

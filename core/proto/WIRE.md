@@ -1,7 +1,7 @@
 # WVD backend-A wire protocol, version 1
 
 Normative companion to [`wvd.proto`](wvd.proto) for hosts and the Vision Pro client.
-The macOS reference implementation lives in [`macos/WVDKit`](../../macos/WVDKit).
+The macOS reference implementation lives in [`macos/HostKit`](../../macos/HostKit).
 
 ## 1. Roles
 
