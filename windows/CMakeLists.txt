@@ -1,4 +1,4 @@
-# WVM Host — Windows Virtual Monitor host for Apple Vision Pro (plan v2.3)
+# NDisplayHostWin — NDisplay Windows host for Apple Vision Pro (plan v2.3)
 #
 # User-mode components build with plain MSVC + Windows SDK 10.0.22621+.
 # The IddCx UMDF driver (driver/) additionally requires the WDK and is NOT
@@ -6,11 +6,11 @@
 cmake_minimum_required(VERSION 3.24)
 project(WVD LANGUAGES CXX)
 
-# Product identity shown to the user: "WVM Host <version> (build N)".
+# Product identity shown to the user: "NDisplayHostWin <version> (build N)".
 # THIS IS THE ONLY PLACE THE VERSION LIVES — bump it on every build you hand
 # out. It reaches the control-panel title/tray tooltip through
 # src/ui/Version.cs.in and the worker logs through wvd/version.h.
-set(WVM_HOST_NAME "WVM Host")
+set(WVM_HOST_NAME "NDisplayHostWin")
 set(WVM_HOST_VERSION_MAJOR 1)
 set(WVM_HOST_VERSION_MINOR 0)
 set(WVM_HOST_VERSION_PATCH 0)

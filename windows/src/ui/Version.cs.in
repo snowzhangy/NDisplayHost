@@ -5,9 +5,9 @@ namespace WvdHost {
     public const string Name = "@WVM_HOST_NAME@";
     public const string Version = "@WVM_HOST_VERSION@";
     public const string Build = "@WVM_HOST_BUILD@";
-    // "WVM Host 1.0.0" — what the user calls the app, with its version.
+    // "NDisplayHostWin 1.0.0" — what the user calls the app, with its version.
     public const string Product = Name + " " + Version;
-    // "WVM Host 1.0.0 (build 1)" — window title, tray tooltip, activity log.
+    // "NDisplayHostWin 1.0.0 (build 1)" — window title, tray tooltip, activity log.
     public const string Full = Product + " (build " + Build + ")";
   }
 }

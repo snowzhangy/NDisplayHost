@@ -425,3 +425,26 @@ larger than the 1200-byte QUIC minimum (the packetiser is sized from the headset
 negotiated path MTU was never exercised), sustained throughput and congestion behaviour, and the
 panel's pairing prompt — the code currently reaches the media log and `\.\pipe\wvm-pairing`, and the
 operator answers over that pipe.
+
+## Renamed to "NDisplayHostWin" — 2026-11-19 (AMD development PC)
+
+The Vision Pro client family is now **NDisplay**, so the Windows host's
+user-facing name became **NDisplayHostWin** (the macOS host keeps its own name).
+Only the product string changed: `WVM_HOST_NAME` in `CMakeLists.txt` now reads
+`NDisplayHostWin`, which flows to the panel's window title, header, activity-log
+title, tray tooltip and **Open/Exit NDisplayHostWin** menu items through the
+generated `src/ui/Version.cs`; `wvd/version.h`, the certificate subject
+(`identity.Load(...)`) and the direct-Wi-Fi SSID default
+(`NDisplay-<machine>` / `NDisplay-Direct`) were updated to match. CI names the
+artifact `NDisplayHostWin-<version>-build<build>`.
+
+Deliberately unchanged, because they are internal and renaming them would break
+existing pairings, saved hosts and installed drivers: the `WVM_HOST_*` CMake
+variables, `WVM_HOME` and its `%LOCALAPPDATA%\WVM` identity/pairing store, the
+`WVM Host Identity` certificate key container, the `wvm-pairing-<pid>` pipe, the
+`_wvd._udp` service type, the `wvd-*` executable and target names, and the
+driver's `WVD` virtual-monitor identifiers.
+
+Verified on this machine: full `cmake --build build` (MSVC, all targets including
+the panel), `ctest` 8/8 passed, and the running panel's window title read back as
+`NDisplayHostWin 1.0.0 (build 1)`.

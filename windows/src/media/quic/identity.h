@@ -21,7 +21,7 @@ namespace wvd {
 class HostIdentity {
  public:
   // Load the persisted identity, creating and self-signing a new one on first
-  // run. cnName appears in the certificate subject ("WVM Host").
+  // run. cnName appears in the certificate subject ("NDisplayHostWin").
   bool Load(const std::string& cnName, std::string* error);
   void Unload();
   ~HostIdentity() { Unload(); }

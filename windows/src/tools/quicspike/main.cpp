@@ -201,7 +201,7 @@ static QUIC_STATUS _stdcall ClientConnCb(HQUIC conn, void* ctx, QUIC_CONNECTION_
 
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  printf("== WVM QUIC spike ==\n");
+  printf("== NDisplay QUIC spike ==\n");
   if (QUIC_FAILED(MsQuicOpenVersion(QUIC_API_VERSION_2, (const void**)&MsQuic))) {
     printf("MsQuicOpen failed\n");
     return 1;
@@ -209,7 +209,7 @@ int main() {
 
   wvd::HostIdentity id;
   std::string err;
-  if (!id.Load("WVM Host", &err)) {
+  if (!id.Load("NDisplayHostWin", &err)) {
     printf("identity load failed: %s\n", err.c_str());
     return 1;
   }

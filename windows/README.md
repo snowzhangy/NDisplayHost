@@ -1,14 +1,18 @@
-# WVM Host — Windows virtual monitor host for Apple Vision Pro
+# NDisplayHostWin — Windows virtual monitor host for Apple Vision Pro
 
-The user-facing name of this host is **WVM Host** followed by its version, for
-example `WVM Host 1.0.0 (build 1)`. It appears in the control-panel title bar,
+The user-facing name of this host is **NDisplayHostWin** followed by its version,
+for example `NDisplayHostWin 1.0.0 (build 1)`. It appears in the control-panel title bar,
 the header, the tray tooltip and the first line of every `wvd-media` log, so a
 screenshot or a log is enough to say which build a machine is running. Bump
 `WVM_HOST_VERSION_MAJOR/MINOR/PATCH` and `WVM_HOST_BUILD` in
 [`CMakeLists.txt`](CMakeLists.txt) — the single source of truth; the C# panel
 (`src/ui/Version.cs.in`) and the native binaries (`src/common/include/wvd/
 version.h`) are generated from it. The executable and component names
-(`wvd-host.exe`, `wvd-media.exe`, …) are unchanged.
+(`wvd-host.exe`, `wvd-media.exe`, …), the `WVM_HOST_*` CMake variables, the
+`WVM_HOME` override with its `%LOCALAPPDATA%\WVM` store, the `wvm-pairing-*`
+pipes, the `_wvd._udp` service type and the driver's `WVD` virtual-monitor
+identifiers are unchanged: they are internal, and renaming them would break
+existing pairings, saved hosts and installed drivers for no user benefit.
 
 Windows host for desktop capture, video encoding, audio, cursor updates and remote input.
 The user-mode components build with MSVC and the Windows SDK. The IddCx driver
@@ -26,7 +30,7 @@ the PC and headset when pairing.
 | `wvd-input` | Consented, per-session keyboard/mouse injection |
 | `wvd-diag` | Adapter/encoder probes, capture diagnostics and QUIC listener probe |
 | `wvd-testcard` | Animated window for capture and latency testing |
-| `wvd-host` | **WVM Host** control panel for streaming, input consent and connection setup |
+| `wvd-host` | **NDisplayHostWin** control panel for streaming, input consent and connection setup |
 | `wvd-network` | Optional offline Wi-Fi Direct access point, owned by the control panel |
 | `driver/` | UMDF/IddCx virtual monitor provider, separate WDK project |
 
@@ -163,10 +167,10 @@ The test can run during an active streaming session. Input
 control is off by default. Enable it before starting only for a trusted client;
 **Disable input** immediately disarms the helper. **Minimize** hides the panel
 in the Windows notification area (system tray) while streaming keeps running.
-Click the WVM Host monitor icon to reopen it, or right-click for **Open WVM
-Host** and **Exit WVM Host**; the tooltip names the running version. The icon
+Click the NDisplayHostWin monitor icon to reopen it, or right-click for
+**Open NDisplayHostWin** and **Exit NDisplayHostWin**; the tooltip names the running version. The icon
 may be under the notification area's overflow arrow.
-Closing the panel or choosing **Exit WVM Host** stops all
+Closing the panel or choosing **Exit NDisplayHostWin** stops all
 processes and any direct Wi-Fi network it created. Existing independently
 started command-line processes are not managed by this panel.
 

@@ -82,7 +82,7 @@ namespace WvdHost {
       Find<PasswordBox>("WifiPassword").Password = Convert.ToBase64String(random);
       string shortName = Environment.MachineName;
       if (shortName.Length > 16) shortName = shortName.Substring(0, 16);
-      Find<TextBox>("SsidText").Text = "WVM-" + shortName;
+      Find<TextBox>("SsidText").Text = "NDisplay-" + shortName;
       controller.Line += delegate(string line) {
         if (!window.Dispatcher.HasShutdownStarted) window.Dispatcher.BeginInvoke(new Action(delegate { OnLine(line); }));
       };

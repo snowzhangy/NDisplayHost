@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="WVM Host" Width="1080" Height="740"
+        Title="NDisplayHostWin" Width="1080" Height="740"
         MinWidth="960" MinHeight="660" WindowStartupLocation="CenterScreen"
         Background="#10141E" Foreground="#EDF1F9" FontFamily="Segoe UI" FontSize="13">
   <Window.Resources>
@@ -38,7 +38,7 @@
   <Grid Margin="28,22,28,18">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <Grid Margin="0,0,0,18">
-      <StackPanel><TextBlock x:Name="ProductTitle" Text="WVM Host" FontSize="30" FontWeight="Bold"/><TextBlock Text="Your Windows desktop, ready to share." Foreground="{StaticResource Muted}" Margin="0,3,0,0"/></StackPanel>
+      <StackPanel><TextBlock x:Name="ProductTitle" Text="NDisplayHostWin" FontSize="30" FontWeight="Bold"/><TextBlock Text="Your Windows desktop, ready to share." Foreground="{StaticResource Muted}" Margin="0,3,0,0"/></StackPanel>
       <Border HorizontalAlignment="Right" VerticalAlignment="Center" Background="#1E2A3B" CornerRadius="16" Padding="13,7">
         <StackPanel Orientation="Horizontal"><Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#99A6BA" Margin="0,0,8,0"/><TextBlock x:Name="StatusBadge" Text="Host stopped" FontWeight="SemiBold"/></StackPanel>
       </Border>
@@ -98,7 +98,7 @@
               <Expander x:Name="DirectExpander" Header="Direct Wi-Fi · no router" Foreground="#EDF1F9" FontWeight="SemiBold">
               <StackPanel Margin="0,9,0,0">
               <TextBlock Text="Create a private Wi-Fi network on this PC, then join it in Vision Pro Settings → Wi-Fi." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,10"/>
-              <TextBlock Text="Network name" FontSize="11" Foreground="{StaticResource Muted}"/><TextBox x:Name="SsidText" Text="WVM-Direct" MaxLength="32" Margin="0,5,0,8"/>
+              <TextBlock Text="Network name" FontSize="11" Foreground="{StaticResource Muted}"/><TextBox x:Name="SsidText" Text="NDisplay-Direct" MaxLength="32" Margin="0,5,0,8"/>
               <TextBlock Text="Wi-Fi password" FontSize="11" Foreground="{StaticResource Muted}"/>
               <DockPanel Margin="0,5,0,10"><Button x:Name="CopyPasswordButton" Content="Copy" Padding="11,7" DockPanel.Dock="Right" Margin="8,0,0,0"/><PasswordBox x:Name="WifiPassword" Padding="10,7" Background="#101722" Foreground="White" BorderBrush="#3A4961"/></DockPanel>
               <Button x:Name="DirectButton" Content="Create direct Wi-Fi"/>

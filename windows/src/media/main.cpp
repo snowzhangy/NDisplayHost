@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
   DnsRegistration dns;
   if (a.listenPort) {
     std::string error;
-    if (!identity.Load("WVM Host", &error)) {
+    if (!identity.Load("NDisplayHostWin", &error)) {
       WVD_LOGE("host identity: %s", error.c_str());
       return 1;
     }

@@ -24,7 +24,7 @@
 namespace wvd {
 
 // Product name the user sees (window title, tray tooltip, docs).
-inline constexpr const char* kHostProduct = "WVM Host";
+inline constexpr const char* kHostProduct = "NDisplayHostWin";
 
 // "1.0.0 (build 1)" — log this once per process start so any captured log or
 // screenshot says which host build produced it.

@@ -1,6 +1,6 @@
 # NDisplayHost
 
-Desktop streaming hosts for the NDisplayApp Vision Pro client. The Windows host ships as **WVM Host**. The macOS host has a menu bar app and a command-line sender.
+Desktop streaming hosts for the NDisplayApp Vision Pro client. The Windows host ships as **NDisplayHostWin**. The macOS host has a menu bar app and a command-line sender.
 
 | Directory | Responsibility |
 | --- | --- |
