@@ -7,6 +7,7 @@
 
 #include "identity.h"
 #include "wdauth.h"
+#include "wvd/annex_b.h"
 #include "wvd/logging.h"
 #include "wvd/pacing.h"
 #include "wvd/time.h"
@@ -31,35 +32,18 @@ T Clamp(T v, T lo, T hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Length of the Annex-B start code at `p` (0 when there is none).
-size_t StartCodeLength(const uint8_t* csd, size_t size, size_t p) {
-  if (p + 3 <= size && csd[p] == 0 && csd[p + 1] == 0 && csd[p + 2] == 1) return 3;
-  if (p + 4 <= size && csd[p] == 0 && csd[p + 1] == 0 && csd[p + 2] == 0 && csd[p + 3] == 1)
-    return 4;
-  return 0;
-}
-
-// CodecConfig.parameter_sets: the individual NAL units, without start codes
-// (proto/wvd.proto), in the order the encoder emitted them.
-std::vector<uint8_t> NextParameterSet(const uint8_t* csd, size_t size, size_t& at) {
-  while (at < size) {
-    const size_t sc = StartCodeLength(csd, size, at);
-    if (!sc) {
-      ++at;
-      continue;
-    }
-    const size_t from = at + sc;
-    size_t to = size;
-    for (size_t j = from; j + 2 < size; ++j) {
-      if (StartCodeLength(csd, size, j)) {
-        to = j;
-        break;
-      }
-    }
-    at = to;
-    if (to > from) return std::vector<uint8_t>(csd + from, csd + to);
-  }
-  return {};
+// WIRE v1 §6: send 32-bit big-endian NAL lengths. Parameter sets travel
+// separately on the control stream in CodecConfig.
+std::vector<uint8_t> LengthPrefixedPicture(Codec codec, const uint8_t* au, size_t auBytes) {
+  std::vector<uint8_t> picture;
+  picture.reserve(auBytes);
+  ForEachAnnexBNal(au, auBytes, [&](const uint8_t* nal, size_t size) {
+    if (IsAnnexBParameterSet(codec, AnnexBNalType(codec, nal[0]))) return;
+    picture.insert(picture.end(), {uint8_t(size >> 24), uint8_t(size >> 16),
+                                  uint8_t(size >> 8), uint8_t(size)});
+    picture.insert(picture.end(), nal, nal + size);
+  });
+  return picture;
 }
 
 }  // namespace
@@ -803,27 +787,20 @@ void Wire1Channel::OnLegacyCodecConfig(const uint8_t* payload, uint32_t size) {
   if (size < sizeof(CodecConfigPayload)) return;
   CodecConfigPayload cc{};
   std::memcpy(&cc, payload, sizeof(cc));
-  std::vector<uint8_t> csd;
-  if (cc.csdSize && size >= sizeof(CodecConfigPayload) + cc.csdSize) {
-    csd.assign(payload + sizeof(CodecConfigPayload),
-               payload + sizeof(CodecConfigPayload) + cc.csdSize);
-  }
+  codecOut_ = static_cast<Codec>(cc.codec);
   msg::Envelope out;
   out.kind = msg::Envelope::Kind::CodecConfig;
   out.codecConfig.codecGen = uint32_t(cc.codecGen);
-  out.codecConfig.codec = cc.codec == uint8_t(Codec::H264) ? msg::Codec::H264
-                              : cc.codec == uint8_t(Codec::AV1) ? msg::Codec::Av1
-                                                                : msg::Codec::Hevc;
+  out.codecConfig.codec = codecOut_ == Codec::H264 ? msg::Codec::H264
+                          : codecOut_ == Codec::AV1 ? msg::Codec::Av1
+                                                   : msg::Codec::Hevc;
   out.codecConfig.width = cc.width;
   out.codecConfig.height = cc.height;
-  if (!csd.empty()) {
-    size_t at = 0;
-    while (true) {
-      auto nal = NextParameterSet(csd.data(), csd.size(), at);
-      if (nal.empty()) break;
-      out.codecConfig.parameterSets.push_back(std::move(nal));
-      if (out.codecConfig.parameterSets.size() >= 8) break;
-    }
+  if (cc.csdSize <= size - sizeof(cc)) {
+    ForEachAnnexBNal(payload + sizeof(cc), cc.csdSize, [&](const uint8_t* nal, size_t nalSize) {
+      if (out.codecConfig.parameterSets.size() < 8)
+        out.codecConfig.parameterSets.emplace_back(nal, nal + nalSize);
+    });
   }
   out.codecConfig.monitorId = captureMonitorId_;  // corrected when the first picture names it
   out.codecConfig.color.primaries = cc.vui.primaries;
@@ -1006,9 +983,20 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   desc.captureTimeUs = QpcMicroseconds((std::max)(int64_t(0), captureQpc));
   desc.deadlineBudgetMs = uint16_t(ctx_.cfg.deadlineBudgetMs);
 
-  // Packetization and Reed-Solomon parity are CPU work. Keep the QUIC
-  // receive path and the pacer's send path free while this picture is built.
+  // Keep the QUIC receive and send paths free while converting, packetizing
+  // and computing parity for this picture.
+  const Codec codec = codecOut_;
   lock.unlock();
+  std::vector<uint8_t> picture;
+  if (codec != Codec::AV1) {
+    picture = LengthPrefixedPicture(codec, au, auBytes);
+    if (picture.empty()) {
+      lock.lock();
+      return;
+    }
+    au = picture.data();
+    auBytes = picture.size();
+  }
   fec::PacketizedFrame frame(desc, au, auBytes, packetConfig);
   frame.ComputeParity();
   auto datagrams = frame.interleavedData();

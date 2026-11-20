@@ -7,7 +7,7 @@
 //   MonitorLayout / CodecConfig / CursorShape / DisplayModes / HelloAck /
 //   SessionState / Pong / HostStats   -> length-prefixed protobuf envelopes on
 //                                        the reliable control stream
-//   Media                              -> FEC blocks -> paced QUIC datagrams
+//   Media                              -> length-prefixed NALs, FEC, QUIC datagrams
 //   CursorPos                          -> datagram (urgent, unpaced)
 //   Audio                              -> datagrams (~5 ms each)
 //
@@ -319,6 +319,7 @@ class Wire1Channel : public MediaChannel,
   uint32_t cursorSeq_ = 0;
   uint32_t shapeVerSent_ = 0;   // a position without a shape yet is undrawable
   uint32_t layoutGenOut_ = 0;
+  Codec codecOut_ = Codec::HEVC;
   uint32_t codecGenOut_ = 0;
   uint32_t bitrateKbpsOut_ = 0;
   uint32_t inputGen_ = 1;

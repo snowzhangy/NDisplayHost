@@ -945,10 +945,18 @@ void MediaSession::EncodeLoop() {
         const Codec codec = encoder_->codec();
         if (au.key) {
           auto ps = ExtractParameterSets(codec, au.bytes.data(), au.bytes.size());
-          if (!ps.empty())
-            csd_ = std::move(ps);
-          else if (!csd_.empty())
+          if (!ps.empty()) {
+            if (ps != csd_) {
+              csd_ = std::move(ps);
+              // The QUIC receiver gets decoder parameter sets in CodecConfig.
+              if (!codecConfigPending_) {
+                gens_.codecGen.fetch_add(1);
+                codecConfigPending_ = true;
+              }
+            }
+          } else if (!csd_.empty()) {
             au.bytes.insert(au.bytes.begin(), csd_.begin(), csd_.end());
+          }
         }
         if (csd_.empty()) csd_ = encoder_->codecPrivate();
       }

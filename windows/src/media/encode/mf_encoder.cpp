@@ -17,6 +17,7 @@
 #include <mutex>
 #include <utility>
 
+#include "wvd/annex_b.h"
 #include "wvd/logging.h"
 #include "wvd/time.h"
 
@@ -40,44 +41,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Calls f(startCodePos, nalBegin, nalEnd) for every NAL unit in an Annex B
-// buffer (3- or 4-byte start codes).
-template <class F>
-void ForEachNal(const uint8_t* p, size_t n, F&& f) {
-  auto findStart = [&](size_t from, size_t& scLen) -> size_t {
-    for (size_t k = from; k + 3 <= n; ++k) {
-      if (p[k] != 0 || p[k + 1] != 0) continue;
-      if (p[k + 2] == 1) {
-        scLen = 3;
-        return k;
-      }
-      if (k + 4 <= n && p[k + 2] == 0 && p[k + 3] == 1) {
-        scLen = 4;
-        return k;
-      }
-    }
-    return n;
-  };
-  size_t sc = 0;
-  size_t s = findStart(0, sc);
-  while (s < n) {
-    const size_t begin = s + sc;
-    size_t sc2 = 0;
-    const size_t next = findStart(begin, sc2);
-    if (begin < next) f(s, begin, next);
-    s = next;
-    sc = sc2;
-  }
-}
-
-int NalType(Codec c, uint8_t firstByte) {
-  return c == Codec::H264 ? (firstByte & 0x1F) : ((firstByte >> 1) & 0x3F);
-}
-
-bool IsParameterSet(Codec c, int t) {
-  return c == Codec::H264 ? (t == 7 || t == 8) : (t == 32 || t == 33 || t == 34);
-}
-
 bool IsKeySlice(Codec c, int t) {
   return c == Codec::H264 ? t == 5 : (t >= 16 && t <= 21);  // HEVC IRAP: BLA/IDR/CRA
 }
@@ -87,11 +50,11 @@ bool IsKeySlice(Codec c, int t) {
 std::vector<uint8_t> ExtractParameterSets(Codec codec, const uint8_t* au, size_t len) {
   std::vector<uint8_t> out;
   if (!au || !len) return out;
-  ForEachNal(au, len, [&](size_t, size_t b, size_t e) {
-    if (IsParameterSet(codec, NalType(codec, au[b]))) {
+  ForEachAnnexBNal(au, len, [&](const uint8_t* nal, size_t size) {
+    if (IsAnnexBParameterSet(codec, AnnexBNalType(codec, nal[0]))) {
       static const uint8_t kSc[4] = {0, 0, 0, 1};
       out.insert(out.end(), kSc, kSc + 4);
-      out.insert(out.end(), au + b, au + e);
+      out.insert(out.end(), nal, nal + size);
     }
   });
   return out;
@@ -100,8 +63,8 @@ std::vector<uint8_t> ExtractParameterSets(Codec codec, const uint8_t* au, size_t
 bool ContainsKeyframe(Codec codec, const uint8_t* au, size_t len) {
   bool key = false;
   if (!au || !len) return false;
-  ForEachNal(au, len, [&](size_t, size_t b, size_t) {
-    if (IsKeySlice(codec, NalType(codec, au[b]))) key = true;
+  ForEachAnnexBNal(au, len, [&](const uint8_t* nal, size_t) {
+    if (IsKeySlice(codec, AnnexBNalType(codec, nal[0]))) key = true;
   });
   return key;
 }

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 
 #include <shlobj.h>
 
@@ -49,13 +50,9 @@ std::string LocalAppDataDir() {
   char override_[MAX_PATH] = {};
   const DWORD n = GetEnvironmentVariableA("WVM_HOME", override_, MAX_PATH);
   if (n > 0 && n < MAX_PATH) {
-    std::wstring wide = Utf8ToWide(override_);
-    for (size_t i = 1; i < wide.size(); ++i) {
-      std::wstring partial = wide.substr(0, i);
-      CreateDirectoryW(partial.c_str(), nullptr);
-    }
-    CreateDirectoryW(wide.c_str(), nullptr);
-    return override_;
+    std::error_code error;
+    std::filesystem::create_directories(override_, error);
+    return error ? std::string() : override_;
   }
   PWSTR base = nullptr;
   if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) return {};
@@ -371,6 +368,10 @@ bool HostIdentity::Load(const std::string& cnName, std::string* error) {
     return false;
   };
 
+  const std::string dir = LocalAppDataDir();
+  if (dir.empty()) return fail("could not open the host identity directory");
+  const std::string certPath = dir + "\\host-cert.der";
+
   NCRYPT_PROV_HANDLE hProv = 0;
   SECURITY_STATUS st = NCryptOpenStorageProvider(&hProv, kKsp, 0);
   if (st != ERROR_SUCCESS) return fail("NCryptOpenStorageProvider failed");
@@ -396,8 +397,6 @@ bool HostIdentity::Load(const std::string& cnName, std::string* error) {
     return fail("NCryptFinalizeKey failed");
   }
 
-  std::string dir = LocalAppDataDir();
-  std::string certPath = dir + "\\host-cert.der";
   printf("identity: %s key=%s created=%d\n", certPath.c_str(),
          st == ERROR_SUCCESS ? "loaded" : "new", created ? 1 : 0);
 

@@ -385,9 +385,9 @@ Pin a specific encoder with `--codec mf-hw`, `--codec mf-sw-h264`, or
 decoder cannot display. An unavailable pinned encoder fails initialization;
 runtime encoder errors can still fall back to another tier.
 
-Video access units and parameter sets use Annex B start codes. A Vision Pro
-receiver must split NAL units, build its VideoToolbox format description, and
-convert access units to the length-prefixed form expected by VideoToolbox.
+The Windows encoders produce Annex B. The host converts H.264 and HEVC access
+units to four-byte big-endian NAL lengths for QUIC. The Vision Pro builds its
+VideoToolbox format description from the parameter sets sent in `CodecConfig`.
 
 ## Input consent and lifecycle
 

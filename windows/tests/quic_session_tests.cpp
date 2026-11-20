@@ -302,29 +302,56 @@ std::vector<uint8_t> PackedLayout() {
   return w.Take();
 }
 
-std::vector<uint8_t> PackedCodecConfig(uint64_t codecGen) {
+const std::vector<uint8_t>& ParameterSets(Codec codec) {
+  static const std::vector<uint8_t> hevc{
+      0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01,
+      0, 0, 1, 0x42, 0x01, 0x02, 0x03,
+      0, 0, 0, 1, 0x44, 0x01, 0xc0};
+  static const std::vector<uint8_t> h264{0, 0, 0, 1, 0x67, 0x64, 0, 0, 1, 0x68, 0xce};
+  return codec == Codec::H264 ? h264 : hevc;
+}
+
+std::vector<uint8_t> PackedCodecConfig(uint64_t codecGen, Codec codec = Codec::HEVC) {
   PacketWriter w(PacketKind::CodecConfig);
   CodecConfigPayload cc{};
   cc.codecGen = codecGen;
   cc.width = 1920;
   cc.height = 1080;
-  cc.codec = uint8_t(Codec::HEVC);
+  cc.codec = uint8_t(codec);
   cc.fpsNum = 60000;
   cc.fpsDen = 1000;
   cc.bitrateKbps = 24000;
-  // Two parameter sets with start codes: WIRE wants them bare.
-  const uint8_t csd[] = {0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01,
-                         0, 0, 0, 1, 0x42, 0x01, 0x02, 0x03};
-  cc.csdSize = sizeof(csd);
+  const auto& csd = ParameterSets(codec);
+  cc.csdSize = uint32_t(csd.size());
   w.Append(cc);
-  w.AppendBytes(csd, sizeof(csd));
+  w.AppendBytes(csd.data(), csd.size());
   return w.Take();
 }
 
-// A deterministic "coded picture" so the receiver can verify the bytes.
-uint8_t AuByte(uint32_t picSeq, size_t i) { return uint8_t((i * 31u + picSeq * 7u) & 0xFFu); }
+// Stand-in NAL units in the exact framing the headset expects. The first
+// contains an emulation-prevention byte that must survive conversion.
+std::vector<uint8_t> WirePicture(uint32_t picSeq, uint32_t bytes, bool idr, Codec codec) {
+  const uint8_t sei = codec == Codec::H264 ? 0x06 : 0x4e;
+  std::vector<uint8_t> au{0, 0, 0, 6, sei, 0x01, 0, 0, 3, 1};
+  const uint32_t sliceBytes = bytes - uint32_t(au.size()) - 4;
+  au.insert(au.end(), {uint8_t(sliceBytes >> 24), uint8_t(sliceBytes >> 16),
+                       uint8_t(sliceBytes >> 8), uint8_t(sliceBytes)});
+  const uint8_t slice = codec == Codec::H264 ? (idr ? 0x65 : 0x41) : (idr ? 0x26 : 0x02);
+  au.push_back(slice);
+  au.push_back(0x01);
+  for (size_t i = au.size(); i < bytes; ++i) au.push_back(uint8_t(i * 31u + picSeq * 7u));
+  return au;
+}
 
-std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t bytes, bool idr) {
+std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t bytes, bool idr,
+                                Codec codec = Codec::HEVC) {
+  const auto wire = WirePicture(picSeq, bytes, idr, codec);
+  std::vector<uint8_t> annexB;
+  if (idr) annexB = ParameterSets(codec);
+  annexB.insert(annexB.end(), {0, 0, 0, 1});
+  annexB.insert(annexB.end(), wire.begin() + 4, wire.begin() + 10);
+  annexB.insert(annexB.end(), {0, 0, 1});
+  annexB.insert(annexB.end(), wire.begin() + 14, wire.end());
   PacketWriter w(PacketKind::Media);
   MediaPayloadHeader mh{};
   mh.picSeq = picSeq;
@@ -334,11 +361,9 @@ std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t by
   mh.layoutGen = 7;
   mh.deadlineQpc = QpcNow() + MsToQpc(50);
   mh.monitor = 0;
-  mh.dataSize = bytes;
+  mh.dataSize = uint32_t(annexB.size());
   w.Append(mh);
-  std::vector<uint8_t> au(bytes);
-  for (size_t i = 0; i < au.size(); ++i) au[i] = AuByte(picSeq, i);
-  w.AppendBytes(au.data(), au.size());
+  w.AppendBytes(annexB.data(), annexB.size());
   return w.Take();
 }
 
@@ -373,7 +398,7 @@ void MeasureDelivery(Wire1Channel& channel, FakeHeadset& headset, uint32_t codec
   const auto start = QpcNow();
   for (uint32_t i = 0; i < kFrames; ++i) {
     sleeper.SleepUntilQpc(start + MsToQpc(i * (1000.0 / 60)));
-    channel.SendPacket(PackedMedia(kFirstPicture + i, codecGen, kBytesPerFrame, i == 0));
+    channel.SendPacket(PackedMedia(kFirstPicture + i, codecGen, kBytesPerFrame, i == 0, Codec::H264));
     maxBacklog = (std::max)(maxBacklog, channel.BacklogBytes());
     drain();
   }
@@ -390,7 +415,8 @@ void MeasureDelivery(Wire1Channel& channel, FakeHeadset& headset, uint32_t codec
 bool Run(bool measure) {
   wchar_t tmp[MAX_PATH] = {};
   GetTempPathW(MAX_PATH, tmp);
-  const std::wstring home = std::wstring(tmp) + L"wvm-quic-test-" + std::to_wstring(GetTickCount());
+  const std::wstring testDir = std::wstring(tmp) + L"wvm-quic-test-" + std::to_wstring(GetTickCount());
+  const std::wstring home = testDir + L"\\identity";
   SetEnvironmentVariableW(L"WVM_HOME", home.c_str());
 
   std::string error;
@@ -403,6 +429,8 @@ bool Run(bool measure) {
     std::printf("FAIL host identity: %s\n", error.c_str());
     return false;
   }
+  CHECK(GetFileAttributesW((testDir + L"\\identit").c_str()) == INVALID_FILE_ATTRIBUTES,
+        "creating the identity directory must not create partial path names");
   CHECK(identity.certSha256().size() == 32, "certificate hash");
 
   PairedDeviceStore devices;
@@ -455,6 +483,7 @@ bool Run(bool measure) {
   hello.hello.requestPairing = true;
   hello.hello.maxDatagramSize = 1100;
   hello.hello.decoder.hevc = true;
+  hello.hello.decoder.h264 = true;
   hello.hello.decoder.maxPixelRate = 3840ull * 2160ull * 60ull;
   headset.SendEnvelope(control, hello);
 
@@ -568,12 +597,10 @@ bool Run(bool measure) {
   CHECK(codecEnv.codecConfig.monitorId == 1, "codec config monitor id");
   CHECK(codecEnv.codecConfig.codecGen == codecGen, "codec generation");
   CHECK(codecEnv.codecConfig.codec == msg::Codec::Hevc, "codec");
-  CHECK(codecEnv.codecConfig.parameterSets.size() == 2, "parameter sets split from Annex-B: %zu",
-        codecEnv.codecConfig.parameterSets.size());
-  if (codecEnv.codecConfig.parameterSets.size() == 2) {
-    const auto& first = codecEnv.codecConfig.parameterSets[0];
-    CHECK(first.size() == 4 && first[0] == 0x40, "the start codes must be gone");
-  }
+  const std::vector<std::vector<uint8_t>> hevcSets{{0x40, 0x01, 0x0c, 0x01},
+                                                 {0x42, 0x01, 0x02, 0x03},
+                                                 {0x44, 0x01, 0xc0}};
+  CHECK(codecEnv.codecConfig.parameterSets == hevcSets, "bare HEVC VPS, SPS and PPS");
 
   // ---- the picture as FEC-protected datagrams (§4.1, §5) -------------------
   std::map<uint16_t, std::vector<uint8_t>> block0Data, block0Parity;
@@ -644,12 +671,13 @@ bool Run(bool measure) {
                                      parityPtrs.data(), int(parityPtrs.size()), shardBytes);
     CHECK(ok, "Reed-Solomon could not rebuild the block");
     if (ok) {
+      const auto expected = WirePicture(picSeq, pictureBytes, true, Codec::HEVC);
       bool same = true;
       for (int i = 0; i < 2; ++i) {
         for (size_t b = 0; b < shardBytes; ++b)
-          if (shards[i][b] != AuByte(picSeq, size_t(i) * shardBytes + b)) same = false;
+          if (shards[i][b] != expected[size_t(i) * shardBytes + b]) same = false;
       }
-      CHECK(same, "the rebuilt shards do not match the coded picture");
+      CHECK(same, "the rebuilt shards must contain length-prefixed HEVC without parameter sets");
     }
   }
 
@@ -677,12 +705,35 @@ bool Run(bool measure) {
 
   // Audio and cursor are sent from the pipeline while the pacer is active.
   // A reconfiguration must also publish a second CodecConfig.
-  const auto nextCodec = PackedCodecConfig(codecGen + 1);
+  const auto nextCodec = PackedCodecConfig(codecGen + 1, Codec::H264);
   CHECK(channel->SendPacket(nextCodec), "second codec config send");
-  const auto nextPicture = PackedMedia(picSeq + 1, codecGen + 1, 4096, true);
+  constexpr uint32_t h264Bytes = 80;
+  const auto nextPicture = PackedMedia(picSeq + 1, codecGen + 1, h264Bytes, true, Codec::H264);
   CHECK(channel->SendPacket(nextPicture), "send picture in new codec generation");
   CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::CodecConfig, 1000, &codecEnv) &&
         codecEnv.codecConfig.codecGen == codecGen + 1, "second codec config did not arrive");
+  const std::vector<std::vector<uint8_t>> h264Sets{{0x67, 0x64}, {0x68, 0xce}};
+  CHECK(codecEnv.codecConfig.codec == msg::Codec::H264 &&
+        codecEnv.codecConfig.parameterSets == h264Sets, "bare H.264 SPS and PPS");
+  const auto h264Wire = WirePicture(picSeq + 1, h264Bytes, true, Codec::H264);
+  bool sawH264 = false;
+  const ULONGLONG h264Deadline = GetTickCount64() + 1000;
+  while (!sawH264 && GetTickCount64() < h264Deadline) {
+    std::vector<std::vector<uint8_t>> batch;
+    headset.DrainDatagrams(kDgMediaShard, 100, &batch);
+    for (const auto& datagram : batch) {
+      dg::MediaShardHeader header{};
+      if (!dg::MediaShardHeader::parse(datagram.data(), datagram.size(), header) ||
+          header.picSeq != picSeq + 1 || (header.flags & dg::MediaShardHeader::kParity))
+        continue;
+      sawH264 = true;
+      CHECK(header.frameBytes == h264Wire.size() && header.shardBytes >= h264Wire.size() &&
+                memcmp(datagram.data() + dg::MediaShardHeader::kSize,
+                       h264Wire.data(), h264Wire.size()) == 0,
+            "H.264 must be length-prefixed with the SPS and PPS removed");
+    }
+  }
+  CHECK(sawH264, "no H.264 media datagram arrived");
 
   msg::Envelope settings;
   settings.kind = msg::Envelope::Kind::StreamSettings;
