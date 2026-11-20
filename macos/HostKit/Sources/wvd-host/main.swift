@@ -8,7 +8,7 @@ import WVDHostKit
 // Headless macOS host and benchmarks.
 //
 //   wvd-host serve [--display N | --synthetic] [--fps 60] [--mbps 150] [--port 47800] [--allow-input]
-//   wvd-host bench [--width 3840 --height 2160] [--h264] [--low-latency-rc]
+//   wvd-host bench [--width 3840 --height 2160] [--mbps 80] [--h264] [--low-latency-rc] [--quality]
 //
 // `serve` opens the pairing window at start and prints the SAS; type "y" + return to accept.
 
@@ -69,14 +69,58 @@ func serve() async throws {
     while true { try await Task.sleep(for: .seconds(3600)) }
 }
 
+enum BenchError: Error { case invalidSettings, readPixels }
+
+/// Squared difference on 8-bit luma against the NV12 that went into the encoder.
+///
+/// Speed on its own cannot tell an encoder that is fast from one that is fast because it dropped
+/// detail, and this is the number that lets a hardware tier be compared with VideoToolbox at the
+/// same resolution and bitrate instead of by eye. It is measured on the encoder's own input, which
+/// is what it is being judged on, rather than on the source's RGB.
+func lumaError(reference: CVPixelBuffer, decoded: CVPixelBuffer) throws -> (squared: UInt64, pixels: UInt64) {
+    guard CVPixelBufferLockBaseAddress(reference, .readOnly) == kCVReturnSuccess else { throw BenchError.readPixels }
+    defer { CVPixelBufferUnlockBaseAddress(reference, .readOnly) }
+    guard CVPixelBufferLockBaseAddress(decoded, .readOnly) == kCVReturnSuccess else { throw BenchError.readPixels }
+    defer { CVPixelBufferUnlockBaseAddress(decoded, .readOnly) }
+    let width = CVPixelBufferGetWidthOfPlane(reference, 0)
+    let height = CVPixelBufferGetHeightOfPlane(reference, 0)
+    guard width == CVPixelBufferGetWidthOfPlane(decoded, 0), height == CVPixelBufferGetHeightOfPlane(decoded, 0),
+          let referenceBase = CVPixelBufferGetBaseAddressOfPlane(reference, 0),
+          let decodedBase = CVPixelBufferGetBaseAddressOfPlane(decoded, 0) else { throw BenchError.readPixels }
+    let referenceStride = CVPixelBufferGetBytesPerRowOfPlane(reference, 0)
+    let decodedStride = CVPixelBufferGetBytesPerRowOfPlane(decoded, 0)
+    var squared: UInt64 = 0
+    for y in 0..<height {
+        let a = referenceBase.advanced(by: y * referenceStride).assumingMemoryBound(to: UInt8.self)
+        let b = decodedBase.advanced(by: y * decodedStride).assumingMemoryBound(to: UInt8.self)
+        var row = 0
+        for x in 0..<width {
+            let delta = Int(a[x]) - Int(b[x])
+            row += delta * delta
+        }
+        squared += UInt64(row)
+    }
+    return (squared, UInt64(width) * UInt64(height))
+}
+
 /// Per-stage costs on this Mac (plan §8 metric definitions; encode = submit -> last byte).
+///
+/// A frame the encoder or decoder drops is skipped rather than fatal: a benchmark that stops on the
+/// first hiccup reports the timings of the run up to it and calls that the machine.
 func bench() throws {
-    let w = Int(value("--width") ?? "") ?? 3840, h = Int(value("--height") ?? "") ?? 2160
+    guard let w = Int(value("--width") ?? "3840"), (2...8192).contains(w), w.isMultiple(of: 2),
+          let h = Int(value("--height") ?? "2160"), (2...8192).contains(h), h.isMultiple(of: 2),
+          let mbps = Int(value("--mbps") ?? "80"), (1...1000).contains(mbps) else {
+        throw BenchError.invalidSettings
+    }
+    let fps = 60
+    let frameCount = 120
+    let measureQuality = flag("--quality")
     let pipeline = try ColorPipeline()
     let source = try SyntheticSource(width: w, height: h)
     let pre = NV12Preprocessor(pipeline: pipeline, width: w, height: h)
     let codec: CodecKind = flag("--h264") ? .h264 : .hevc
-    let encoder = try VideoEncoder(settings: .init(width: w, height: h, fps: 60, bitrateBps: 80_000_000, codec: codec,
+    let encoder = try VideoEncoder(settings: .init(width: w, height: h, fps: fps, bitrateBps: mbps * 1_000_000, codec: codec,
                                                    lowLatencyRateControl: flag("--low-latency-rc")))
     print("VideoToolbox low-latency rate control: \(encoder.lowLatencyRateControl)")
     var convert = PercentileWindow(), encode = PercentileWindow(), fec = PercentileWindow(), decode = PercentileWindow(), rgb = PercentileWindow()
@@ -84,12 +128,14 @@ func bench() throws {
     let done = DispatchSemaphore(value: 0)
     let outputs = Locked<[VideoEncoder.Output]>([])
     var decoder: VideoDecoder?
+    var squaredError: UInt64 = 0
+    var pixels: UInt64 = 0
     let rgbDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm_srgb, width: w, height: h, mipmapped: true)
     rgbDesc.usage = [.shaderRead, .shaderWrite, .renderTarget, .pixelFormatView]
     rgbDesc.storageMode = .private
     let rgbTex = pipeline.device.makeTexture(descriptor: rgbDesc)!
     let rgbView = rgbTex.makeTextureView(pixelFormat: .rgba8Unorm)!
-    for i in 0..<120 {
+    for i in 0..<frameCount {
         guard let frame = source.render() else { continue }
         let t0 = MonoClock.nowMicros()
         let nv12 = try pre.convert(frame.pixelBuffer)
@@ -126,20 +172,34 @@ func bench() throws {
         cb.waitUntilCompleted()
         withExtendedLifetime(keep) {}
         rgb.add(micros: MonoClock.nowMicros() - t3)
+        if measureQuality, let error = try? lumaError(reference: nv12, decoded: pb) {
+            squaredError += error.squared
+            pixels += error.pixels
+        }
     }
     func line(_ name: String, _ p: PercentileWindow) {
         print(String(format: "%-28@ p50 %6.2f ms   p95 %6.2f ms   p99 %6.2f ms", name as NSString,
                      Double(p.p50) / 1000, Double(p.p95) / 1000, Double(p.p99) / 1000))
     }
-    print("\(w)x\(h), 120 frames, IDR every 30")
+    let codecName = codec == .h264 ? "H.264" : "HEVC"
+    print("\(codecName), \(w)x\(h) @ \(fps) fps, \(frameCount) frames, IDR every 30, \(mbps) Mbit/s target")
     line("BGRA->NV12 (GPU)", convert)
-    line("HEVC encode (VT)", encode)
+    line("Encode (VT)", encode)
     line("packetize + RS parity", fec)
-    line("HEVC decode (VT)", decode)
+    line("Decode (VT)", decode)
     line("NV12->RGB + mips (GPU)", rgb)
     let sorted = sizes.sorted()
     if !sorted.isEmpty {
         print("AU size p50 \(sorted[sorted.count / 2] / 1024) KiB, max \(sorted.last! / 1024) KiB")
+        // What the rate controller actually produced, which is the number a hardware encoder is
+        // compared at: two encoders at the same *target* are not at the same bitrate.
+        let encodedMbps = Double(sizes.reduce(0, +)) * 8 * Double(fps) / Double(frameCount) / 1e6
+        print(String(format: "Encoded video %.2f Mbit/s at source cadence", encodedMbps))
+    }
+    if measureQuality {
+        guard pixels > 0, squaredError > 0 else { print("Luma PSNR: no frames measured") ; return }
+        let mse = Double(squaredError) / Double(pixels)
+        print(String(format: "Luma PSNR %.2f dB", 10 * log10(255.0 * 255.0 / mse)))
     }
 }
 
@@ -148,7 +208,7 @@ do {
     case "bench": try bench()
     case "serve", nil: try await serve()
     default:
-        print("usage: wvd-host serve [--display N] [--fps 60] [--mbps 150] [--port 47800] [--allow-input] | bench [--width W --height H]")
+        print("usage: wvd-host serve [--display N] [--fps 60] [--mbps 150] [--port 47800] [--allow-input] | bench [--width W --height H --mbps N --h264 --low-latency-rc --quality]")
     }
 } catch {
     print("error: \(error)")

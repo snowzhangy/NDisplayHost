@@ -37,6 +37,17 @@ public enum FrameSourceStop: Sendable, Equatable {
     case failed(String)
 }
 
+/// Captured system audio: interleaved signed 16-bit PCM.
+public struct AudioChunk: Sendable {
+    public var sampleRate: UInt32
+    public var channels: Int
+    public var samples: [Int16]
+    public var hostTimeMicros: UInt64
+    public init(sampleRate: UInt32, channels: Int, samples: [Int16], hostTimeMicros: UInt64) {
+        self.sampleRate = sampleRate; self.channels = channels; self.samples = samples; self.hostTimeMicros = hostTimeMicros
+    }
+}
+
 public protocol FrameSource: AnyObject, Sendable {
     var name: String { get }
     var width: Int { get }
@@ -49,6 +60,12 @@ public protocol FrameSource: AnyObject, Sendable {
     func stop() async
     func cursor() -> CursorSnapshot?
     func cursorImage() -> CursorImage?
+    /// System audio while the source runs (nil stops delivery). Sources without audio ignore it.
+    func setAudioHandler(_ handler: (@Sendable (AudioChunk) -> Void)?)
+}
+
+extension FrameSource {
+    public func setAudioHandler(_ handler: (@Sendable (AudioChunk) -> Void)?) {}
 }
 
 /// GPU-generated test desktop (README bring-up step 2: headless CI without capture permissions).
@@ -165,6 +182,39 @@ public final class SyntheticSource: FrameSource, @unchecked Sendable {
         timerQueue.sync {
             timer?.cancel()
             timer = nil
+        }
+        setAudioHandler(nil)
+    }
+
+    // MARK: Audio (test tone)
+
+    private var audioTimer: DispatchSourceTimer?
+    private let audioPhase = Locked<Double>(0)
+
+    /// A 440 Hz tone on the left channel and 660 Hz on the right, in 10 ms chunks at 48 kHz.
+    public func setAudioHandler(_ handler: (@Sendable (AudioChunk) -> Void)?) {
+        timerQueue.sync {
+            audioTimer?.cancel()
+            audioTimer = nil
+            guard let handler else { return }
+            let t = DispatchSource.makeTimerSource(flags: .strict, queue: timerQueue)
+            t.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .microseconds(500))
+            let phase = audioPhase
+            t.setEventHandler {
+                let frames = 480
+                var samples = [Int16](repeating: 0, count: frames * 2)
+                phase.withLock { p in
+                    for f in 0..<frames {
+                        let t = p + Double(f) / 48_000
+                        samples[f * 2] = Int16(sin(2 * .pi * 440 * t) * 8000)
+                        samples[f * 2 + 1] = Int16(sin(2 * .pi * 660 * t) * 8000)
+                    }
+                    p += Double(frames) / 48_000
+                }
+                handler(AudioChunk(sampleRate: 48_000, channels: 2, samples: samples, hostTimeMicros: MonoClock.nowMicros()))
+            }
+            t.resume()
+            audioTimer = t
         }
     }
 

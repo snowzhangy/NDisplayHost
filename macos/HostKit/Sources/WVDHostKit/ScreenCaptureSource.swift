@@ -1,5 +1,6 @@
 #if os(macOS)
 import AppKit
+import CoreAudioTypes
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -29,6 +30,8 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
     private let fps: Int
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "wvd.sck", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "wvd.sck.audio", qos: .userInteractive)
+    private let onAudio = Locked<(@Sendable (AudioChunk) -> Void)?>(nil)
     private var onFrame: (@Sendable (CapturedFrame) -> Void)?
     private let onStopped = Locked<(@Sendable (FrameSourceStop) -> Void)?>(nil)
     private let cursorCache = Locked<(image: CursorImage?, hash: Int)>((nil, 0))
@@ -70,11 +73,16 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         config.queueDepth = 3
         config.showsCursor = false
-        config.capturesAudio = false
+        // System audio for the headset (48 kHz stereo); our own process is excluded so nothing echoes.
+        config.capturesAudio = true
+        config.sampleRate = 48_000
+        config.channelCount = 2
+        config.excludesCurrentProcessAudio = true
         config.scalesToFit = false
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
         try await stream.startCapture()
         self.stream = stream
         await MainActor.run { self.startCursorShapePolling() }
@@ -82,6 +90,7 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
 
     public func stop() async {
         onStopped.withLock { $0 = nil }  // an intentional stop is not a failure
+        onAudio.withLock { $0 = nil }
         try? await stream?.stopCapture()
         stream = nil
         await MainActor.run {
@@ -90,7 +99,49 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         }
     }
 
+    public func setAudioHandler(_ handler: (@Sendable (AudioChunk) -> Void)?) { onAudio.withLock { $0 = handler } }
+
+    /// SCK audio arrives as Float32, usually one buffer per channel; convert to interleaved Int16.
+    private func handleAudio(_ sb: CMSampleBuffer) {
+        guard let handler = onAudio.snapshot, sb.isValid,
+              let desc = CMSampleBufferGetFormatDescription(sb),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM, asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              asbd.mBitsPerChannel == 32, asbd.mChannelsPerFrame > 0 else { return }
+        let channels = Int(asbd.mChannelsPerFrame)
+        let frames = CMSampleBufferGetNumSamples(sb)
+        guard frames > 0 else { return }
+        var blockBuffer: CMBlockBuffer?
+        var listSize = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, bufferListSizeNeededOut: &listSize, bufferListOut: nil,
+            bufferListSize: 0, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+        guard listSize > 0 else { return }
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: listSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let abl = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, bufferListSizeNeededOut: nil, bufferListOut: abl,
+            bufferListSize: listSize, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, blockBufferOut: &blockBuffer) == noErr else { return }
+        let buffers = UnsafeMutableAudioBufferListPointer(abl)
+        let planar = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        var out = [Int16](repeating: 0, count: frames * channels)
+        @inline(__always) func s16(_ v: Float) -> Int16 { Int16((v.isFinite ? min(max(v, -1), 1) : 0) * 32767) }
+        if planar {
+            for c in 0..<min(channels, buffers.count) {
+                guard let p = buffers[c].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let n = min(frames, Int(buffers[c].mDataByteSize) / 4)
+                for f in 0..<n { out[f * channels + c] = s16(p[f]) }
+            }
+        } else if let p = buffers.first?.mData?.assumingMemoryBound(to: Float.self) {
+            let n = min(frames * channels, Int(buffers[0].mDataByteSize) / 4)
+            for i in 0..<n { out[i] = s16(p[i]) }
+        }
+        handler(AudioChunk(sampleRate: UInt32(asbd.mSampleRate.rounded()), channels: channels, samples: out,
+                           hostTimeMicros: MonoClock.nowMicros()))
+    }
+
     public func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio { handleAudio(sb); return }
         guard type == .screen, sb.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let statusRaw = attachments.first?[.status] as? Int, let status = SCFrameStatus(rawValue: statusRaw),

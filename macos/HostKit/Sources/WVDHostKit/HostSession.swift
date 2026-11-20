@@ -77,6 +77,9 @@ public final class HostSession: @unchecked Sendable {
     private var cursorShapeHash = 0
     private var cursorShapeVer: UInt32 = 0
     private var cursorSeq: UInt32 = 0
+    /// The client asked for audio (StreamSettings.audio); nothing is sent otherwise.
+    private var audioEnabled = false
+    private var audioSeq: UInt32 = 0
     private var lastCursor: CursorSnapshot?
     private var lastCursorSentAt: UInt64 = 0
 
@@ -267,6 +270,7 @@ public final class HostSession: @unchecked Sendable {
             thermal = t.state
             applyBitrateCaps()
         case .streamSettings(let s) where auth == .authenticated:
+            audioEnabled = s.audio
             if s.maxBitrateKbps > 0 {
                 maxBitrate = min(Int(s.maxBitrateKbps) * 1000, server?.config.maxBitrateBps ?? Int.max)
                 applyBitrateCaps()
@@ -549,6 +553,10 @@ public final class HostSession: @unchecked Sendable {
                 self.queue.async { [weak self] in self?.close(reason: "capture failed: \(error.localizedDescription)") }
             }
         }
+        src.setAudioHandler { [weak self] chunk in
+            guard let self else { return }
+            self.queue.async { [weak self] in self?.sendAudio(chunk) }
+        }
         repeating(every: .milliseconds(4)) { [weak self] in self?.cursorTick() }
         repeating(every: .seconds(1)) { [weak self] in self?.statsTick() }
     }
@@ -812,6 +820,23 @@ public final class HostSession: @unchecked Sendable {
         let d = CursorDatagram(visible: snap.visible, monitorID: UInt16(monitor.monitorID), layoutGen: layoutGen,
                                shapeVer: cursorShapeVer, seq: cursorSeq, x: snap.x, y: snap.y, hostTimeMicros: now)
         flow.send(content: d.encoded(), completion: .idempotent)
+    }
+
+    // MARK: Audio (uncompressed PCM datagrams, about 5 ms each; see AudioPacket)
+
+    private func sendAudio(_ chunk: AudioChunk) {
+        guard audioEnabled, auth == .authenticated, !isClosed, let flow = datagramFlow.snapshot,
+              chunk.channels > 0, chunk.sampleRate > 0 else { return }
+        let usable = Int(hello?.maxDatagramSize ?? 1200)
+        let fit = (min(max(usable, 1200), 1400) - AudioPacket.headerSize) / (chunk.channels * 2)
+        let perPacket = max(1, min(Int(chunk.sampleRate) / 200, fit))
+        let packets = AudioPacket.packetize(chunk.samples, channels: chunk.channels, sampleRate: chunk.sampleRate,
+                                            framesPerPacket: perPacket, sessionGen: sessionGen, firstSeq: audioSeq,
+                                            hostTimeMicros: chunk.hostTimeMicros)
+        audioSeq &+= UInt32(packets.count)
+        flow.batch {
+            for p in packets { flow.send(content: p.encoded(), completion: .idempotent) }
+        }
     }
 
     // MARK: Stats
