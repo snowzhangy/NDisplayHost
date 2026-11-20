@@ -10,8 +10,9 @@
     2. Ensure test signing is enabled (reboot required if toggled).
     3. Import the lab certificate into LocalMachine Root + TrustedPublisher.
     4. pnputil add/install the INF.
-    5. Start wvd-owner (creates the Root\WVDIDD software device; the driver
-       binds to it and a virtual monitor arrives).
+    5. Start the owner service (ndisplay owner --install/--start; it creates
+       the Root\WVDIDD software device, the driver binds to it and a virtual
+       monitor arrives).
 
   Requires an elevated prompt. Secure Boot may need to be disabled for
   load-time signing on some builds.
@@ -34,11 +35,11 @@ function Test-Admin {
 if (-not (Test-Admin)) { throw "run from an elevated prompt" }
 
 $root = Split-Path -Parent $PSScriptRoot
-$owner = Join-Path $root 'build\src\owner\wvd-owner.exe'
+$cli = Join-Path $root 'build\bin\ndisplay.exe'
 
 if ($Uninstall) {
   Write-Host "stopping owner + removing device + driver" -ForegroundColor Yellow
-  & $owner --stop
+  & $cli owner --stop
   $dev = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -like '*WVD*' }
   if ($dev) { & pnputil /remove-device $dev.InstanceId }
   $oem = (Get-WindowsDriver -Online | Where-Object {
@@ -73,7 +74,7 @@ if (-not $SkipDriver) {
 }
 
 # 4. Install + start the owner service (creates the software device → monitor).
-Write-Host "installing + starting wvd-owner" -ForegroundColor Cyan
-& $owner --install
-& $owner --start
+Write-Host "installing + starting the owner service" -ForegroundColor Cyan
+& $cli owner --install
+& $cli owner --start
 Write-Host "done — a 'WVD Virtual Display' should appear in Display Settings." -ForegroundColor Green

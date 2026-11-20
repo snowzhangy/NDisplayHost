@@ -17,7 +17,7 @@ Direct legacy-AP API. A client joins it through ordinary Wi-Fi settings; it does
 not need access to Apple's private networking frameworks or a Wi-Fi Direct API.
 This is a router-free local connection, not a cellular/internet tether.
 
-1. Expand **Direct Wi-Fi · no router** in `wvd-host`.
+1. Expand **Direct Wi-Fi · no router** in the control panel.
 2. Set an SSID (1–32 UTF-8 bytes) and a password (8–63 printable ASCII characters).
    The panel generates a random password on launch and masks it; **Copy** is
    available for the operator. The password is never put in logs or command lines.

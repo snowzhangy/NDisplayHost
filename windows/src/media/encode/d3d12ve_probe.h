@@ -1,6 +1,6 @@
 // Tier-2 probe: D3D12 Video Encode capability query (§4.6).
 // Queries codecs / frame sizes per adapter. The encode implementation module
-// lands in Phase 1; the probe is real and used by wvd-diag and the factory.
+// lands in Phase 1; the probe is real and used by the diag role and the factory.
 #pragma once
 
 #include <string>

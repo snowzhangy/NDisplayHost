@@ -2,17 +2,18 @@
 
 The user-facing name of this host is **NDisplayHostWin** followed by its version,
 for example `NDisplayHostWin 1.0.0 (build 1)`. It appears in the control-panel title bar,
-the header, the tray tooltip and the first line of every `wvd-media` log, so a
+the header, the tray tooltip and the first line of every `ndisplay stream` log, so a
 screenshot or a log is enough to say which build a machine is running. Bump
 `WVM_HOST_VERSION_MAJOR/MINOR/PATCH` and `WVM_HOST_BUILD` in
 [`CMakeLists.txt`](CMakeLists.txt) — the single source of truth; the C# panel
 (`src/ui/Version.cs.in`) and the native binaries (`src/common/include/wvd/
-version.h`) are generated from it. The executable and component names
-(`wvd-host.exe`, `wvd-media.exe`, …), the `WVM_HOST_*` CMake variables, the
-`WVM_HOME` override with its `%LOCALAPPDATA%\WVM` store, the `wvm-pairing-*`
-pipes, the `_wvd._udp` service type and the driver's `WVD` virtual-monitor
-identifiers are unchanged: they are internal, and renaming them would break
-existing pairings, saved hosts and installed drivers for no user benefit.
+version.h`) are generated from it. The build produces **two** executables —
+`NDisplayHostWin.exe` (the control panel) and `ndisplay.exe` (every other role,
+chosen by its first argument) — while internal names keep the older spelling:
+the `WVM_HOST_*` CMake variables, the `WVM_HOME` override with its
+`%LOCALAPPDATA%\WVM` store, the `wvm-pairing-*` pipes, the `_wvd._udp` service
+type and the driver's `WVD` virtual-monitor identifiers. Renaming those would
+break existing pairings, saved hosts and installed drivers for no benefit.
 
 Windows host for desktop capture, video encoding, audio, cursor updates and remote input.
 The user-mode components build with MSVC and the Windows SDK. The IddCx driver
@@ -23,16 +24,25 @@ In [NDisplayApp](https://github.com/snowzhangy/NDisplayApp), select the discover
 PC or add its LAN address using **Secure QUIC**. Compare the six-digit code on
 the PC and headset when pairing.
 
-| Component | Role |
+| Executable | Role |
 | --- | --- |
-| `wvd-owner` | Software-device lifetime, topology recovery and keep-awake |
-| `wvd-media` | Desktop Duplication → BT.709 full-range NV12 → encoder → transport |
-| `wvd-input` | Consented, per-session keyboard/mouse injection |
-| `wvd-diag` | Adapter/encoder probes, capture diagnostics and QUIC listener probe |
-| `wvd-testcard` | Animated window for capture and latency testing |
-| `wvd-host` | **NDisplayHostWin** control panel for streaming, input consent and connection setup |
-| `wvd-network` | Optional offline Wi-Fi Direct access point, owned by the control panel |
+| `bin/NDisplayHostWin.exe` | **NDisplayHostWin**, the control panel: streaming, input consent, connection setup, direct Wi-Fi, tray |
+| `bin/ndisplay.exe` | the command-line host: one binary, one role per process |
+| `bin/msquic.dll` | QUIC runtime, loaded by `ndisplay.exe` |
 | `driver/` | UMDF/IddCx virtual monitor provider, separate WDK project |
+
+| Role of `ndisplay.exe` | What it does |
+| --- | --- |
+| `stream` | Desktop Duplication → BT.709 full-range NV12 → encoder → QUIC transport |
+| `input` | Consented, per-session keyboard/mouse injection |
+| `owner` | Software-device lifetime, topology recovery and keep-awake; installs as a service |
+| `network` | Optional offline Wi-Fi Direct access point, owned by the control panel |
+| `diag` | Adapter/encoder/mode/capture probes and the QUIC listener probe |
+| `--version` | Host name and version |
+
+One executable, but still one process per role: a crashing media worker must not
+take the panel, the input helper or the virtual monitor down with it (§4.1).
+The panel starts roles as its children and stops them with its job object.
 
 See the [wire contract](../core/proto/WIRE.md) and
 [validation record](VALIDATION.md) for implementation scope and test evidence.
@@ -54,6 +64,9 @@ Or configure manually:
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 ```
+
+Both shipped executables land in **`build/bin/`**: `NDisplayHostWin.exe`,
+`ndisplay.exe` and `msquic.dll`, the same layout as the release package.
 
 Tests cover input state and pipe lifecycle, GPU colour conversion, cursor
 shapes, EDID encoding, and topology persistence/remapping with simulated CCD
@@ -108,7 +121,7 @@ The required MsQuic build uses the pinned revision and Schannel TLS. See
 [Build and checks](#build-and-checks) to compile it.
 
 ```powershell
-wvd-media --listen 47800
+build/bin/ndisplay.exe stream --listen 47800
 ```
 
 The host publishes `_wvd._udp`. Allow inbound UDP 47800 on the Windows network
@@ -152,7 +165,7 @@ session being refused, and disconnect.
 Open the desktop control panel from the repository root:
 
 ```powershell
-windows/build/src/ui/wvd-host.exe
+windows/build/bin/NDisplayHostWin.exe
 ```
 
 Choose the display, encoder, frame rate and bitrate, then click **Start host**.
@@ -173,9 +186,6 @@ may be under the notification area's overflow arrow.
 Closing the panel or choosing **Exit NDisplayHostWin** stops all
 processes and any direct Wi-Fi network it created. Existing independently
 started command-line processes are not managed by this panel.
-
-**Test card** opens an optional animated pattern with a frame counter. It helps
-spot freezes and capture delay; it is not the control panel or a video receiver.
 
 The panel uses WPF and the .NET Framework compiler included on the development
 PC; CMake builds it without NuGet packages. If that compiler is unavailable,
@@ -199,21 +209,22 @@ Mobile Hotspot conflicts with this mode and must be off.
 From the repository root, in your interactive Windows session:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File windows/scripts/start-dev.ps1 -TestCard
+powershell -ExecutionPolicy Bypass -File windows/scripts/start-dev.ps1
 ```
 
-This starts the input helper, the host on UDP **47800**, and the test card.
-Logs and process IDs are in `.local/dev-session/`. Pass `-Probe` to test the QUIC
-handshake or `-NoInput` to omit the input helper. `-ScreenOff` blacks out the PC's
+This starts the input role and the stream role on UDP **47800**, both from
+`windows/build/bin/ndisplay.exe`. Logs and process IDs are in
+`.local/dev-session/`. Pass `-Probe` to test the QUIC handshake or `-NoInput` to
+omit the input helper. `-ScreenOff` blacks out the PC's
 screens while a headset is connected. `-NoAudio` keeps the PC's sound off the stream.
 
 ```powershell
 # From windows/
-build/src/media/wvd-media.exe --listen 47800 --codec auto
-build/src/tools/diag/wvd-diag.exe quic-probe 47800
+build/bin/ndisplay.exe stream --listen 47800 --codec auto
+build/bin/ndisplay.exe diag quic-probe 47800
 
 # Run capture and encoding locally with synthetic input.
-build/src/media/wvd-media.exe --synthetic --demo 5 --codec auto
+build/bin/ndisplay.exe stream --synthetic --demo 5 --codec auto
 ```
 
 `--monitor \\.\DISPLAY2` selects an output; `--fps 60` sets the stream frame
@@ -242,7 +253,7 @@ Sound). The host captures the default playback device with WASAPI shared-mode lo
   level, centre into both sides and surround/back channels into their side at -3 dB, LFE left out. Louder
   surround mixes are clipped, not wrapped.
 - **Switch it off on the PC:** clear **Send this PC's sound to the headset** in the control panel, or start
-  `wvd-media --no-audio`. The host then refuses the headset's request and logs it once.
+  `ndisplay stream --no-audio`. The host then refuses the headset's request and logs it once.
 
 The host log shows `audio=1` in each peer hello that asks for sound, then `audio: loopback '<device>'`
 with the format (and `folded to stereo` for more than two channels). `audio: off (headset)` follows a hello
@@ -255,7 +266,7 @@ installation are described in the build instructions above.
 
 Like a Mac running Mac Virtual Display, the PC's own screens can go dark while the headset is connected:
 tick **Turn off this PC's screen while the headset is connected** in the control panel, or start
-`wvd-media --screen-off`. Each physical screen gets a black, click-through, topmost window that is
+`ndisplay stream --screen-off`. Each physical screen gets a black, click-through, topmost window that is
 **excluded from capture** (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, Windows 10 2004 or later),
 so Desktop Duplication and the headset still see the desktop beneath it. For the first ten seconds it
 shows a dim line explaining how to get the screen back.
@@ -273,7 +284,7 @@ shows a dim line explaining how to get the screen back.
   above topmost windows, and the hardware pointer. An LCD's backlight stays on; an OLED panel shows true
   black. A full-screen game under the curtain is composed by DWM rather than flipped directly.
 
-`wvd-diag curtain-test` checks this on a PC (unlocked desktop required): it shows a small magenta
+`ndisplay diag curtain-test` checks this on a PC (unlocked desktop required): it shows a small magenta
 rectangle near the top-left corner for about two seconds and verifies, through Desktop Duplication, that
 the curtain hides it on screen but not in the captured picture. It also lists which screens
 `--screen-off` would cover.
@@ -359,7 +370,7 @@ new `MonitorLayout` and `CodecConfig` and its window takes the new shape.
 * `--no-mode-change` advertises only the current mode, so the menu is hidden.
   Requests come from the authenticated headset session.
 
-`wvd-diag modes` prints the list each display would offer.
+`ndisplay diag modes` prints the list each display would offer.
 
 ### Encoder selection
 
@@ -380,15 +391,15 @@ convert access units to the length-prefixed form expected by VideoToolbox.
 
 ## Input consent and lifecycle
 
-`wvd-input` runs inside the interactive session, and starts disarmed. For a
-manual launch, copy its printed token into the media worker:
+The input role runs inside the interactive session, and starts disarmed. For a
+manual launch, copy its printed token into the stream role:
 
 ```powershell
 # Terminal 1; elevate for injection into elevated applications:
-build/src/input/wvd-input.exe
+build/bin/ndisplay.exe input
 
 # Terminal 2; substitute the token printed above:
-build/src/media/wvd-media.exe --listen 47800 --allow-input --input \\.\pipe\wvd.input --input-token TOKEN
+build/bin/ndisplay.exe stream --listen 47800 --allow-input --input \\.\pipe\wvd.input --input-token TOKEN
 ```
 
 The option is **`--input`**, not `--input-pipe`. Without a token, video works
@@ -415,9 +426,9 @@ Install the [driver package](driver/README.md) before using the owner to create
 a virtual monitor. Save/arrange/restore from an elevated interactive terminal:
 
 ```powershell
-build/src/owner/wvd-owner.exe --save-topology
-build/src/owner/wvd-owner.exe --arrange WVD
-build/src/owner/wvd-owner.exe --restore-topology
+build/bin/ndisplay.exe owner --save-topology
+build/bin/ndisplay.exe owner --arrange WVD
+build/bin/ndisplay.exe owner --restore-topology
 ```
 
 Version-2 snapshots store active monitor device identities, source modes, clone
@@ -435,15 +446,15 @@ after IPC callbacks, watchdog work, power requests and the software device stop.
 ## Diagnostics
 
 ```text
-wvd-diag adapters        DXGI adapters and outputs
-wvd-diag caps            encoder candidates
-wvd-diag modes           sizes the headset's size menu would offer per display
-wvd-diag topology        active display paths (--all for every path)
-wvd-diag capture         Desktop Duplication probe (--seconds N)
-wvd-diag coords-selftest coordinate transforms
-wvd-diag curtain-test    --screen-off curtain stays out of the stream
-wvd-diag owner-ping      owner control pipe
-wvd-diag quic-probe PORT local QUIC handshake and datagram negotiation
+ndisplay diag adapters        DXGI adapters and outputs
+ndisplay diag caps            encoder candidates
+ndisplay diag modes           sizes the headset's size menu would offer per display
+ndisplay diag topology        active display paths (--all for every path)
+ndisplay diag capture         Desktop Duplication probe (--seconds N)
+ndisplay diag coords-selftest coordinate transforms
+ndisplay diag curtain-test    --screen-off curtain stays out of the stream
+ndisplay diag owner-ping      owner control pipe
+ndisplay diag quic-probe PORT local QUIC handshake and datagram negotiation
 ```
 
 Monochrome cursor height excludes the second mask. Colour alpha is retained;

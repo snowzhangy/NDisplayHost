@@ -1,4 +1,5 @@
-// Main owns notifications; only the hook-free injector thread calls SendInput.
+// "input" role: main owns notifications; only the hook-free injector thread
+// calls SendInput.
 #include <atomic>
 #include <cstdio>
 #include <deque>
@@ -8,6 +9,8 @@
 #include <wtsapi32.h>
 #include "wvd/ipc.h"
 #include "wvd/logging.h"
+#include "wvd/roles.h"
+#include "wvd/version.h"
 #include "wvd/stop_signal.h"
 using namespace wvd;
 
@@ -166,8 +169,10 @@ BOOL WINAPI StopHandler(DWORD type) {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace wvd {
+int RoleInput(int argc, char** argv) {
   EnablePerMonitorDpiAwareness(); log::Init("input");
+  WVD_LOGI("%s %s", kHostProduct, HostVersion().c_str());
   std::wstring pipe = kDefaultPipe;
   std::wstring stopEvent;
   for (int i = 1; i < argc; ++i) {
@@ -188,12 +193,12 @@ int main(int argc, char** argv) {
     if (!random || !random(&g_instance, sizeof(g_instance)) || !g_instance) return 1;
     if (!g_authToken && (!random(&g_authToken, sizeof(g_authToken)) || !g_authToken)) return 1;
   }
-  printf("WVD input arming token: %016llX\n", (unsigned long long)g_authToken);
-  printf("start the media worker with: wvd-media --input-token %016llX\n",
+  printf("Input arming token: %016llX\n", (unsigned long long)g_authToken);
+  printf("start the stream role with: ndisplay stream --input-token %016llX\n",
          (unsigned long long)g_authToken);
   fflush(stdout);
   if (!ProcessIdToSessionId(GetCurrentProcessId(), &g_sessionId) || !g_sessionId) {
-    WVD_LOGE("launch wvd-input in the interactive session (not Session 0)"); return 1;
+    WVD_LOGE("run 'ndisplay input' inside the desktop session, not as a service"); return 1;
   }
   g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   if (!g_wake) return 1;
@@ -232,3 +237,4 @@ int main(int argc, char** argv) {
   SetConsoleCtrlHandler(StopHandler, FALSE); CloseHandle(g_wake);
   return 0;
 }
+}  // namespace wvd

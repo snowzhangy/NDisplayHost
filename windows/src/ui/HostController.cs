@@ -23,13 +23,16 @@ namespace WvdHost {
     public bool AllowInput, Synthetic, ScreenOff, NoAudio;
   }
 
-  // Every process is a child of this UI's kill-on-close job. Normal stops use
-  // an event: media releases/disarms input before the helper itself shuts down.
+  // Every role runs as a child process of this UI's kill-on-close job, started
+  // from the single command-line host: ndisplay.exe <role>. Normal stops use an
+  // event: the stream role releases/disarms input before the helper shuts down.
   public sealed class HostController : IDisposable {
     public event Action<string> Line;
     public readonly string Root;
+    // The command-line host lives next to the panel, in the same folder.
+    public const string CliName = "ndisplay.exe";
     private readonly IntPtr job;
-    private Process media, input, card, network;
+    private Process media, input, network;
     private EventWaitHandle mediaStop, inputStop, networkStop;
     private string pipeName;
     private ulong token;
@@ -40,7 +43,7 @@ namespace WvdHost {
     public bool InputAvailable { get { return Alive(input); } }
 
     public HostController() {
-      Root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+      Root = AppDomain.CurrentDomain.BaseDirectory;
       job = CreateJobObject(IntPtr.Zero, null);
       var limits = new JobLimits();
       limits.BasicLimitInformation.LimitFlags = 0x2000; // KILL_ON_JOB_CLOSE
@@ -67,11 +70,14 @@ namespace WvdHost {
       }
       return result.Append('\\', slashes * 2).Append('"').ToString();
     }
-    private string Exe(string relative) { return Path.Combine(Root, relative); }
-    private Process Spawn(string relative, IEnumerable<string> args, bool captureOutput,
+    private string Cli { get { return Path.Combine(Root, CliName); } }
+    // args begin with the role name: stream, input, network, diag.
+    private Process Spawn(IEnumerable<string> args, bool captureOutput,
                           Action<string> onOutput = null) {
-      string executable = Exe(relative);
-      if (!File.Exists(executable)) throw new FileNotFoundException("Build component missing: " + relative);
+      string executable = Cli;
+      if (!File.Exists(executable))
+        throw new FileNotFoundException(CliName + " is missing next to " +
+          Path.GetFileName(Process.GetCurrentProcess().MainModule.FileName));
       var info = new ProcessStartInfo(executable, String.Join(" ", args.Select(Quote))) {
         UseShellExecute = false, CreateNoWindow = true,
         RedirectStandardError = true, RedirectStandardOutput = true,
@@ -108,7 +114,7 @@ namespace WvdHost {
         if (options.Port < 1024 || options.Port > 65535) throw new ArgumentException("Port must be 1024–65535.");
         Port = options.Port;
         try {
-          var args = new List<string> {"--listen", Port.ToString(CultureInfo.InvariantCulture),
+          var args = new List<string> {"stream", "--listen", Port.ToString(CultureInfo.InvariantCulture),
             "--fps", options.Fps.ToString(), "--bitrate", options.Bitrate.ToString(),
             "--codec", options.Encoder, "--stop-event", NewStopEvent(out mediaStop)};
           if (!String.IsNullOrEmpty(options.Display)) args.AddRange(new [] {"--monitor", options.Display});
@@ -120,13 +126,13 @@ namespace WvdHost {
             token = BitConverter.ToUInt64(random, 0);
             pipeName = "wvd.input.ui." + Process.GetCurrentProcess().Id + "." + Guid.NewGuid().ToString("N");
             string auth = token.ToString("X16", CultureInfo.InvariantCulture);
-            input = Spawn("input/wvd-input.exe", new [] {"--pipe", "\\\\.\\pipe\\" + pipeName,
+            input = Spawn(new [] {"input", "--pipe", "\\\\.\\pipe\\" + pipeName,
               "--token", auth, "--stop-event", NewStopEvent(out inputStop)}, false);
             args.AddRange(new [] {"--input", "\\\\.\\pipe\\" + pipeName, "--input-token", auth, "--allow-input"});
           }
           var listening = new TaskCompletionSource<bool>();
           string readyLine = "HOST_READY " + Port.ToString(CultureInfo.InvariantCulture);
-          media = Spawn("media/wvd-media.exe", args, true, line => {
+          media = Spawn(args, true, line => {
             if (line == readyLine) listening.TrySetResult(true);
           });
           var timeout = Stopwatch.StartNew();
@@ -154,7 +160,7 @@ namespace WvdHost {
     public Task Stop() { return Task.Run(delegate { StopCore(); Emit("UI_HOST_STOPPED"); }); }
     public async Task ProbeListener() {
       if (!Running) throw new InvalidOperationException("Start the host before testing the listener.");
-      await Probe("tools/diag/wvd-diag.exe", "quic-probe " + Port.ToString(CultureInfo.InvariantCulture));
+      await Probe("diag quic-probe " + Port.ToString(CultureInfo.InvariantCulture));
       Emit("UI_LISTENER_TEST_OK");
     }
 
@@ -169,11 +175,6 @@ namespace WvdHost {
           pipe.Write(decision, 0, decision.Length);
         }
       });
-    }
-    public void ToggleCard() {
-      if (Alive(card)) { card.CloseMainWindow(); return; }
-      card = Spawn("tools/testcard/wvd-testcard.exe", new [] {"--big"}, false);
-      Emit("Test card opened: an animated reference pattern and frame counter. Press Esc to close it.");
     }
     public Task DisableInput() {
       return Task.Run(delegate {
@@ -205,16 +206,17 @@ namespace WvdHost {
           throw new ArgumentException("Use a network name of 1–32 UTF-8 bytes.");
         if (password.Length < 8 || password.Length > 63 || password.Any(c => c < 32 || c > 126))
           throw new ArgumentException("Use a Wi-Fi password of 8–63 printable ASCII characters.");
-        network = Spawn("network/wvd-network.exe", new [] {"--ssid", ssid,
+        network = Spawn(new [] {"network", "--ssid", ssid,
           "--stop-event", NewStopEvent(out networkStop)}, true);
         network.StandardInput.WriteLine(password); network.StandardInput.Close();
         Emit("Creating direct Wi-Fi. No internet connection is required.");
       });
     }
-    public Task<string> Probe(string component, string argument) {
+    // Runs a command line of the host executable and returns its output.
+    public Task<string> Probe(string argument) {
       return Task.Run(delegate {
         using (var process = new Process()) {
-          process.StartInfo = new ProcessStartInfo(Exe(component), argument) {
+          process.StartInfo = new ProcessStartInfo(Cli, argument) {
             UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
             RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8
@@ -246,7 +248,6 @@ namespace WvdHost {
     public void Dispose() {
       if (disposed) return; disposed = true;
       StopCore(); End(ref network, ref networkStop);
-      EventWaitHandle unused = null; End(ref card, ref unused);
       if (job != IntPtr.Zero) CloseHandle(job);
     }
     [StructLayout(LayoutKind.Sequential)] private struct BasicLimits {

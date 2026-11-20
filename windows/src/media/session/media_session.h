@@ -43,12 +43,12 @@ struct SessionConfig {
   uint32_t fps = 60;
   uint32_t bitrateKbps = 60000;
   // "auto" (best tier) | "hevc" | "h264" (preferred codec, best tier) |
-  // "null" (pipeline test encoder) | an encoder name from `wvd-diag caps`.
+  // "null" (pipeline test encoder) | an encoder name from `ndisplay diag caps`.
   std::string codec = "auto";
   uint32_t deadlineMs = 50;      // presentation deadline beyond capture stamp
   uint32_t quietMsRefine = 250;  // T_q: refinement after this quiet time (§6.4)
   std::wstring inputPipe;        // optional: forward input to helper
-  uint64_t inputToken = 0;       // arming token from wvd-input (§4.7-4); 0 = cannot inject
+  uint64_t inputToken = 0;       // arming token from the input role (§4.7-4); 0 = cannot inject
   ChromaFilter chroma = ChromaFilter::TextAware;
   uint32_t synWidth = 1280;   // synthetic source size (§--synthetic)
   uint32_t synHeight = 720;

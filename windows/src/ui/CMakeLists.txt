@@ -1,12 +1,15 @@
-# WPF desktop shell using the .NET Framework that ships with Windows. No NuGet,
-# WebView runtime or additional UI SDK is required.
+# NDisplayHostWin.exe — the WPF control panel, built with the .NET Framework
+# that ships with Windows. No NuGet, WebView runtime or additional UI SDK.
+# It is the only GUI executable; everything it drives lives in ndisplay.exe.
 set(WVD_FRAMEWORK "$ENV{WINDIR}/Microsoft.NET/Framework64/v4.0.30319")
 set(WVD_CSC "${WVD_FRAMEWORK}/csc.exe")
 if(NOT EXISTS "${WVD_CSC}")
-  message(WARNING ".NET Framework compiler unavailable; wvd-host UI is skipped")
+  message(WARNING ".NET Framework compiler unavailable; the control panel is skipped")
   return()
 endif()
-set(WVD_UI_EXE "${CMAKE_CURRENT_BINARY_DIR}/wvd-host.exe")
+# Shipped beside ndisplay.exe and msquic.dll in build/bin.
+set(WVD_UI_EXE "${CMAKE_BINARY_DIR}/bin/NDisplayHostWin.exe")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # Name + version shown in the title bar, tray tooltip and activity log.
 configure_file(Version.cs.in "${CMAKE_CURRENT_BINARY_DIR}/Version.cs" @ONLY)
 file(TO_NATIVE_PATH "${CMAKE_CURRENT_BINARY_DIR}/Version.cs" WVD_VERSION_CS)
@@ -24,7 +27,7 @@ add_custom_command(OUTPUT "${WVD_UI_EXE}"
     "/resource:${WVD_XAML},WvdHost.MainWindow.xaml"
     "${WVD_APP_CS}" "${WVD_VERSION_CS}" "${WVD_CONTROLLER_CS}" "${WVD_TRAY_CS}"
   DEPENDS App.cs "${CMAKE_CURRENT_BINARY_DIR}/Version.cs" HostController.cs TrayIcon.cs
-    MainWindow.xaml Version.cs.in
+    MainWindow.xaml Version.cs.in $<TARGET_FILE:ndisplay>
   VERBATIM)
-add_custom_target(wvd-host ALL DEPENDS "${WVD_UI_EXE}")
-add_dependencies(wvd-host wvd-media wvd-input wvd-diag wvd-testcard wvd-network)
+add_custom_target(NDisplayHostWin ALL DEPENDS "${WVD_UI_EXE}")
+add_dependencies(NDisplayHostWin ndisplay)

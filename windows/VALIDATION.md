@@ -448,3 +448,42 @@ driver's `WVD` virtual-monitor identifiers.
 Verified on this machine: full `cmake --build build` (MSVC, all targets including
 the panel), `ctest` 8/8 passed, and the running panel's window title read back as
 `NDisplayHostWin 1.0.0 (build 1)`.
+
+## Two executables: NDisplayHostWin.exe and ndisplay.exe — 2026-11-19 (AMD development PC)
+
+The host used to ship seven executables (`wvd-host`, `wvd-media`, `wvd-input`,
+`wvd-owner`, `wvd-network`, `wvd-diag`, `wvd-testcard`) in a mirrored
+`src/<component>/` tree. It now ships two:
+
+* **`NDisplayHostWin.exe`** — the WPF control panel, the only GUI;
+* **`ndisplay.exe`** — the command-line host, with the other components as
+  *roles* selected by the first argument: `stream`, `input`, `owner`, `network`,
+  `diag`, plus `--version`.
+
+Each role is still its own process. The process split is what §4.1 asks for — a
+crashing media worker must not take the panel, the armed input helper or the
+virtual monitor down with it, and the owner still runs as a LocalSystem service
+while the input helper stays inside the interactive session — so the roles were
+merged into one *binary*, not into one *process*. `wvd-diag`'s commands became
+`ndisplay diag <command>`; the animated **test card** and the development-only
+`wvd-quic-spike` were removed. The role entry points are declared once in
+`src/common/include/wvd/roles.h`, each former `main()` became `wvd::Role*` in
+its own file, and `src/cli/main.cpp` dispatches with wide arguments converted to
+UTF-8 so a non-ASCII SSID or password survives.
+
+Both executables are now written to `build/bin` beside `msquic.dll`, which is
+also the release layout: the panel finds the CLI next to itself instead of
+reaching into `../media`. A role's log starts with
+`NDisplayHostWin 1.0.0 (build 2)` (`wvd/version.h`, used for the first time), and
+`ndisplay.exe --version` prints the same line. Pairings, pipes
+(`wvm-pairing-<pid>`, `wvd.input`), the identity store, `_wvd._udp` and the
+service name `WvdOwner` are unchanged, so existing headsets keep pairing.
+
+Verified on this machine: `cmake --build --preset amd` clean from an empty build
+directory; `ctest --preset amd` 8/8, with `input-ipc` and
+`launcher-stop-and-network-validation` now driving `ndisplay input|stream|network|diag`
+from one binary; `ndisplay stream --synthetic --demo` encodes through the AMD
+hardware HEVC encoder; a UI Automation pass opened the panel, confirmed the
+**Test card** button is gone, clicked **Start host**, saw exactly one
+`ndisplay.exe` child appear, clicked **Stop host** and confirmed the child
+exited; `ndisplay.exe` with no arguments prints the role list and exits 2.

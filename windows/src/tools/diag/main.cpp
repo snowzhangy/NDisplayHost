@@ -1,14 +1,14 @@
-// wvd-diag — bring-up and §8 measurement helpers.
+// "diag" role — bring-up and §8 measurement helpers.
 //
-//   wvd-diag adapters                DXGI adapters + outputs
-//   wvd-diag topology                CCD targets (find the WVD monitor)
-//   wvd-diag caps                    encoder capability matrix (§4.6)
-//   wvd-diag modes                   sizes the headset's size menu would offer
-//   wvd-diag capture [--monitor N] [--seconds S] [--write-nv12 F]
-//                                    DDA smoke: fps, dirty stats, pointer state
-//   wvd-diag owner-ping              IPC to wvd-owner
-//   wvd-diag coords-selftest         §4.4 transform checks
-//   wvd-diag curtain-test            --screen-off curtain stays out of the stream
+//   ndisplay diag adapters             DXGI adapters + outputs
+//   ndisplay diag topology             CCD targets (find the WVD monitor)
+//   ndisplay diag caps                 encoder capability matrix (§4.6)
+//   ndisplay diag modes                sizes the headset's size menu would offer
+//   ndisplay diag capture [--monitor N] [--seconds S] [--write-nv12 F]
+//                                      DDA smoke: fps, dirty stats, pointer state
+//   ndisplay diag owner-ping           IPC to the owner role
+//   ndisplay diag coords-selftest      §4.4 transform checks
+//   ndisplay diag curtain-test         --screen-off curtain stays out of the stream
 #include "quic_host.h"
 
 #include <condition_variable>
@@ -30,6 +30,7 @@
 #include "wvd/ipc.h"
 #include "wvd/logging.h"
 #include "wvd/protocol.h"
+#include "wvd/roles.h"
 #include "wvd/time.h"
 
 // owner/topology.h (compiled into diag directly)
@@ -62,7 +63,7 @@ int CmdAdapters() {
   return 0;
 }
 
-// Read-only: the per-output list wvd-media advertises (DisplayModes).
+// Read-only: the per-output list the stream role advertises (DisplayModes).
 int CmdModes() {
   auto f = CreateDxgiFactory();
   if (!f) return 1;
@@ -323,7 +324,7 @@ int CmdQuicProbe(int argc, char** argv) {
   char* end = nullptr;
   const auto port = argc == 3 ? strtoul(argv[2], &end, 10) : 0;
   if (!port || port > 65535 || !end || *end) {
-    fprintf(stderr, "usage: wvd-diag quic-probe PORT\n");
+    fprintf(stderr, "usage: ndisplay diag quic-probe PORT\n");
     return 2;
   }
   QuicProbe probe;
@@ -586,13 +587,14 @@ int CmdCurtainTest() {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace wvd {
+int RoleDiag(int argc, char** argv) {
   // Physical-pixel coordinates (§4.1). Runs before any display query.
   wvd::EnablePerMonitorDpiAwareness();
 
   log::Init("diag", log::Level::Info);
   if (argc < 2) {
-    printf("wvd-diag: adapters|topology|caps|modes|capture|quic-probe|owner-ping|coords-selftest|curtain-test\n");
+    printf("ndisplay diag: adapters|topology|caps|modes|capture|quic-probe|owner-ping|coords-selftest|curtain-test\n");
     return 2;
   }
   std::string c = argv[1];
@@ -608,3 +610,5 @@ int main(int argc, char** argv) {
   printf("unknown command\n");
   return 2;
 }
+
+}  // namespace wvd

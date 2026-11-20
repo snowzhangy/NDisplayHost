@@ -48,28 +48,25 @@ jobs:
       - name: Package desktop host
         shell: pwsh
         run: |
-          $sourceRoot = (Resolve-Path windows/build-ci/src).Path
-          Get-ChildItem $sourceRoot -Recurse -File | Where-Object {
-            ($_.Extension -eq '.exe' -and $_.Name -ne 'wvd-quic-spike.exe') -or $_.Name -eq 'msquic.dll'
-          } | ForEach-Object {
-            $relative = [IO.Path]::GetRelativePath($sourceRoot, $_.FullName) -replace '(?i)(^|\\)Release\\', '$1'
-            $target = Join-Path 'windows-host/src' $relative
-            New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
-            Copy-Item $_.FullName $target
+          # Both shipped executables land in windows/build/bin: the control panel,
+          # the command-line host and the QUIC runtime it loads. Nothing else.
+          $bin = 'windows/build-ci/bin'
+          foreach ($name in 'NDisplayHostWin.exe', 'ndisplay.exe', 'msquic.dll') {
+            if (!(Test-Path "$bin/$name")) { throw "Missing $name in $bin." }
           }
-          foreach ($dir in 'media', 'tools/diag') {
-            if (!(Test-Path "windows-host/src/$dir/msquic.dll")) { throw "Missing MsQuic in $dir." }
-          }
+          New-Item -ItemType Directory -Force windows-host | Out-Null
+          Copy-Item "$bin/*" windows-host/
           Copy-Item windows/third_party/msquic/LICENSE windows-host/MsQuic-LICENSE.txt
           @"
           NDisplayHostWin ${{ steps.version.outputs.version }} (build ${{ steps.version.outputs.build }})
 
-          Run src/ui/wvd-host.exe to start the host on UDP port 47800.
+          Run NDisplayHostWin.exe, then Start host. It listens on UDP port 47800.
           In NDisplayApp, choose Secure QUIC and compare the pairing codes.
+          Command line: ndisplay.exe stream|input|owner|network|diag, ndisplay.exe --version.
           For the separate virtual display driver, see windows/driver/README.md in the source repository.
           "@ | Set-Content windows-host/README.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: NDisplayHostWin-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build }}
+          name: NDisplayHostWin-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build }}-win-x64
           path: windows-host/
           retention-days: 14

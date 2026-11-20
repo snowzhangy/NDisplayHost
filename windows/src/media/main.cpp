@@ -1,12 +1,12 @@
-// wvd-media — media worker (§4.1 process roles).
+// "stream" role — media worker (§4.1 process roles).
 //
 // Owns: capture (Path D), preprocessing, encoder, transport, discovery.
-// Does NOT own: the software device or topology (that is wvd-owner.exe, the
+// Does NOT own: the software device or topology (that is the "owner" role, the
 // small stable "device owner"); if this process dies the monitors stay up.
 //
 // Usage:
-//   wvd-media --demo 10                 local pipeline check, prints stats
-//   wvd-media --listen 47800         WIRE v1 over QUIC
+//   ndisplay stream --demo 10              local pipeline check, prints stats
+//   ndisplay stream --listen 47800         WIRE v1 over QUIC
 // Options:
 //   --monitor \\.\DISPLAY2 --fps 60 --bitrate 60000 --codec auto|null
 //   --input \\.\pipe\wvd.input  forward input to privileged helper
@@ -19,6 +19,8 @@
 #include "discovery.h"
 #include "session/media_session.h"
 #include "wvd/logging.h"
+#include "wvd/roles.h"
+#include "wvd/version.h"
 #include "wvd/stop_signal.h"
 
 #include "identity.h"
@@ -40,8 +42,8 @@ BOOL WINAPI CtrlHandler(DWORD type) {
 
 void Usage() {
   printf(
-      "wvd-media — WVD media worker\n"
-      "usage: wvd-media [--demo N] [--listen PORT] [--monitor NAME]\n"
+      "ndisplay stream — media worker\n"
+      "usage: ndisplay stream [--demo N] [--listen PORT] [--monitor NAME]\n"
       "                 [--fps N] [--bitrate KBPS] [--codec auto|hevc|h264|ENCODER]\n"
       "                 [--input PIPE] [--input-token HEX] [--synthetic]\n"
       "                 [--max-pixels N] [--min-bitrate KBPS] [--fixed-bitrate]\n"
@@ -269,9 +271,10 @@ class PairingConsole : public IWire1Observer {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace wvd {
+int RoleStream(int argc, char** argv) {
   // Physical-pixel coordinates (§4.1). Runs before any display query.
-  wvd::EnablePerMonitorDpiAwareness();
+  EnablePerMonitorDpiAwareness();
 
   Args a;
   if (!ParseArgs(argc, argv, a)) return 2;
@@ -279,6 +282,8 @@ int main(int argc, char** argv) {
   if (!stopSignal.Watch(a.stopEvent, g_quit)) return 1;
   if (g_quit) return 0;
   log::Init("media", a.verbose ? log::Level::Verbose : log::Level::Info);
+  // A captured log alone must say which host build produced it.
+  WVD_LOGI("%s %s", kHostProduct, HostVersion().c_str());
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
   if (!a.demoSeconds && !a.listenPort) a.listenPort = kQuicDefaultPort;
 
@@ -436,3 +441,4 @@ int main(int argc, char** argv) {
   if (listener) listener->Stop();
   return 0;
 }
+}  // namespace wvd

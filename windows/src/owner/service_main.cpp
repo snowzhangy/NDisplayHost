@@ -1,14 +1,14 @@
-// wvd-owner — device owner service (§4.1) + host service duties (§4.2).
+// "owner" role — device owner service (§4.1) + host service duties (§4.2).
 //
 //   owns: SwDevice handle, monitor topology (CCD save/restore/watchdog),
 //         power keep-awake on request, local control pipe
 //   never: parses network input, encodes, or sends media
 //
 // usage:
-//   wvd-owner --install | --uninstall | --start | --stop | --status
-//   wvd-owner --run-console            (interactive debugging)
-//   wvd-owner --arrange <nameMatch>    arrange WVD monitor right of primary
-//   wvd-owner --save-topology | --restore-topology | --list
+//   ndisplay owner --install | --uninstall | --start | --stop
+//   ndisplay owner --run-console        (interactive debugging)
+//   ndisplay owner --arrange <nameMatch> arrange WVD monitor right of primary
+//   ndisplay owner --save-topology | --restore-topology | --list
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -23,6 +23,8 @@
 #include "wvd/ipc.h"
 #include "wvd/logging.h"
 #include "wvd/protocol.h"
+#include "wvd/roles.h"
+#include "wvd/version.h"
 
 using namespace wvd;
 
@@ -224,7 +226,7 @@ int RunLoop(bool asService, SERVICE_STATUS_HANDLE ssh) {
         if (t == CTRL_C_EVENT || t == CTRL_CLOSE_EVENT) { g_stop = true; return TRUE; }
         return FALSE;
       }, TRUE);
-    WVD_LOGI("wvd-owner console mode — Ctrl+C to stop");
+    WVD_LOGI("owner role in console mode — Ctrl+C to stop");
     while (!g_stop) Sleep(250);
   }
 
@@ -269,11 +271,13 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace wvd {
+int RoleOwner(int argc, char** argv) {
   // Physical-pixel coordinates (§4.1). Runs before any display query.
-  wvd::EnablePerMonitorDpiAwareness();
+  EnablePerMonitorDpiAwareness();
 
   log::Init("owner");
+  WVD_LOGI("%s %s", kHostProduct, HostVersion().c_str());
 
   if (argc >= 2) {
     std::string a = argv[1];
@@ -368,3 +372,4 @@ int main(int argc, char** argv) {
   }
   return 0;
 }
+}  // namespace wvd

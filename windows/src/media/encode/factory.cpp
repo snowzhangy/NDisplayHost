@@ -154,7 +154,7 @@ std::unique_ptr<IVideoEncoder> CreateBestEncoder(const EncoderInitDesc& desc,
              c.name.c_str());
   }
   if (!desc.pinEncoder.empty())
-    WVD_LOGE("requested encoder '%s' is not available here (wvd-diag caps)",
+    WVD_LOGE("requested encoder '%s' is not available here (ndisplay diag caps)",
              desc.pinEncoder.c_str());
   return nullptr;
 }

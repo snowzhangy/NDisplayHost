@@ -24,10 +24,10 @@ set_tests_properties(quic-host-session PROPERTIES TIMEOUT 120)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
   add_test(NAME input-ipc COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/input_ipc_test.py"
-    "$<TARGET_FILE:wvd-input>")
+    "$<TARGET_FILE:ndisplay>" "input")
   set_tests_properties(input-ipc PROPERTIES TIMEOUT 20)
+  # One executable, one role per invocation: the test runs ndisplay <role>.
   add_test(NAME launcher-stop-and-network-validation COMMAND "${Python3_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/launcher_test.py" "$<TARGET_FILE:wvd-media>"
-    "$<TARGET_FILE:wvd-input>" "$<TARGET_FILE:wvd-network>" "$<TARGET_FILE:wvd-diag>")
+    "${CMAKE_CURRENT_SOURCE_DIR}/launcher_test.py" "$<TARGET_FILE:ndisplay>")
   set_tests_properties(launcher-stop-and-network-validation PROPERTIES TIMEOUT 30)
 endif()

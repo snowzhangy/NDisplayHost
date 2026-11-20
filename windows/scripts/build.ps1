@@ -38,4 +38,4 @@ Write-Host "== build ==" -ForegroundColor Cyan
 if ($LASTEXITCODE) { throw "cmake build failed ($LASTEXITCODE)" }
 
 Write-Host "`nBinaries:" -ForegroundColor Green
-Get-ChildItem -Recurse $build -Filter 'wvd-*.exe' | ForEach-Object { $_.FullName }
+Get-ChildItem (Join-Path $build 'bin') -Filter '*.exe' | ForEach-Object { $_.FullName }

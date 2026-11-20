@@ -1,6 +1,8 @@
-// Offline access point using the public Wi-Fi Direct legacy-AP desktop API.
+// "network" role: an offline access point using the public Wi-Fi Direct
+// legacy-AP desktop API.
 // Legacy mode lets ordinary Wi-Fi clients join; no internet uplink is needed.
 #include "wvd/platform.h"
+#include "wvd/roles.h"
 #include "wvd/stop_signal.h"
 #include <wlanapi.h>
 #include <winrt/Windows.Foundation.h>
@@ -66,7 +68,8 @@ int Probe() {
 }
 }  // namespace
 
-int wmain(int argc, wchar_t** argv) {
+namespace wvd {
+int RoleNetwork(int argc, wchar_t** argv) {
   std::wstring ssid, password, stopEvent;
   bool probe = false;
   for (int i = 1; i < argc; ++i) {
@@ -144,3 +147,4 @@ int wmain(int argc, wchar_t** argv) {
     return 1;
   }
 }
+}  // namespace wvd

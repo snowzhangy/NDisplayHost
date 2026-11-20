@@ -7,7 +7,8 @@ import time
 
 TOKEN = 0x123456789ABCDEF
 pipe = rf"\\.\pipe\wvd.input.test.{os.getpid()}"
-process = subprocess.Popen([sys.argv[1], "--pipe", pipe, "--token", f"{TOKEN:X}"],
+process = subprocess.Popen([sys.argv[1], sys.argv[2], "--pipe", pipe,
+                           "--token", f"{TOKEN:X}"],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            creationflags=subprocess.CREATE_NO_WINDOW)
 

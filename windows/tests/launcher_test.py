@@ -16,24 +16,26 @@ name = "Local\\WvdTestStop-" + uuid.uuid4().hex
 event = kernel.CreateEventW(None, True, True, name)
 assert event
 
-def run(executable, arguments, text=""):
-    return subprocess.run([executable] + arguments, input=text, text=True,
+# One executable for every host role; each call names the role it starts.
+CLI = sys.argv[1]
+
+def run(role, arguments, text=""):
+    return subprocess.run([CLI, role] + arguments, input=text, text=True,
                           capture_output=True, timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
 
-media, injector, network, diagnostic = sys.argv[1:]
 try:
-    for executable, extra, stdin in [(media, [], ""), (injector, [], ""),
-                                     (network, ["--ssid", "WVD-Stop-Test"], "TestPassword123\n")]:
-        result = run(executable, extra + ["--stop-event", name], stdin)
+    for role, extra, stdin in [("stream", [], ""), ("input", [], ""),
+                               ("network", ["--ssid", "WVD-Stop-Test"], "TestPassword123\n")]:
+        result = run(role, extra + ["--stop-event", name], stdin)
         assert result.returncode == 0, result.stderr
         assert "DIRECT_WIFI_STARTED" not in result.stdout
     for ssid, password in [("", "TestPassword123"), ("X" * 33, "TestPassword123"),
                            ("WVD-Test", "short"), ("WVD-Test", "x" * 64)]:
-        result = run(network, ["--ssid", ssid], password + "\n")
+        result = run("network", ["--ssid", ssid], password + "\n")
         assert result.returncode == 2, (ssid, result.returncode, result.stderr)
         assert "DIRECT_WIFI_STARTED" not in result.stdout
     for value in ("0", "65536", "abc", "47800garbage"):
-        assert run(media, ["--listen", value]).returncode == 2, value
+        assert run("stream", ["--listen", value]).returncode == 2, value
     kernel.ResetEvent.argtypes = [ctypes.c_void_p]
     kernel.SetEvent.argtypes = [ctypes.c_void_p]
     assert kernel.ResetEvent(event)
@@ -44,7 +46,7 @@ try:
         tcp.listen()
         port = tcp.getsockname()[1]
         with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as logs:
-            host = subprocess.Popen([media, "--listen", str(port), "--no-discovery", "--no-pair",
+            host = subprocess.Popen([CLI, "stream", "--listen", str(port), "--no-discovery", "--no-pair",
                                        "--stop-event", name],
                                       stdout=logs, stderr=subprocess.STDOUT, text=True,
                                       env={**os.environ, "WVM_HOME": home},
@@ -58,7 +60,7 @@ try:
                 else:
                     logs.seek(0)
                     raise AssertionError(logs.read())
-                probe = run(diagnostic, ["quic-probe", str(port)])
+                probe = run("diag", ["quic-probe", str(port)])
                 assert probe.returncode == 0, (probe.stdout, probe.stderr)
                 assert "datagram handshake succeeded" in probe.stdout
                 assert kernel.SetEvent(event)

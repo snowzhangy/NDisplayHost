@@ -156,7 +156,7 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
     csd_.clear();
   }
   if (!encoder_) {
-    WVD_LOGE("no encoder available (run wvd-diag caps; §4.6 tiers)");
+    WVD_LOGE("no encoder available (run ndisplay diag caps; §4.6 tiers)");
     return E_FAIL;
   }
 
@@ -171,7 +171,7 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
     if (cfg_.inputToken == 0) {
       // No token: the helper would refuse both InputArm and InputInject. Input
       // stays off rather than silently half-working (§4.7-4).
-      WVD_LOGW("input forwarding off: no --input-token (start wvd-input, pass the "
+      WVD_LOGW("input forwarding off: no --input-token (start 'ndisplay input', pass the "
                "token it prints; §4.7)");
     } else if (!EnsureInputArmed()) {
       WVD_LOGW("input helper not reachable/armed yet — retried while the session runs");

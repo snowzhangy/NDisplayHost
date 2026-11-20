@@ -91,9 +91,6 @@ namespace WvdHost {
       Find<Button>("StopButton").Click += async delegate { await Run(controller.Stop); };
       Find<Button>("ReceiverButton").Click += async delegate { await Run(controller.ProbeListener); };
       Find<Button>("DisableInputButton").Click += async delegate { await Run(controller.DisableInput); };
-      Find<Button>("TestCardButton").Click += delegate {
-        try { controller.ToggleCard(); } catch (Exception error) { Footer(error.Message); }
-      };
       Find<Button>("DirectButton").Click += async delegate {
         string ssid = Find<TextBox>("SsidText").Text, password = Find<PasswordBox>("WifiPassword").Password;
         await Run(delegate { return controller.ToggleDirectNetwork(ssid, password); });
@@ -177,7 +174,7 @@ namespace WvdHost {
     async Task RefreshDisplays(bool requireSelection) {
       int index = Find<ComboBox>("DisplayChoice").SelectedIndex;
       string selected = index >= 0 && index < displays.Count ? displays[index] : "";
-      string adapters = await controller.Probe("tools/diag/wvd-diag.exe", "adapters");
+      string adapters = await controller.Probe("diag adapters");
       bool found = PopulateDisplays(adapters, selected);
       if (!found) {
         const string message = "The selected display is no longer available. Choose an active display, then start again.";
@@ -187,12 +184,12 @@ namespace WvdHost {
     }
     async Task Probe() {
       try {
-        string adapters = await controller.Probe("tools/diag/wvd-diag.exe", "adapters");
+        string adapters = await controller.Probe("diag adapters");
         var gpu = Regex.Match(adapters, @"(?m)^\s*\[0\]\s+(.+?)\s+luid=");
         PopulateDisplays(adapters, "");
         var encoders = Find<ComboBox>("EncoderChoice");
         encoders.Items.Add(new ComboBoxItem { Content = "Automatic · best available", Tag = "auto" });
-        string caps = await controller.Probe("tools/diag/wvd-diag.exe", "caps");
+        string caps = await controller.Probe("diag caps");
         foreach (string name in new [] {"mf-hw", "nvenc-hevc", "mf-sw-h264"})
           if (Regex.IsMatch(caps, @"(?m)^\s*" + name + @"\s+.*\bAVAILABLE\b"))
             encoders.Items.Add(new ComboBoxItem { Content = name == "mf-hw" ? "GPU hardware · Media Foundation" :
@@ -200,7 +197,7 @@ namespace WvdHost {
         encoders.SelectedIndex = 0;
         Text("GpuLabel", (gpu.Success ? gpu.Groups[1].Value.Trim() : "Windows graphics adapter") +
           (caps.Contains("mf-hw") && Regex.IsMatch(caps, @"mf-hw[^\r\n]*AVAILABLE") ? " · hardware encoder available" : ""));
-        string wifi = await controller.Probe("network/wvd-network.exe", "--probe");
+        string wifi = await controller.Probe("network --probe");
         if (wifi.Contains("WIFI_ADAPTER")) Text("NetworkStatus", "Wi-Fi adapter found. Start checks direct-network support; the radio is unchanged until then.");
         else Text("NetworkStatus", "No Wi-Fi adapter found. Direct Wi-Fi requires a compatible wireless adapter.");
         ready = true; Footer("Ready. Start the host, then connect from Vision Pro.");

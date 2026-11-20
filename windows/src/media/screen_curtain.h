@@ -47,7 +47,7 @@ class ScreenCurtain {
     std::wstring capturedDevice;  // monitor being streamed ("" = none)
     bool showHint = true;         // dim instructions for the first seconds
     bool excludeFromCapture = true;
-    // Test hook (wvd-diag curtain-test): cover only this rectangle.
+    // Test hook (ndisplay diag curtain-test): cover only this rectangle.
     bool useTestRect = false;
     RECT testRect{};
   };

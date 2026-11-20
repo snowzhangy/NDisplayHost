@@ -23,7 +23,7 @@ Implemented source paths:
 * Swapchain buffers are drained using `IddCxSwapChainReleaseAndAcquireBuffer`
   and `IddCxSwapChainFinishedProcessingFrame`; a stopped monitor joins its drain
   thread. Device creation uses the adapter provided by AssignSwapChain.
-* The driver does not encode video. Desktop Duplication in `wvd-media` captures
+* The driver does not encode video. Desktop Duplication in the `stream` role captures
   the output. Hardware-cursor setup, HDR, dynamic monitor creation, and Path S
   shared-surface transport remain unimplemented.
 

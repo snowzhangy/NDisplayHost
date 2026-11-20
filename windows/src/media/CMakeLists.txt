@@ -1,4 +1,4 @@
-# Capture/encode core shared by wvd-media and wvd-diag.
+# Capture/encode core shared by the "stream" and "diag" roles of ndisplay.exe.
 add_library(wvd_capture_core STATIC
   dx.cpp
   display_modes.cpp
@@ -25,8 +25,7 @@ if(DEFINED NVENC_INCLUDE_DIR)
   target_compile_definitions(wvd_capture_core PRIVATE WVD_HAVE_NVENC=1)
 endif()
 
-add_executable(wvd-media main.cpp discovery.cpp)
-target_link_libraries(wvd-media PRIVATE wvd_capture_core wvd_quic)
-wvd_link_msquic(wvd-media)
-set_target_properties(wvd-media PROPERTIES OUTPUT_NAME "wvd-media")
-wvd_apply_manifest(wvd-media)
+# The "stream" role of ndisplay.exe (formerly wvd-media.exe).
+add_library(wvd_stream_role STATIC main.cpp discovery.cpp)
+target_include_directories(wvd_stream_role PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(wvd_stream_role PUBLIC wvd_capture_core wvd_quic)

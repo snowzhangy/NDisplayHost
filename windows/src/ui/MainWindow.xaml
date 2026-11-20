@@ -111,10 +111,7 @@
             <StackPanel><TextBlock Text="Connect your Vision Pro" Foreground="#B9D6FF" FontWeight="SemiBold"/>
               <TextBlock Text="Start the host. On Vision Pro, select this PC or add the address above with Secure QUIC. Compare the pairing code on both devices." Foreground="#D0DDEE" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"/></StackPanel>
           </Border>
-          <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="10"/><ColumnDefinition/></Grid.ColumnDefinitions>
-            <Button x:Name="ReceiverButton" Content="Test listener" ToolTip="Check the local UDP listener and QUIC handshake."/>
-            <Button x:Name="TestCardButton" Grid.Column="2" Content="Test card" ToolTip="An optional animated pattern and frame counter to reveal freezes and capture delay."/>
-          </Grid>
+          <Button x:Name="ReceiverButton" Content="Test listener" ToolTip="Check the local UDP listener and QUIC handshake."/>
         </StackPanel>
       </Grid>
     </ScrollViewer>
