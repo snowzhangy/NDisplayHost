@@ -57,14 +57,8 @@ jobs:
           New-Item -ItemType Directory -Force windows-host | Out-Null
           Copy-Item "$bin/*" windows-host/
           Copy-Item windows/third_party/msquic/LICENSE windows-host/MsQuic-LICENSE.txt
-          @"
-          NDisplayHostWin ${{ steps.version.outputs.version }} (build ${{ steps.version.outputs.build }})
-
-          Run NDisplayHostWin.exe, then Start host. It listens on UDP port 47800.
-          In NDisplayApp, choose Secure QUIC and compare the pairing codes.
-          Command line: ndisplay.exe stream|input|owner|network|diag, ndisplay.exe --version.
-          For the separate virtual display driver, see windows/driver/README.md in the source repository.
-          "@ | Set-Content windows-host/README.txt
+          Copy-Item windows/SETUP.txt windows-host/README.txt
+          Copy-Item LICENSE,THIRD_PARTY_NOTICES.md windows-host/
       - uses: actions/upload-artifact@v7
         with:
           name: NDisplayHostWin-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build }}-win-x64

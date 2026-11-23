@@ -462,6 +462,127 @@ static void TestPacketizer() {
   }
 }
 
+// Embedded depth (GAME_DEPTH_HOST_PLAN.md §3, WIRE.md §4.1/§6.1): the new
+// fields round trip, older peers that never set them still decode, and
+// DEPTH_VALID rides every shard of a picture including parity and
+// retransmissions.
+static void TestEmbeddedDepth() {
+  // DecoderCaps.embedded_depth (field 8).
+  msg::DecoderCaps caps;
+  caps.hevc = true;
+  caps.embeddedDepth = true;
+  caps.maxPixelRate = 1000000000ull;
+  pb::Writer cw;
+  caps.write(cw);
+  msg::DecoderCaps capsOut;
+  pb::Reader cr(cw.bytes.data(), cw.bytes.size());
+  CHECK(capsOut.read(cr) && capsOut.embeddedDepth && capsOut.hevc);
+
+  // Older peer: no field 8 → stays false.
+  msg::DecoderCaps oldCaps;
+  oldCaps.hevc = true;
+  pb::Writer ow;
+  oldCaps.write(ow);
+  msg::DecoderCaps oldOut;
+  pb::Reader orr(ow.bytes.data(), ow.bytes.size());
+  CHECK(oldOut.read(orr) && !oldOut.embeddedDepth);
+
+  // StreamSettings.depth_monitors (field 5, packed repeated uint32).
+  msg::Envelope ssIn;
+  ssIn.kind = msg::Envelope::Kind::StreamSettings;
+  ssIn.streamSettings.audio = true;
+  ssIn.streamSettings.depthMonitors = {1, 3};
+  auto ssBytes = ssIn.encode();
+  msg::Envelope ssOut;
+  CHECK(ssOut.decode(ssBytes.data(), ssBytes.size()));
+  CHECK(ssOut.streamSettings.audio);
+  CHECK(ssOut.streamSettings.depthMonitors == std::vector<uint32_t>({1, 3}));
+
+  // Empty list = no request (an older peer sends the message without it).
+  msg::Envelope ssEmpty;
+  ssEmpty.kind = msg::Envelope::Kind::StreamSettings;
+  ssEmpty.streamSettings.frameRate = 60;
+  auto ssE = ssEmpty.encode();
+  msg::Envelope ssEOut;
+  CHECK(ssEOut.decode(ssE.data(), ssE.size()));
+  CHECK(ssEOut.streamSettings.depthMonitors.empty());
+
+  // CodecConfig.embedded_depth (field 10, presence = packing).
+  msg::Envelope ccIn;
+  ccIn.kind = msg::Envelope::Kind::CodecConfig;
+  ccIn.codecConfig.monitorId = 1;
+  ccIn.codecConfig.codecGen = 4;
+  ccIn.codecConfig.width = 3840;
+  ccIn.codecConfig.height = 2312;  // coded size: strip included
+  ccIn.codecConfig.hasEmbeddedDepth = true;
+  ccIn.codecConfig.embeddedDepth.pictureWidth = 3840;
+  ccIn.codecConfig.embeddedDepth.pictureHeight = 2160;
+  ccIn.codecConfig.embeddedDepth.stripY = 2176;
+  ccIn.codecConfig.embeddedDepth.mapWidth = 960;
+  ccIn.codecConfig.embeddedDepth.mapHeight = 540;
+  ccIn.codecConfig.embeddedDepth.slices = 4;
+  auto ccBytes = ccIn.encode();
+  msg::Envelope ccOut;
+  CHECK(ccOut.decode(ccBytes.data(), ccBytes.size()));
+  CHECK(ccOut.codecConfig.hasEmbeddedDepth);
+  CHECK(ccOut.codecConfig.embeddedDepth.pictureHeight == 2160);
+  CHECK(ccOut.codecConfig.embeddedDepth.stripY == 2176);
+  CHECK(ccOut.codecConfig.embeddedDepth.mapWidth == 960);
+  CHECK(ccOut.codecConfig.embeddedDepth.mapHeight == 540);
+  CHECK(ccOut.codecConfig.embeddedDepth.slices == 4);
+  CHECK(ccOut.codecConfig.embeddedDepth.encoding ==
+        msg::DepthEncoding::InverseNearWhite);
+
+  // Without the field there is no layout (older host / no packing).
+  msg::Envelope ccPlain;
+  ccPlain.kind = msg::Envelope::Kind::CodecConfig;
+  ccPlain.codecConfig.codecGen = 5;
+  ccPlain.codecConfig.width = 3840;
+  ccPlain.codecConfig.height = 2160;
+  auto ccP = ccPlain.encode();
+  msg::Envelope ccPOut;
+  CHECK(ccPOut.decode(ccP.data(), ccP.size()));
+  CHECK(!ccPOut.codecConfig.hasEmbeddedDepth);
+
+  // DEPTH_VALID through the packetiser: data, parity and retransmission all
+  // carry it (WIRE.md §4.1).
+  std::vector<uint8_t> au(4000, 0x5A);
+  fec::FrameDescriptor desc;
+  desc.codecGen = 2;
+  desc.picSeq = 42;
+  desc.depthValid = true;
+  fec::PacketizedFrame f(desc, au.data(), au.size(), fec::PacketizerConfig::ForDatagramSize(1200));
+  f.ComputeParity();
+  auto data = f.interleavedData();
+  auto parity = f.interleavedParity();
+  CHECK(!data.empty() && !parity.empty());
+  for (const auto& d : data) {
+    dg::MediaShardHeader h;
+    CHECK(dg::MediaShardHeader::parse(d.data(), d.size(), h));
+    CHECK(h.flags & dg::MediaShardHeader::kDepthValid);
+  }
+  CHECK(!parity.empty());
+  for (const auto& p : parity) {  // interleavedParity(): flat list of parity datagrams
+    dg::MediaShardHeader h;
+    CHECK(dg::MediaShardHeader::parse(p.data(), p.size(), h));
+    CHECK((h.flags & dg::MediaShardHeader::kDepthValid) &&
+          (h.flags & dg::MediaShardHeader::kParity));
+  }
+  auto rtx = f.Retransmission({0});
+  CHECK(rtx.size() == 1);
+  {
+    dg::MediaShardHeader h;
+    CHECK(dg::MediaShardHeader::parse(rtx[0].data(), rtx[0].size(), h));
+    CHECK((h.flags & dg::MediaShardHeader::kDepthValid) &&
+          (h.flags & dg::MediaShardHeader::kRetransmit));
+  }
+
+  // A picture without depth never sets the bit.
+  desc.depthValid = false;
+  fec::PacketizedFrame nd(desc, au.data(), au.size(), fec::PacketizerConfig::ForDatagramSize(1200));
+  CHECK(!(nd.dataDatagrams()[0][1] & dg::MediaShardHeader::kDepthValid));
+}
+
 int main() {
   TestPbBasics();
   TestFraming();
@@ -469,6 +590,7 @@ int main() {
   TestDatagrams();
   TestFec();
   TestPacketizer();
+  TestEmbeddedDepth();
   if (failures) {
     std::printf("wire1_tests: %d FAILURES\n", failures);
     return 1;

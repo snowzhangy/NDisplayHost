@@ -40,6 +40,8 @@ enum class PacketKind : uint16_t {
   Clipboard = 16,
   Audio = 17,              // host -> headset PCM, only after Hello asks for it
   DisplayModes = 18,        // host -> headset: DisplayModesPayload + DisplayModeDesc[]
+  DepthMonitors = 19,       // headset -> host: DepthMonitorsPayload + uint16 indices
+                            // (StreamSettings.depth_monitors, game-depth plan §3.1)
   // Local IPC (owner / input helper named pipes), plan §4.7-4:
   IpcCommand = 32,
   IpcResponse = 33,
@@ -114,6 +116,9 @@ struct HelloPayload {
 
 // HelloPayload.reserved bits.
 constexpr uint16_t kHelloWantsAudio = 0x0001;  // send PacketKind::Audio
+constexpr uint16_t kHelloEmbeddedDepth =
+    0x0002;  // peer DecoderCaps.embedded_depth: it can unpack a coded picture
+             // with a depth strip (capability only — never a request, §3.3)
 
 // PacketKind::Audio body: interleaved little-endian int16 samples follow
 // (frames * channels). Sent only to a headset that set kHelloWantsAudio.
@@ -149,6 +154,7 @@ struct MonitorDesc {
   int32_t x, y;         // virtual-desktop coordinates (may be negative)
   uint32_t width, height;
   uint32_t dpiX, dpiY;
+  uint32_t refreshMilliHz;
   uint8_t primary;
   uint8_t rotation;     // 0/90/180/270
   uint16_t reserved;
@@ -157,22 +163,29 @@ struct MonitorDesc {
 struct MonitorLayoutPayload {
   uint64_t layoutGen;
   uint32_t count;       // MonitorDesc[count] follows
+  uint32_t captureIndex;
 };
 
 // CodecConfig{codec_gen, codec, profile, size, colour VUI} — sent reliably on
 // the control stream before any media of that generation (§6.6).
+// CodecConfig: width/height are the CODED size — with an embedded depth strip
+// the strip and its guard band are inside `height` (game-depth plan §3.3).
 struct CodecConfigPayload {
   uint64_t codecGen;
   uint8_t codec;        // Codec
   uint8_t hevcProfile;  // e.g. 1 = Main, 2 = Main10
   uint8_t flags;        // bit0 intraRefresh, bit1 sliceOutput, bit2 ltr
-  uint8_t reserved;
+  uint8_t reserved;     // bit0 kCodecConfigEmbeddedDepth (see below)
   uint32_t width, height;
   uint32_t fpsNum, fpsDen;
   uint32_t bitrateKbps;
   ColorVui vui;
-  uint32_t csdSize;     // parameter sets trail the struct
+  uint32_t csdSize;     // parameter sets trail the struct (after the layout when present)
 };
+
+// CodecConfigPayload.reserved bits.
+constexpr uint8_t kCodecConfigEmbeddedDepth = 0x01;  // EmbeddedDepthPayload follows this struct,
+                                                     // parameter sets follow the layout
 
 // Input (§7): Input{input_gen, seq} + events.
 // The headset sends pointer events in MONITOR SURFACE pixels + monitor
@@ -273,8 +286,20 @@ struct MediaPayloadHeader {
   uint32_t picSeq, contentVer;
   int64_t deadlineQpc;  // absolute presentation deadline (PC clock domain)
   uint16_t monitor, slice, sliceCount;
-  uint16_t flags;       // bit0 keyframe, bit1 refinement, bit2 lastSlice
+  uint16_t flags;       // bit0 keyframe, bit1 refinement, bit2 lastSlice, bit3 depthValid
   uint32_t dataSize;    // AU bytes trail the struct
+  uint32_t videoEpoch;
+};
+
+// MediaPayloadHeader.flags bit3: this picture carries a valid depth strip
+// (maps to WIRE.md §4.1 flag bit4 DEPTH_VALID; the QUIC adapter maps it).
+constexpr uint16_t kMediaDepthValid = 1u << 3;
+
+// StreamSettings.depth_monitors for the pipeline (indices into MonitorLayout,
+// 0-based; the headset's 1-based monitor ids are mapped by the QUIC adapter).
+struct DepthMonitorsPayload {
+  uint32_t count;   // uint16 indices follow
+  uint32_t reserved;
 };
 
 struct RecoveryRequestPayload {
@@ -349,9 +374,9 @@ struct IpcStatusResponse {
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == 20, "wire header");
-static_assert(sizeof(MediaPayloadHeader) == 52, "wire media header");
+static_assert(sizeof(MediaPayloadHeader) == 56, "wire media header");
 static_assert(sizeof(HelloPayload) == 60, "hello layout");
-static_assert(sizeof(MonitorDesc) == 92, "monitor layout");
+static_assert(sizeof(MonitorDesc) == 96, "monitor layout");
 static_assert(sizeof(CodecConfigPayload) == 44, "codec layout");
 static_assert(sizeof(InputEvent) == 24, "input layout");
 static_assert(sizeof(CursorShapePayload) == 32, "cursor shape layout");

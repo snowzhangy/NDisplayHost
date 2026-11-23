@@ -54,6 +54,7 @@ struct EncoderInitDesc {
   // burst that a one-frame VBV turns into a visible quality pulse.
   uint32_t gopSeconds = 0;
   bool lowLatency = true;      // no B-frames, ~1 frame VBV, intra refresh
+  bool preferQuality = true;
   std::string tuningProfile;   // "N-AQ", "N-EMPH", "AMF-RDNA3"… (§4.6)
   // Pin one candidate by name ("mf-hw", "mf-sw-h264", "nvenc-hevc", "null-test");
   // empty = best available by tier.
@@ -74,6 +75,7 @@ struct SourcePicture {
   uint64_t contentVer = 0;
   int64_t qpcCapture = 0;
   bool qualityBoost = false;      // refinement frame (low QP, §6.4)
+  bool depthValid = false;        // embedded-depth strip in this picture is real
 
   HRESULT Cpu(const uint8_t** data, size_t* size) const {
     if (nv12 && nv12Size) {
@@ -88,8 +90,14 @@ struct SourcePicture {
 struct EncodedAu {
   std::vector<uint8_t> bytes;     // access unit (annex B)
   bool key = false;               // random access point (IDR/CRA/intra-done)
+  // Identity of the SOURCE PICTURE these bytes encode. For a pipelined
+  // encoder the output can lag the input, so these must describe the picture
+  // the bytes came from, not the picture submitted by this call — the session
+  // stamps packet deadlines/flags from them.
   uint64_t contentVer = 0;
   int64_t qpcCapture = 0;
+  bool refinement = false;        // that picture was a quiet-refinement frame
+  bool depthValid = false;        // that picture carries a real DEPTH_VALID strip
   int64_t qpcEncodeIn = 0;
   int64_t qpcEncodeOut = 0;
 };

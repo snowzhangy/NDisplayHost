@@ -56,6 +56,8 @@ HRESULT NullEncoder::Encode(const SourcePicture& src, EncodedAu& au) {
   au.key = key;
   au.contentVer = src.contentVer;
   au.qpcCapture = src.qpcCapture;
+  au.refinement = src.qualityBoost;
+  au.depthValid = src.depthValid;
   au.qpcEncodeOut = QpcNow();
   return S_OK;
 }

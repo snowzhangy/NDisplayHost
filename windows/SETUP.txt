@@ -1,0 +1,23 @@
+NDisplayHostWin setup for Apple Vision Pro
+
+1. Extract the ZIP into a folder and keep both EXEs and msquic.dll together.
+2. Run NDisplayHostWin.exe. This release is unsigned. If SmartScreen shows
+   "Windows protected your PC", check that you downloaded the ZIP from this
+   project's GitHub release, then choose More info > Run anyway if offered.
+3. On a trusted home or office LAN, set the PC's network profile to Private
+   in Windows Settings > Network & Internet > the active network. Put the
+   Vision Pro on the same LAN.
+4. Choose the display and click Start host. To install the inbound UDP 47800
+   rule for this copy of ndisplay.exe, approve the firewall prompt. You can
+   also use Allow through firewall in the host window.
+5. Open NDisplayApp on Vision Pro and select your PC. Compare the six-digit
+   pairing code on both devices and confirm. If the PC is missing from the
+   list, add the receiver address shown by the host. Discovery uses mDNS
+   (UDP 5353) and depends on Windows and the network allowing multicast.
+
+Windows Firewall setup affects Private and Domain profiles and the local
+subnet. The desktop host runs without administrator rights after setup.
+Pairings are stored in %LOCALAPPDATA%\WVM.
+The separate virtual display driver has its own installation instructions.
+
+See LICENSE and THIRD_PARTY_NOTICES.md for the host and component licenses.

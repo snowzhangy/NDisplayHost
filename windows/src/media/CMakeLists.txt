@@ -3,6 +3,7 @@ add_library(wvd_capture_core STATIC
   dx.cpp
   display_modes.cpp
   capture/dda_capture.cpp
+  depth/synthetic_depth.cpp
   preprocess/nv12_convert.cpp
   encode/factory.cpp
   encode/null_encoder.cpp
@@ -26,6 +27,6 @@ if(DEFINED NVENC_INCLUDE_DIR)
 endif()
 
 # The "stream" role of ndisplay.exe (formerly wvd-media.exe).
-add_library(wvd_stream_role STATIC main.cpp discovery.cpp)
+add_library(wvd_stream_role STATIC main.cpp discovery.cpp workstation.cpp)
 target_include_directories(wvd_stream_role PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(wvd_stream_role PUBLIC wvd_capture_core wvd_quic)
+target_link_libraries(wvd_stream_role PUBLIC wvd_capture_core wvd_quic wtsapi32)

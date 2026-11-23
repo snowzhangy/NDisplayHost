@@ -15,6 +15,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <string>
 #include <thread>
@@ -22,6 +23,8 @@
 
 #include "audio/loopback_capture.h"
 #include "capture/dda_capture.h"
+#include "depth/synthetic_depth.h"
+#include "wvd/depth.h"
 #include "cursor/cursor_source.h"
 #include "dx.h"
 #include "encode/iencoder.h"
@@ -76,6 +79,15 @@ struct SessionConfig {
   // Black out this PC's own screens while a headset is connected, like the
   // Mac's display while Mac Virtual Display runs (ScreenCurtain).
   bool screenOff = false;
+  // Embedded game depth (GAME_DEPTH_HOST_PLAN.md §3–6). H1 ships the wire,
+  // layout and encode path with a SYNTHETIC source: a left-to-right ramp plus
+  // a nearer square following the pointer (--depth-test-pattern). A monitor
+  // is packed only while the headset advertises the capability AND requests
+  // depth for this monitor AND a depth source is attached (§3.3 rule 1).
+  bool depthTestPattern = false;
+  // Clear DEPTH_VALID on every Nth generated frame (0 = never): drives the
+  // H1 acceptance cases for depth gaps without a hook.
+  uint32_t depthTestDropEvery = 0;
 };
 
 // Encoded picture size for a source of srcW×srcH under a pixel budget: even
@@ -114,6 +126,11 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
     double captureGapMaxMs = 0;   // worst inter-picture gap in this reporting window
     double sendGapMaxMs = 0;
     double sendP95Ms = 0;         // time spent writing one encoded picture
+    // Embedded depth (game-depth plan): packing state of the current codec
+    // generation and the count of pictures that carried DEPTH_VALID.
+    bool depthPacking = false;
+    uint32_t depthMapWidth = 0, depthMapHeight = 0;
+    uint64_t depthValidFrames = 0;
   };
   Snapshot GetSnapshot();
 
@@ -123,11 +140,30 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
     int64_t qpcCapture = 0;
     bool refinement = false;
     bool forcedFull = false;  // first frame after start / re-create
+    uint32_t videoEpoch = 1;
   };
   struct SendWork {
     std::vector<uint8_t> framed;  // one Media packet
     int64_t deadlineQpc = 0;
   };
+  // Identity of a PUBLISHED ring frame. AcquireLatest hands back a slot and
+  // its sequence number; colour/depth pairing and every Media header field
+  // must use the identity the capture thread attached to that sequence —
+  // never the work item that happened to wake the encoder (capture can get
+  // ahead between Pop and AcquireLatest, which would pair frame B's colour
+  // with frame A's depth).
+  struct FrameIdentity {
+    uint64_t ringSeq = 0;
+    uint64_t contentVer = 0;
+    int64_t qpcCapture = 0;
+    bool refinement = false;
+    uint32_t videoEpoch = 1;
+  };
+  // Capture thread: record AFTER ring Publish, BEFORE pushing the work item.
+  void RecordFrameIdentity(uint64_t ringSeq, uint64_t contentVer, int64_t qpcCapture,
+                           bool refinement, uint32_t videoEpoch);
+  // Encode thread: resolve the acquired frame's identity.
+  bool FindFrameIdentity(uint64_t ringSeq, FrameIdentity& out);
 
   bool CaptureDda();       // capture thread body
   bool WaitOnStop(uint32_t ms) {
@@ -152,6 +188,9 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   // Rebuild the encoder for a new surface size (display mode change). Takes
   // encMutex_, bumps codecGen; CodecConfig follows with its first picture.
   bool ReconfigureEncoder(UINT width, UINT height);
+  bool RecreateEncoderLocked();
+  uint32_t VideoEpoch() const { return channel_ ? channel_->VideoEpoch() : 1; }
+  uint32_t EffectiveFrameRate() const;
   // Encode thread: move the encoder's target bitrate. False once the encoder
   // turns out not to support it.
   bool ApplyBitrate(uint32_t kbps, const char* why);
@@ -168,6 +207,19 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   void BuildLayoutLocked(UINT w, UINT h);
   void SendMonitorLayoutLocked();
   void RecordStageTimes(const EncodedAu& au);
+
+  // Embedded depth (game-depth plan §3–6).
+  // §3.3 rule 1: capability AND request AND an attached source. Caller holds
+  // encMutex_; on true, `layout` holds the strip geometry for encColorW×encH.
+  bool DepthWantedLocked(EmbeddedDepthPayload& layout);
+  // Encode thread (encMutex_ held): a packing or layout change is a codec
+  // generation change — new coded size, CodecConfig with/without the layout,
+  // IDR. Frame-to-frame gaps stay DEPTH_VALID, never a new generation.
+  void UpdateDepthPackingLocked();
+  uint32_t DepthBitrateLocked() const;  // +10% while packing (§4)
+  // Capture thread: feed the test depth source for a captured frame. Pointer
+  // coords are colour-picture pixels.
+  void PostDepthFrame(int64_t qpc, int32_t ptrX, int32_t ptrY);
 
   // Input helper connection (§4.4/§4.7). Connects, arms with the operator's
   // token and learns the helper's input generation. Re-tried at most every 2 s.
@@ -197,6 +249,29 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   std::mutex encMutex_;
   bool codecConfigPending_ = true;   // guarded by encMutex_
   std::vector<uint8_t> csd_;         // parameter sets of the current codecGen
+
+  // --- Embedded game depth (game-depth plan; H1 = synthetic source) --------
+  std::atomic<bool> clientDepthCap_{false};  // DecoderCaps.embedded_depth (via Hello)
+  std::atomic<bool> depthEval_{true};        // re-evaluate packing on the encode thread
+  std::mutex depthReqMutex_;
+  std::vector<uint16_t> depthMonitorsReq_;   // StreamSettings.depth_monitors (0-based)
+  // Packing state of the CURRENT codec generation (encMutex_):
+  bool depthPacking_ = false;
+  EmbeddedDepthPayload depthLayout_{};
+  uint32_t encColorW_ = 0, encColorH_ = 0;   // colour encode size, without the strip
+  uint64_t depthValidFrames_ = 0;            // pictures sent with DEPTH_VALID
+  std::unique_ptr<DepthSource> depthSrc_;    // H2: the hook; H1: the test pattern
+  // Published-frame identity history (see FrameIdentity): written by the
+  // capture thread, read by the encode thread.
+  std::mutex identMutex_;
+  std::deque<FrameIdentity> idents_;
+  DepthNormalizer depthNorm_;                // encode thread only
+  int64_t lastDepthNormQpc_ = 0;             // encode thread only
+  int32_t depthPtrX_ = 0, depthPtrY_ = 0;    // capture thread: last known pointer
+  // Re-entrant claim on the encoder/description state: the capture thread
+  // only ever TRYs to take it (reading the strip layout must never stall a
+  // capture behind an in-flight convert+encode).
+  CRITICAL_SECTION encCs_;
 
   // Queues (§6.6: bounded, newest-wins, reported)
   BoundedQueue<CaptureWork> encQueue_{2, OverflowPolicy::NewestWins};

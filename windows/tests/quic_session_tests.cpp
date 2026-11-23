@@ -27,6 +27,7 @@
 #include "wdauth.h"
 #include "wire1_channel.h"
 #include "wvd/fec.h"
+#include "wvd/depth.h"
 #include "wvd/logging.h"
 #include "wvd/protocol.h"
 #include "wvd/pacing.h"
@@ -296,6 +297,7 @@ std::vector<uint8_t> PackedLayout() {
   d.height = 1080;
   d.dpiX = 141;
   d.dpiY = 141;
+  d.refreshMilliHz = 119880;
   d.primary = 1;
   strncpy_s(d.id, "\\\\.\\DISPLAY1", _TRUNCATE);
   w.Append(d);
@@ -344,7 +346,8 @@ std::vector<uint8_t> WirePicture(uint32_t picSeq, uint32_t bytes, bool idr, Code
 }
 
 std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t bytes, bool idr,
-                                Codec codec = Codec::HEVC) {
+                                Codec codec = Codec::HEVC, uint32_t videoEpoch = 1,
+                                uint16_t extraFlags = 0) {
   const auto wire = WirePicture(picSeq, bytes, idr, codec);
   std::vector<uint8_t> annexB;
   if (idr) annexB = ParameterSets(codec);
@@ -356,7 +359,8 @@ std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t by
   MediaPayloadHeader mh{};
   mh.picSeq = picSeq;
   mh.contentVer = picSeq;
-  mh.flags = idr ? 1u : 0u;
+  mh.flags = uint16_t((idr ? 1u : 0u) | extraFlags);
+  mh.videoEpoch = videoEpoch;
   mh.codecGen = codecGen;
   mh.layoutGen = 7;
   mh.deadlineQpc = QpcNow() + MsToQpc(50);
@@ -485,6 +489,7 @@ bool Run(bool measure) {
   hello.hello.decoder.hevc = true;
   hello.hello.decoder.h264 = true;
   hello.hello.decoder.maxPixelRate = 3840ull * 2160ull * 60ull;
+  hello.hello.decoder.embeddedDepth = true;  // game-depth plan: unpack a strip
   headset.SendEnvelope(control, hello);
 
   msg::Envelope ack;
@@ -574,6 +579,7 @@ bool Run(bool measure) {
     CHECK(m.monitorId == 1, "the monitor id is the layout index plus one");
     CHECK(m.width == 1920 && m.height == 1080, "size");
     CHECK(m.ppi == 141, "ppi");
+    CHECK(m.refreshMhz == 119880, "reported refresh rate");
     CHECK(m.primary, "primary flag");
   }
 
@@ -739,10 +745,25 @@ bool Run(bool measure) {
   settings.kind = msg::Envelope::Kind::StreamSettings;
   settings.streamSettings.audio = true;
   settings.streamSettings.maxBitrateKbps = 16000;
+  settings.streamSettings.frameRate = 30;
+  settings.streamSettings.preferQuality = false;
   headset.SendEnvelope(control, settings);
   auto audioRequest = channel->RecvPacket(1000);
   CHECK(audioRequest.has_value(), "stream settings did not enable pipeline audio");
+  if (audioRequest) {
+    // The Hello queued for the audio change must also carry the headset's
+    // embedded-depth capability (game-depth plan §3.1: capability, not request).
+    auto pv = PacketView::Parse(audioRequest->data(), audioRequest->size());
+    auto h = pv && pv->kind() == PacketKind::Hello ? pv->Get<HelloPayload>() : std::nullopt;
+    CHECK(h && (h->reserved & kHelloWantsAudio) && (h->reserved & kHelloEmbeddedDepth),
+          "pipeline Hello lost the audio or embedded-depth bit");
+  }
   CHECK(channel->VideoBitrateLimitKbps() == 16000, "headset bitrate limit was ignored");
+  CHECK(channel->VideoFrameRateLimit() == 30 && !channel->PreferVideoQuality(),
+        "headset frame-rate and speed preference");
+  settings.streamSettings.frameRate = 0;
+  settings.streamSettings.preferQuality = true;
+  headset.SendEnvelope(control, settings);
 
   PacketWriter shapePacket(PacketKind::CursorShape);
   CursorShapePayload shape{};
@@ -872,6 +893,182 @@ bool Run(bool measure) {
   CHECK(!staleLeaked, "an input stream from another session was accepted");
 
   if (measure) MeasureDelivery(*channel, headset, codecGen + 1);
+
+  // Visibility gates the captured monitor, releases held input once, and
+  // requires a new random-access picture. The same gate covers lock/UAC.
+  using Kind = msg::Envelope::Kind;
+  msg::Envelope visibility;
+  visibility.kind = Kind::Visibility;
+  visibility.visibility.monitorIds = {1};
+  headset.SendEnvelope(control, visibility);
+  msg::Envelope stateChange;
+  CHECK(headset.WaitForEnvelope(Kind::SessionState, 1000, &stateChange) &&
+            stateChange.sessionState.inputGen == 2 && channel->VideoEpoch() == 2,
+        "hiding the monitor releases input and suspends video");
+  headset.SendEnvelope(control, visibility);
+  events.input.inputGen = 2;
+  headset.SendEnvelope(input, events);
+  const auto release = channel->RecvPacket(500);
+  const auto releasePacket = release ? PacketView::Parse(release->data(), release->size()) : std::nullopt;
+  CHECK(releasePacket && releasePacket->kind() == PacketKind::InputRelease,
+        "the pipeline received the release");
+  CHECK(!channel->RecvPacket(100), "repeated hide or hidden input queued extra work");
+
+  auto takeVideo = [&](uint32_t sequence, uint32_t waitMs) {
+    const uint64_t end = GetTickCount64() + waitMs;
+    do {
+      std::vector<std::vector<uint8_t>> batch;
+      headset.DrainDatagrams(kDgMediaShard, 30, &batch);
+      for (const auto& datagram : batch) {
+        dg::MediaShardHeader header{};
+        if (dg::MediaShardHeader::parse(datagram.data(), datagram.size(), header) &&
+            header.picSeq == sequence) return true;
+      }
+    } while (GetTickCount64() < end);
+    return false;
+  };
+  const uint32_t first = 2000;
+  channel->SendPacket(PackedMedia(first, codecGen + 1, 80, true, Codec::H264, 2));
+  CHECK(!takeVideo(first, 100), "hidden video was sent");
+  visibility.visibility.visible = true;
+  headset.SendEnvelope(control, visibility);
+  CHECK(headset.WaitForEnvelope(Kind::SessionState, 1000, &stateChange) &&
+            channel->VideoEpoch() == 3, "showing a monitor starts a fresh video epoch");
+  channel->SendPacket(PackedMedia(first + 1, codecGen + 1, 80, true, Codec::H264, 1));
+  channel->SendPacket(PackedMedia(first + 2, codecGen + 1, 80, false, Codec::H264, 3));
+  CHECK(!takeVideo(first + 1, 100) && !takeVideo(first + 2, 100), "stale or dependent video resumed");
+  channel->SendPacket(PackedMedia(first + 3, codecGen + 1, 80, true, Codec::H264, 3));
+  CHECK(takeVideo(first + 3, 500), "fresh IDR did not resume video");
+  CHECK(channel->VideoFrameRateLimit() == 0 && channel->PreferVideoQuality(),
+        "headset cleared its cap and selected quality");
+
+  channel->SetWorkstationState(WorkstationState::Locked);
+  CHECK(headset.WaitForEnvelope(Kind::SessionState, 1000, &stateChange) &&
+            stateChange.sessionState.workstationLocked && !stateChange.sessionState.message.empty() &&
+            stateChange.sessionState.input == msg::InputArmState::Disarmed && channel->VideoEpoch() == 4,
+        "workstation locked state");
+  channel->SetWorkstationState(WorkstationState::SecureDesktop);
+  CHECK(headset.WaitForEnvelope(Kind::SessionState, 1000, &stateChange) &&
+            stateChange.sessionState.workstationLocked && channel->VideoEpoch() == 4,
+        "secure desktop keeps video paused");
+  channel->SetWorkstationState(WorkstationState::Available);
+  CHECK(headset.WaitForEnvelope(Kind::SessionState, 1000, &stateChange) &&
+            !stateChange.sessionState.workstationLocked && stateChange.sessionState.message.empty() &&
+            channel->VideoEpoch() == 5, "workstation unlock resumes video");
+
+  // ---- embedded depth end to end (game-depth plan §3/§4, H1) --------------
+  {
+    // 1) StreamSettings.depth_monitors becomes the pipeline's DepthMonitors
+    //    packet with 0-based indices, and withdrawing it clears the list.
+    msg::Envelope depthSettings;
+    depthSettings.kind = msg::Envelope::Kind::StreamSettings;
+    depthSettings.streamSettings.audio = true;
+    depthSettings.streamSettings.preferQuality = true;
+    depthSettings.streamSettings.depthMonitors = {1};
+    // The pipeline queue may still hold unrelated packets (a release from the
+    // lock cycle); read until the DepthMonitors one shows up.
+    bool sawRequest = false, sawWithdraw = false;
+    headset.SendEnvelope(control, depthSettings);
+    const uint64_t reqDeadline = GetTickCount64() + 2000;
+    while (!sawRequest && GetTickCount64() < reqDeadline) {
+      auto req = channel->RecvPacket(500);
+      if (!req) continue;
+      auto pv = PacketView::Parse(req->data(), req->size());
+      if (!pv || pv->kind() != PacketKind::DepthMonitors) continue;
+      auto d = pv->Get<DepthMonitorsPayload>();
+      const auto ids = pv->ArrayAt<uint16_t>(uint32_t(sizeof(DepthMonitorsPayload)),
+                                             d ? d->count : 0);
+      sawRequest = d && d->count == 1 && ids == std::vector<uint16_t>{0};
+    }
+    CHECK(sawRequest, "depth_monitors did not reach the pipeline as monitor index 0");
+
+    depthSettings.streamSettings.depthMonitors.clear();
+    headset.SendEnvelope(control, depthSettings);
+    const uint64_t wdDeadline = GetTickCount64() + 2000;
+    while (!sawWithdraw && GetTickCount64() < wdDeadline) {
+      auto withdrawn = channel->RecvPacket(500);
+      if (!withdrawn) continue;
+      auto pv = PacketView::Parse(withdrawn->data(), withdrawn->size());
+      if (!pv || pv->kind() != PacketKind::DepthMonitors) continue;
+      auto d = pv->Get<DepthMonitorsPayload>();
+      sawWithdraw = d && d->count == 0;
+    }
+    CHECK(sawWithdraw, "withdrawing depth_monitors did not reach the pipeline");
+
+    // 2) A codec generation whose pictures carry a strip: the packed
+    //    EmbeddedDepthPayload rides between the struct and the CSD and lands
+    //    in CodecConfig.embedded_depth, sizes stay the CODED size.
+    const uint64_t depthGen = codecGen + 2;
+    {
+      PacketWriter w(PacketKind::CodecConfig);
+      CodecConfigPayload cc{};
+      cc.codecGen = depthGen;
+      cc.codec = uint8_t(Codec::HEVC);
+      cc.width = 1920;
+      cc.height = 1168;  // coded: 1080 colour + guard band + strip + padding
+      cc.fpsNum = 60000;
+      cc.fpsDen = 1000;
+      cc.bitrateKbps = 26400;  // +10% while packing (§4)
+      cc.reserved = kCodecConfigEmbeddedDepth;
+      EmbeddedDepthPayload dep{};
+      dep.pictureWidth = 1920;
+      dep.pictureHeight = 1080;
+      dep.stripY = 1096;
+      dep.mapWidth = 480;
+      dep.mapHeight = 268;
+      dep.slices = 4;
+      dep.sliceRows = 67;
+      dep.codedHeight = 1168;
+      dep.encoding = kDepthInverseNearWhite;
+      const auto& csd = ParameterSets(Codec::HEVC);
+      cc.csdSize = uint32_t(csd.size());
+      w.Append(cc);
+      w.Append(dep);
+      w.AppendBytes(csd.data(), csd.size());
+      CHECK(channel->SendPacket(w.Take()), "depth codec config send");
+    }
+
+    // 3) A picture with DEPTH_VALID: every shard — data AND parity — keeps
+    //    the bit (WIRE.md §4.1).
+    const uint32_t dpic = first + 20;
+    CHECK(channel->SendPacket(PackedMedia(dpic, depthGen, 80, true, Codec::HEVC, 5,
+                                          kMediaDepthValid)),
+          "depth picture send");
+    msg::Envelope depthCfg;
+    CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::CodecConfig, 1500, &depthCfg) &&
+              depthCfg.codecConfig.codecGen == uint32_t(depthGen) &&
+              depthCfg.codecConfig.hasEmbeddedDepth,
+          "the depth CodecConfig did not arrive with its layout");
+    if (depthCfg.codecConfig.hasEmbeddedDepth) {
+      const auto& L = depthCfg.codecConfig.embeddedDepth;
+      CHECK(depthCfg.codecConfig.width == 1920 && depthCfg.codecConfig.height == 1168,
+            "CodecConfig size must be the coded size (strip included)");
+      CHECK(L.pictureWidth == 1920 && L.pictureHeight == 1080 && L.stripY == 1096 &&
+                L.mapWidth == 480 && L.mapHeight == 268 && L.slices == 4,
+            "the depth layout was altered on the wire");
+    }
+    bool sawDepthData = false, sawDepthParity = false, lostFlag = false;
+    const uint64_t depthDeadline = GetTickCount64() + 1500;
+    while ((!sawDepthData || !sawDepthParity) && GetTickCount64() < depthDeadline) {
+      std::vector<std::vector<uint8_t>> batch;
+      headset.DrainDatagrams(kDgMediaShard, 100, &batch);
+      for (const auto& datagram : batch) {
+        dg::MediaShardHeader header{};
+        if (!dg::MediaShardHeader::parse(datagram.data(), datagram.size(), header) ||
+            header.picSeq != dpic)
+          continue;
+        if (header.flags & dg::MediaShardHeader::kDepthValid) {
+          if (header.flags & dg::MediaShardHeader::kParity) sawDepthParity = true;
+          else sawDepthData = true;
+        } else {
+          lostFlag = true;
+        }
+      }
+    }
+    CHECK(!lostFlag, "a shard of a DEPTH_VALID picture lost the bit");
+    CHECK(sawDepthData, "no data shard with DEPTH_VALID arrived");
+    CHECK(sawDepthParity, "no parity shard with DEPTH_VALID arrived");
+  }
 
   // ---- disconnect ---------------------------------------------------------
   listener.Stop();

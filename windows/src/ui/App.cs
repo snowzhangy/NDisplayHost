@@ -68,6 +68,8 @@ namespace WvdHost {
     TextBox logText;
     bool ready, busy, streaming, inputDisabled, allowClose, closing, lastRunning, initialized;
     string directAddress;
+    string lanAddress;
+    bool firewallPrompted, firewallPresent;
     T Find<T>(string name) where T : class { return window.FindName(name) as T; }
     void Text(string name, string value) { Find<TextBlock>(name).Text = value; }
     void Footer(string value) { Text("FooterText", value); }
@@ -99,6 +101,12 @@ namespace WvdHost {
       Find<Button>("CopyAddressButton").Click += delegate { Copy(Find<TextBox>("AddressText").Text, "Receiver address copied."); };
       Find<Button>("CopyPasswordButton").Click += delegate { Copy(Find<PasswordBox>("WifiPassword").Password, "Wi-Fi password copied. Join this network in Vision Pro Wi-Fi settings."); };
       Find<Button>("LogsButton").Click += delegate { ShowActivity(); };
+      Find<Button>("FirewallButton").Click += async delegate {
+        await Run(async delegate {
+          await controller.AllowFirewall();
+          await RefreshFirewall();
+        });
+      };
       timer.Interval = TimeSpan.FromMilliseconds(500);
       timer.Tick += delegate { Refresh(); };
       window.Loaded += async delegate {
@@ -151,7 +159,31 @@ namespace WvdHost {
     }
     async Task StartHost() {
       await RefreshDisplays(true);
+      lanAddress = null;
+      if (!firewallPrompted) {
+        firewallPrompted = true;
+        await RefreshFirewall();
+        if (!firewallPresent && MessageBox.Show(window,
+            "Allow NDisplayHostWin to receive a Vision Pro connection on trusted local networks? " +
+            "Windows will ask for administrator approval for UDP port 47800.",
+            "Allow through firewall", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes) {
+          try { await controller.AllowFirewall(); }
+          catch (Exception error) { OnLine("Firewall setup: " + error.Message); }
+          await RefreshFirewall();
+        }
+      }
       await controller.Start(Options());
+    }
+    async Task RefreshFirewall() {
+      string status;
+      try { status = await controller.Probe("diag firewall"); }
+      catch (Exception) { status = ""; }
+      firewallPresent = status.Contains("FIREWALL_RULE_PRESENT");
+      string details = firewallPresent ? "Windows Firewall rule is installed for trusted local networks."
+        : "Allow UDP 47800 through Windows Firewall to accept headset connections.";
+      if (status.Contains("FIREWALL_PUBLIC"))
+        details = "Windows reports an active Public network. On a trusted LAN, change its profile to Private in Windows Network & Internet settings. " + details;
+      Text("FirewallStatus", details);
     }
     bool PopulateDisplays(string adapters, string selected) {
       var choices = Find<ComboBox>("DisplayChoice");
@@ -200,6 +232,7 @@ namespace WvdHost {
         string wifi = await controller.Probe("network --probe");
         if (wifi.Contains("WIFI_ADAPTER")) Text("NetworkStatus", "Wi-Fi adapter found. Start checks direct-network support; the radio is unchanged until then.");
         else Text("NetworkStatus", "No Wi-Fi adapter found. Direct Wi-Fi requires a compatible wireless adapter.");
+        await RefreshFirewall();
         ready = true; Footer("Ready. Start the host, then connect from Vision Pro.");
       } catch (Exception error) { Footer("Device check failed: " + error.Message); }
       Refresh();
@@ -224,12 +257,15 @@ namespace WvdHost {
         ConfirmPairing(requestId, pairing.Groups[2].Value, pairing.Groups[3].Value);
       if (line == "UI_HOST_STARTED") { inputDisabled = false; Footer("Host listening. Connect from Vision Pro using the address above."); }
       if (line == "UI_HOST_STOPPED") {
+        lanAddress = null;
         streaming = false; Text("StreamDetail", "Host stopped. Display capture and input have been released.");
         Text("FpsValue", "—"); Text("BitrateValue", "—"); Text("EncodeValue", "—"); Footer("Host stopped.");
       }
       if (line == "UI_INPUT_DISABLED") { inputDisabled = true; Footer("Keyboard and mouse control disabled. Stop and restart the host to allow it again."); }
       if (line == "DIRECT_WIFI_STARTED") { directAddress = null; Text("NetworkStatus", "Direct Wi-Fi is on. Join the network above in Vision Pro Settings → Wi-Fi. No internet is needed."); Footer("Direct Wi-Fi network created."); }
       if (line.StartsWith("DIRECT_WIFI_ADDRESS=")) directAddress = line.Substring("DIRECT_WIFI_ADDRESS=".Length);
+      if (line.StartsWith("HOST_LAN_ADDRESS ", StringComparison.Ordinal))
+        lanAddress = line.Substring("HOST_LAN_ADDRESS ".Length);
       if (line.Contains("DIRECT_WIFI_FAILED")) { Text("NetworkStatus", "Windows could not start direct Wi-Fi. Check Wi-Fi is on and Windows Mobile Hotspot is off. See Activity log for the error."); Footer("Direct Wi-Fi could not start on this adapter/configuration."); }
       if (line == "DIRECT_WIFI_STOPPED") { directAddress = null; Text("NetworkStatus", "Direct Wi-Fi is off."); }
       if (line.Contains("session start failed")) { streaming = false; Footer("Capture could not start. See Activity log for details."); }
@@ -259,6 +295,7 @@ namespace WvdHost {
       Find<Button>("DisableInputButton").IsEnabled = running && controller.InputAvailable && !inputDisabled && !busy;
       Find<Button>("DisableInputButton").Visibility = controller.InputAvailable ? Visibility.Visible : Visibility.Collapsed;
       Find<Button>("DirectButton").IsEnabled = ready && !busy;
+      Find<Button>("FirewallButton").IsEnabled = ready && !busy && !firewallPresent;
       Find<Button>("DirectButton").Content = direct ? "Stop direct Wi-Fi" : "Create direct Wi-Fi";
       Find<TextBox>("SsidText").IsEnabled = !direct && !busy;
       Find<PasswordBox>("WifiPassword").IsEnabled = !direct && !busy;
@@ -266,9 +303,13 @@ namespace WvdHost {
       Text("StatusBadge", status);
       tray.SetStatus(status);
       Find<Ellipse>("StatusDot").Fill = new SolidColorBrush(running ? Color.FromRgb(91, 218, 166) : Color.FromRgb(153,166,186));
-      string address = direct && directAddress != null ? directAddress + ":" + controller.Port : HostController.LocalAddress(controller.Port, direct);
+      string address = direct
+        ? (directAddress == null ? HostController.LocalAddress(controller.Port, true) : directAddress + ":" + controller.Port)
+        : lanAddress == "unavailable" ? "No LAN IPv4 address"
+        : lanAddress != null ? lanAddress + ":" + controller.Port
+        : HostController.LocalAddress(controller.Port, false);
       Find<TextBox>("AddressText").Text = address;
-      Find<Button>("CopyAddressButton").IsEnabled = !address.StartsWith("Waiting");
+      Find<Button>("CopyAddressButton").IsEnabled = address.Contains(":");
     }
     void ShowActivity() {
       if (logWindow != null) { logWindow.Show(); logWindow.Activate(); return; }

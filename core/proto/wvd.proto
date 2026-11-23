@@ -55,6 +55,7 @@ message DecoderCaps {
   uint32 max_width = 5;
   uint32 max_height = 6;
   uint64 max_pixel_rate = 7;   // luma samples per second the client is willing to decode
+  bool embedded_depth = 8;     // client can unpack a picture with a depth strip (EmbeddedDepthLayout)
 }
 
 message Hello {
@@ -158,12 +159,29 @@ message CodecConfig {
   uint32 monitor_id = 1;
   uint32 codec_gen = 2;
   Codec codec = 3;
-  uint32 width = 4;
+  uint32 width = 4;                   // CODED size: the embedded depth strip, when present, is inside it
   uint32 height = 5;
   repeated bytes parameter_sets = 6;  // HEVC: VPS, SPS, PPS in that order; H.264: SPS, PPS. No start codes.
   ColorInfo color = 7;
   uint32 nal_length_size = 8;         // media payload NAL length prefix size; always 4
   uint32 frame_rate_mhz = 9;
+  EmbeddedDepthLayout embedded_depth = 10;  // present when every picture of this codec_gen carries a depth strip
+}
+
+// Depth travels inside the coded picture: a grayscale strip drawn under the colour
+// (GAME_DEPTH_HOST_PLAN.md §3/§4). Never an alpha channel, never a second stream.
+enum DepthEncoding {
+  DEPTH_INVERSE_NEAR_WHITE = 0;   // inverse depth, larger = nearer, normalised by the host
+}
+
+message EmbeddedDepthLayout {
+  uint32 picture_width = 1;    // the colour rectangle, at (0,0) of the coded picture
+  uint32 picture_height = 2;
+  uint32 strip_y = 3;          // first row of the depth strip
+  uint32 map_width = 4;        // the depth map
+  uint32 map_height = 5;
+  uint32 slices = 6;           // the map is cut into this many horizontal bands, placed side by side in the strip
+  DepthEncoding encoding = 7;
 }
 
 enum CursorState {
@@ -334,6 +352,8 @@ message StreamSettings {
   uint32 frame_rate = 2;
   bool prefer_quality = 3;
   bool audio = 4;            // client wants host audio (audio datagrams, WIRE.md §4); default off
+  repeated uint32 depth_monitors = 5;  // monitors whose viewer wants game depth now (3D on). Empty = none.
+                                       // Every StreamSettings carries the full current list.
 }
 
 message Goodbye {

@@ -114,7 +114,8 @@ class NvencEncoder final : public IVideoEncoder {
     if (api.nvEncOpenEncodeSessionEx(&session, &encoder_) != NV_ENC_SUCCESS) return E_FAIL;
     NV_ENC_PRESET_CONFIG preset{};
     preset.version = NV_ENC_PRESET_CONFIG_VER; preset.presetCfg.version = NV_ENC_CONFIG_VER;
-    if (api.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P4_GUID,
+    const auto& presetGuid = desc_.preferQuality ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P3_GUID;
+    if (api.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, presetGuid,
                                          NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &preset) != NV_ENC_SUCCESS) return E_FAIL;
     auto config = preset.presetCfg;
     config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -142,7 +143,7 @@ class NvencEncoder final : public IVideoEncoder {
     vui.colourMatrix = static_cast<NV_ENC_VUI_MATRIX_COEFFS>(desc_.vui.matrix);
     NV_ENC_INITIALIZE_PARAMS init{};
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    init.encodeGUID = NV_ENC_CODEC_HEVC_GUID; init.presetGUID = NV_ENC_PRESET_P4_GUID;
+    init.encodeGUID = NV_ENC_CODEC_HEVC_GUID; init.presetGUID = presetGuid;
     init.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     init.encodeWidth = init.darWidth = init.maxEncodeWidth = desc_.width;
     init.encodeHeight = init.darHeight = init.maxEncodeHeight = desc_.height;
@@ -230,7 +231,9 @@ class NvencEncoder final : public IVideoEncoder {
     const bool unmapped = unmap();
     if (unlocked != NV_ENC_SUCCESS || !unmapped) return E_FAIL;
     forceKey_ = false;
+    // NVENC's lock/unlock path is synchronous: these bytes are `source`.
     au.contentVer = source.contentVer; au.qpcCapture = source.qpcCapture;
+    au.refinement = source.qualityBoost; au.depthValid = source.depthValid;
     au.qpcEncodeOut = QpcNow();
     return S_OK;
   }

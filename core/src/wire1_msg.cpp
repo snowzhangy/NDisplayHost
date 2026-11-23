@@ -25,6 +25,7 @@ void DecoderCaps::write(pb::Writer& w) const {
   w.u32(5, maxWidth);
   w.u32(6, maxHeight);
   w.u64(7, maxPixelRate);
+  w.boolean(8, embeddedDepth);
 }
 bool DecoderCaps::read(pb::Reader& r) {
   FIELD_LOOP() {
@@ -36,6 +37,7 @@ bool DecoderCaps::read(pb::Reader& r) {
       case 5: if (!r.u32(maxWidth)) return false; break;
       case 6: if (!r.u32(maxHeight)) return false; break;
       case 7: if (!r.u64(maxPixelRate)) return false; break;
+      case 8: if (!r.boolean(embeddedDepth)) return false; break;
       SKIP()
     }
   }
@@ -241,6 +243,32 @@ bool ColorInfo::read(pb::Reader& r) {
   return true;
 }
 
+void EmbeddedDepthLayout::write(pb::Writer& w) const {
+  w.u32(1, pictureWidth);
+  w.u32(2, pictureHeight);
+  w.u32(3, stripY);
+  w.u32(4, mapWidth);
+  w.u32(5, mapHeight);
+  w.u32(6, slices);
+  w.u32(7, static_cast<uint32_t>(encoding));
+}
+bool EmbeddedDepthLayout::read(pb::Reader& r) {
+  FIELD_LOOP() {
+    switch (f) {
+      case 1: if (!r.u32(pictureWidth)) return false; break;
+      case 2: if (!r.u32(pictureHeight)) return false; break;
+      case 3: if (!r.u32(stripY)) return false; break;
+      case 4: if (!r.u32(mapWidth)) return false; break;
+      case 5: if (!r.u32(mapHeight)) return false; break;
+      case 6: if (!r.u32(slices)) return false; break;
+      case 7: { uint32_t v = 0; if (!r.u32(v)) return false;
+                encoding = static_cast<DepthEncoding>(v); break; }
+      SKIP()
+    }
+  }
+  return true;
+}
+
 void CodecConfig::write(pb::Writer& w) const {
   w.u32(1, monitorId);
   w.u32(2, codecGen);
@@ -251,6 +279,7 @@ void CodecConfig::write(pb::Writer& w) const {
   { pb::Writer c; color.write(c); w.msg(7, c); }
   w.u32(8, nalLengthSize);
   w.u32(9, frameRateMhz);
+  if (hasEmbeddedDepth) { pb::Writer d; embeddedDepth.write(d); w.msg(10, d, true); }
 }
 bool CodecConfig::read(pb::Reader& r) {
   FIELD_LOOP() {
@@ -265,6 +294,10 @@ bool CodecConfig::read(pb::Reader& r) {
                 pb::Reader sub(p, n); if (!color.read(sub)) return false; break; }
       case 8: if (!r.u32(nalLengthSize)) return false; break;
       case 9: if (!r.u32(frameRateMhz)) return false; break;
+      case 10: { const uint8_t* p; size_t n; if (!r.lenDelim(p, n)) return false;
+                 pb::Reader sub(p, n);
+                 hasEmbeddedDepth = true;
+                 if (!embeddedDepth.read(sub)) return false; break; }
       SKIP()
     }
   }
@@ -527,6 +560,7 @@ void StreamSettings::write(pb::Writer& w) const {
   w.u32(2, frameRate);
   w.boolean(3, preferQuality);
   w.boolean(4, audio);
+  w.packedU32(5, depthMonitors);
 }
 bool StreamSettings::read(pb::Reader& r) {
   FIELD_LOOP() {
@@ -535,6 +569,7 @@ bool StreamSettings::read(pb::Reader& r) {
       case 2: if (!r.u32(frameRate)) return false; break;
       case 3: if (!r.boolean(preferQuality)) return false; break;
       case 4: if (!r.boolean(audio)) return false; break;
+      case 5: if (!r.repeatedU32(wt, depthMonitors)) return false; break;
       SKIP()
     }
   }

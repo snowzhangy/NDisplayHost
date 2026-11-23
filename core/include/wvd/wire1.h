@@ -158,6 +158,9 @@ struct MediaShardHeader {
     kParity = 1 << 1,
     kRefinement = 1 << 2,
     kRetransmit = 1 << 3,
+    // WIRE.md §4.1: this picture's strip holds depth for this picture. Set
+    // identically on data, parity and retransmissions of the picture.
+    kDepthValid = 1 << 4,
   };
   uint8_t flags = 0;
   uint16_t monitorId = 0;

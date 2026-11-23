@@ -94,6 +94,8 @@
               <TextBlock Text="Use the same Wi-Fi or wired network. Internet is not required." Foreground="{StaticResource Muted}" TextWrapping="Wrap"/>
               <TextBlock Text="Local receiver address" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,13,0,5"/>
               <DockPanel><Button x:Name="CopyAddressButton" Content="Copy" Padding="11,7" DockPanel.Dock="Right" Margin="8,0,0,0"/><TextBox x:Name="AddressText" IsReadOnly="True" Text="Checking…"/></DockPanel>
+              <TextBlock x:Name="FirewallStatus" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+              <Button x:Name="FirewallButton" Content="Allow through firewall" HorizontalAlignment="Left" Margin="0,8,0,0"/>
               <Border Height="1" Background="#344157" Margin="0,17,0,14"/>
               <Expander x:Name="DirectExpander" Header="Direct Wi-Fi · no router" Foreground="#EDF1F9" FontWeight="SemiBold">
               <StackPanel Margin="0,9,0,0">

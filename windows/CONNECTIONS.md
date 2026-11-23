@@ -8,7 +8,13 @@ on UDP port 47800.
 PC and headset need a local route to each other. Ethernet on the PC and Wi-Fi
 on the headset can share the same LAN. Internet access is not required. Guest,
 hotel and airplane Wi-Fi may isolate clients, preventing this connection.
-Allow inbound UDP 47800 on the PC network profile used by the headset.
+On a trusted local network, choose the Private network profile in Windows.
+On first Start, the host offers to install a Windows Firewall rule for
+`ndisplay.exe` and UDP 47800. **Allow through firewall** retries the setup.
+The rule allows connections from the local subnet on Private and Domain
+profiles. Bonjour discovery also needs Windows and the LAN to pass multicast
+DNS (UDP 5353). If discovery is unavailable, add the receiver address shown
+in the host panel.
 
 ## Direct Wi-Fi fallback
 

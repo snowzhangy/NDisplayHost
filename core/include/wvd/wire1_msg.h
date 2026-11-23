@@ -28,6 +28,8 @@ struct DecoderCaps {
   bool hevc = false, hevcMain10 = false, h264 = false, av1 = false;
   uint32_t maxWidth = 0, maxHeight = 0;
   uint64_t maxPixelRate = 0;
+  // Field 8: the client can unpack a picture with an embedded depth strip.
+  bool embeddedDepth = false;
   void write(pb::Writer& w) const;
   bool read(pb::Reader& r);
 };
@@ -112,14 +114,31 @@ struct ColorInfo {
   bool read(pb::Reader& r);
 };
 
+// Embedded depth strip (wvd.proto EmbeddedDepthLayout, WIRE.md §6.1). The
+// depth map is a grayscale strip drawn under the colour in the same coded
+// picture; presence on a generation is CodecConfig.embeddedDepth.
+enum class DepthEncoding : uint32_t { InverseNearWhite = 0 };
+
+struct EmbeddedDepthLayout {
+  uint32_t pictureWidth = 0, pictureHeight = 0;  // colour rect at (0,0)
+  uint32_t stripY = 0;
+  uint32_t mapWidth = 0, mapHeight = 0;
+  uint32_t slices = 0;
+  DepthEncoding encoding = DepthEncoding::InverseNearWhite;
+  void write(pb::Writer& w) const;
+  bool read(pb::Reader& r);
+};
+
 struct CodecConfig {
   uint32_t monitorId = 0, codecGen = 0;
   Codec codec = Codec::Hevc;
-  uint32_t width = 0, height = 0;
+  uint32_t width = 0, height = 0;  // CODED size (depth strip included)
   std::vector<std::vector<uint8_t>> parameterSets;  // no start codes
   ColorInfo color;
   uint32_t nalLengthSize = 4;
   uint32_t frameRateMhz = 0;
+  bool hasEmbeddedDepth = false;  // proto3 message presence
+  EmbeddedDepthLayout embeddedDepth;
   void write(pb::Writer& w) const;
   bool read(pb::Reader& r);
 };
@@ -217,6 +236,9 @@ struct StreamSettings {
   uint32_t maxBitrateKbps = 0, frameRate = 0;
   bool preferQuality = false;
   bool audio = false;
+  // Monitors whose viewer wants game depth now (3D on). Empty = none. Every
+  // StreamSettings carries the full current list.
+  std::vector<uint32_t> depthMonitors;
   void write(pb::Writer& w) const;
   bool read(pb::Reader& r);
 };

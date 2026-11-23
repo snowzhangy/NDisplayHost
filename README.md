@@ -11,4 +11,7 @@ Desktop streaming hosts for the NDisplayApp Vision Pro client. The Windows host 
 
 Build each host from its own checkout using the [Windows instructions](windows/README.md) or the [macOS instructions](macos/README.md). The Vision Pro app is developed in [NDisplayApp](https://github.com/snowzhangy/NDisplayApp).
 
+NDisplayHost's first-party code is licensed under the [MIT License](LICENSE).
+See [third-party notices](THIRD_PARTY_NOTICES.md) for component-specific terms.
+
 The [wire specification](core/proto/WIRE.md) and [schema](core/proto/wvd.proto) are canonical here. Update both with wire changes and exercise the client interoperability tests before relying on a change across repositories.

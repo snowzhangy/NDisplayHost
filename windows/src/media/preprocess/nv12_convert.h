@@ -32,6 +32,19 @@ enum class ChromaFilter : uint32_t {
                     // crisper at the same 4:2:0 rate (§6.4 "THE colour plan")
 };
 
+// Optional embedded-depth overlay (game-depth plan §4). The caller supplies
+// the NORMALISED 8-bit inverse-depth map (or null for a black strip when
+// DEPTH_VALID is clear for this frame) plus the strip geometry; the target
+// texture is the full CODED size (colour + guard band + strip + padding).
+struct Nv12DepthOverlay {
+  const uint8_t* map = nullptr;  // mapWidth x mapHeight, row-major (null = black strip)
+  UINT mapWidth = 0, mapHeight = 0;
+  UINT slices = 4;
+  UINT colorHeight = 0;          // rows of real colour; [colorHeight, stripY) repeats it
+  UINT stripY = 0;               // first strip row in the target
+  UINT sliceRows = 0;            // mapHeight / slices
+};
+
 class Nv12Converter {
  public:
   // Output textures rotate through a small pool: a picture handed to an
@@ -47,6 +60,14 @@ class Nv12Converter {
   HRESULT ConvertToTexture(ID3D11ShaderResourceView* srcSrv, UINT srcW, UINT srcH,
                            UINT dstW, UINT dstH, ChromaFilter filter,
                            ID3D11Texture2D** out);
+
+  // With a depth overlay: dstW×dstH is the CODED size (dstH covers the guard
+  // band, the strip and the black padding). Colour is written to rows
+  // [0, ov.colorHeight), the guard band repeats the last colour row, the
+  // strip is the sliced depth map, and strip chroma / padding stay neutral.
+  HRESULT ConvertToTexture(ID3D11ShaderResourceView* srcSrv, UINT srcW, UINT srcH,
+                           UINT dstW, UINT dstH, ChromaFilter filter,
+                           ID3D11Texture2D** out, const Nv12DepthOverlay* ov);
 
   // Copies an NV12 texture from ConvertToTexture into a packed CPU buffer
   // (row pitch = width). Blocks until the GPU has finished the conversion.
@@ -68,14 +89,24 @@ class Nv12Converter {
     ComPtr<ID3D11RenderTargetView> chroma;  // R8G8 view of the UV plane
   };
   HRESULT EnsureTargets(UINT w, UINT h);
+  HRESULT EnsureDepthTex(UINT mapW, UINT mapH);
 
   ComPtr<ID3D11Device> dev_;
   ComPtr<ID3D11DeviceContext> ctx_;
   ComPtr<ID3D11VertexShader> vs_;
-  ComPtr<ID3D11PixelShader> psLuma_, psChroma_;
+  ComPtr<ID3D11PixelShader> psLuma_, psChroma_, psDepth_;
   ComPtr<ID3D11SamplerState> sampler_;
   ComPtr<ID3D11RasterizerState> raster_;
   ComPtr<ID3D11Buffer> cb_;
+  ComPtr<ID3D11Buffer> depthCb_;
+  ComPtr<ID3D11Texture2D> depthTex_;   // R8 map uploaded from the CPU
+  ComPtr<ID3D11ShaderResourceView> depthSrv_;
+  // Stand-ins so the PS shader-resource slots are never holes: a null in a
+  // slot another pass reads wedges some drivers. Colour stand-in for the
+  // depth pass, depth stand-in for the colour pass.
+  ComPtr<ID3D11Texture2D> blackTex_;
+  ComPtr<ID3D11ShaderResourceView> blackSrv_;
+  UINT depthMapW_ = 0, depthMapH_ = 0;
   Target targets_[kPoolSize];
   UINT next_ = 0;
   UINT outW_ = 0, outH_ = 0;

@@ -5,6 +5,9 @@
 #include "audio/loopback_capture.h"
 #include "screen_curtain.h"
 #include "session/link_rate.h"
+#include "wvd/depth.h"
+#include "depth/synthetic_depth.h"
+#include <vector>
 #include <mmreg.h>
 #include <ks.h>
 #include <ksmedia.h>
@@ -200,5 +203,54 @@ int main() {
   }
   CHECK(kWvdReferenceModes[0].width * 9 == kWvdReferenceModes[0].height * 16);
   CHECK(wide && ultrawide);
+
+  {
+    // Embedded depth layout (GAME_DEPTH_HOST_PLAN.md §4) — the exact table the
+    // headset side is built against.
+    EmbeddedDepthPayload dep{};
+    CHECK(ComputeEmbeddedDepth(3840, 2160, dep));
+    CHECK(dep.mapWidth == 960 && dep.mapHeight == 540 && dep.slices == 4 && dep.sliceRows == 135);
+    CHECK(dep.stripY == 2176 && dep.codedHeight == 2312);
+    CHECK(3840ull * 2312ull <= 8912896ull);  // HEVC level 5.1 luma samples
+    CHECK(ComputeEmbeddedDepth(2560, 1440, dep));
+    CHECK(dep.mapWidth == 640 && dep.mapHeight == 360 && dep.stripY == 1456 &&
+          dep.codedHeight == 1552);
+    CHECK(ComputeEmbeddedDepth(5120, 1440, dep));
+    CHECK(dep.mapWidth == 1280 && dep.mapHeight == 360 && dep.codedHeight == 1552);
+    CHECK(ComputeEmbeddedDepth(1920, 1080, dep));
+    CHECK(dep.mapWidth == 480 && dep.mapHeight == 268 && dep.stripY == 1096 &&
+          dep.codedHeight == 1168);
+    // Invariants for any even size: slice split exact, strip below the guard
+    // band, coded height 8-aligned, 4 slices fit the width.
+    for (uint32_t h : {720u, 1200u, 1440u, 1600u, 2160u})
+      for (uint32_t w : {1280u, 1920u, 2560u, 3840u, 5120u}) {
+        CHECK(ComputeEmbeddedDepth(w, h, dep));
+        CHECK(dep.mapHeight % dep.slices == 0);
+        CHECK(dep.stripY >= h + 16);  // guard band under the colour
+        CHECK(dep.codedHeight >= dep.stripY + dep.sliceRows);
+        CHECK(dep.codedHeight % 8 == 0);
+        CHECK(dep.mapWidth * dep.slices <= w);
+        CHECK(dep.mapHeight * 4 >= h - 32);  // map shape tracks picture shape
+      }
+    CHECK(!ComputeEmbeddedDepth(64, 360, dep));  // too small for a map
+  }
+  // DepthNormalizer (game-depth §5): the raw domain is 16-bit, a flat first
+  // frame must not collapse the interval (a zero width makes the stretch
+  // infinite and the LUT fill converts NaN to an integer), and a spread
+  // finer than 8 bits must still stretch across the whole strip.
+  {
+    wvd::DepthNormalizer n;
+    std::vector<uint16_t> flat(4096, 1000);
+    n.Observe(flat.data(), flat.size(), 1.0 / 60);
+    CHECK(n.hi() - n.lo() >= 1.f);
+    const uint8_t* lut = n.Lut();
+    for (uint32_t i = 1; i < 65536; ++i) CHECK(lut[i] >= lut[i - 1]);  // no NaN garbage
+    std::vector<uint16_t> tight(4096);
+    for (size_t i = 0; i < tight.size(); ++i) tight[i] = uint16_t(20000 + (i % 101));
+    for (int f = 0; f < 60; ++f) n.Observe(tight.data(), tight.size(), 1.0 / 60);
+    CHECK(n.hi() - n.lo() < 400.f);   // the interval tracked the scene
+    CHECK(lut[20100] > 200);          // and still maps it onto full 8-bit range:
+    CHECK(lut[20000] < 55);           // an 8-bit raw domain could not tell these apart
+  }
   puts("input, cursor and EDID regressions passed");
 }

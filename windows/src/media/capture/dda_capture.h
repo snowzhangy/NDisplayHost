@@ -144,6 +144,13 @@ class DdaCapture {
     UINT den = desc_.ModeDesc.RefreshRate.Denominator;
     return den ? desc_.ModeDesc.RefreshRate.Numerator / den : 60;
   }
+  uint32_t refreshMilliHz() const {
+    const auto& rate = desc_.ModeDesc.RefreshRate;
+    return rate.Denominator
+               ? uint32_t((uint64_t(rate.Numerator) * 1000 + rate.Denominator / 2) /
+                          rate.Denominator)
+               : 0u;
+  }
   DXGI_MODE_ROTATION rotation() const { return desc_.Rotation; }
   void SetRing(FrameRing* r) { ring_ = r; }
 

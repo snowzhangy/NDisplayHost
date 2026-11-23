@@ -18,6 +18,7 @@
 
 #include "discovery.h"
 #include "session/media_session.h"
+#include "workstation.h"
 #include "wvd/logging.h"
 #include "wvd/roles.h"
 #include "wvd/version.h"
@@ -48,7 +49,8 @@ void Usage() {
       "                 [--input PIPE] [--input-token HEX] [--synthetic]\n"
       "                 [--max-pixels N] [--min-bitrate KBPS] [--fixed-bitrate]\n"
       "                 [--gop-sec N] [--box-chroma] [--no-mode-change]\n"
-      "                 [--no-audio] [--screen-off] [--no-discovery] [-v]\n"
+      "                 [--no-audio] [--screen-off] [--no-discovery]\n"
+      "                 [--depth-test-pattern [--depth-test-drop N]] [-v]\n"
       "Listens on UDP 47800 by default (WIRE v1 over QUIC). --demo runs offline.\n"
       "  --quic [PORT] is also accepted. Pairing uses the local pipe shown in the log.\n"
       "  --pair-auto skips the code comparison and is intended for lab use.\n"
@@ -65,6 +67,10 @@ void Usage() {
       "--no-audio never sends this PC's sound, even when the headset asks\n"
       "--screen-off blacks out this PC's screens while a headset is connected\n"
       "  (Ctrl+Alt+Shift+B shows them again; the stream is not affected)\n"
+      "--depth-test-pattern feeds the embedded-depth pipeline a synthetic map\n"
+      "  (a ramp plus a square that follows the pointer); the headset still\n"
+      "  has to ask for depth per monitor. --depth-test-drop N clears\n"
+      "  DEPTH_VALID on every Nth frame to exercise the fallback path\n"
       "encoders: mf-hw, mf-sw-h264, nvenc-hevc (SDK build), null (test only)\n");
 }
 
@@ -90,6 +96,8 @@ struct Args {
   bool noModeChange = false;
   bool noAudio = false;
   bool screenOff = false;
+  bool depthTestPattern = false;
+  uint32_t depthTestDropEvery = 0;
   bool pairAuto = false;
   bool noPair = false;
   bool allowInput = false;
@@ -144,6 +152,10 @@ bool ParseArgs(int argc, char** argv, Args& a) {
       a.noAudio = true;
     else if (s == "--screen-off")
       a.screenOff = true;
+    else if (s == "--depth-test-pattern")
+      a.depthTestPattern = true;
+    else if (s == "--depth-test-drop" && next(v))
+      a.depthTestDropEvery = uint32_t(atoi(v.c_str()));
     else if (s == "--pair-auto")
       a.pairAuto = true;
     else if (s == "--no-pair")
@@ -302,6 +314,8 @@ int RoleStream(int argc, char** argv) {
   cfg.allowModeChange = !a.noModeChange;
   cfg.allowAudio = !a.noAudio;
   cfg.screenOff = a.screenOff;
+  cfg.depthTestPattern = a.depthTestPattern;
+  cfg.depthTestDropEvery = a.depthTestDropEvery;
   if (a.synWidth && a.synHeight) {
     cfg.synWidth = a.synWidth;
     cfg.synHeight = a.synHeight;
@@ -328,6 +342,7 @@ int RoleStream(int argc, char** argv) {
   std::unique_ptr<Wire1Listener> listener;
   std::unique_ptr<PairingConsole> console;
   DnsRegistration dns;
+  WorkstationWatcher workstation;
   if (a.listenPort) {
     std::string error;
     if (!identity.Load("NDisplayHostWin", &error)) {
@@ -359,9 +374,12 @@ int RoleStream(int argc, char** argv) {
     }
     if (!listener->Listen(a.listenPort, &error)) {
       WVD_LOGE("listen on udp:%u failed: %s", a.listenPort, error.c_str());
+      printf("HOST_LISTEN_ERROR UDP %u: %s\n", a.listenPort, error.c_str());
+      fflush(stdout);
       return 1;
     }
     if (!a.noDiscovery) dns.Start(name, a.listenPort, wireCfg.hostId);
+    if (!a.synthetic) workstation.Start();
     printf("HOST_READY %u\n", a.listenPort);
     fflush(stdout);
   }
@@ -370,6 +388,13 @@ int RoleStream(int argc, char** argv) {
   auto demoExpired = [&] {
     return a.demoSeconds &&
            GetTickCount64() - startTick >= ULONGLONG(a.demoSeconds) * 1000ull;
+  };
+  auto serviceHost = [&](Wire1Channel* channel) {
+    dns.Refresh();
+    if (!channel || a.synthetic) return WorkstationState::Available;
+    const auto state = workstation.Poll();
+    channel->SetWorkstationState(state);
+    return state;
   };
 
   // Reconnect loop: the peer may drop and come back, and the plan requires a
@@ -380,11 +405,18 @@ int RoleStream(int argc, char** argv) {
 
     std::shared_ptr<Wire1Channel> channel;
     if (listener) {
-      while (!demoExpired() && !g_quit && !channel)
+      while (!demoExpired() && !g_quit && !channel) {
+        serviceHost(nullptr);
         channel = listener->AcceptChannel(200);
+      }
       if (!channel) break;
       WVD_LOGI("headset connected over QUIC (%s), input %s", channel->peerName().c_str(),
                channel->inputAllowed() ? "armed" : "disarmed");
+      while (!g_quit && !demoExpired() && channel->IsConnected() &&
+             serviceHost(channel.get()) != WorkstationState::Available)
+        Sleep(200);
+      if (g_quit || demoExpired()) break;
+      if (!channel->IsConnected()) continue;
     }
 
     MediaSession session(cfg, gens);
@@ -403,19 +435,24 @@ int RoleStream(int argc, char** argv) {
 
     // Stats ticker + liveness.
     for (;;) {
-      Sleep(1000);
+      for (int i = 0; i < 5 && !g_quit && !session.peerGone(); ++i) {
+        Sleep(200);
+        serviceHost(channel.get());
+      }
       auto s = session.GetSnapshot();
       WVD_LOGI(
           "cap=%llu enc=%llu sent=%llu late=%llu missed=%llu q[c/e/s]=%u/%u/%u "
           "conv p50=%.2fms p95=%.2fms | enc p50=%.2fms p95=%.2fms "
           "%ukbps %ufps ptr=%d enc=%s target=%ukbps size=%ux%u %s skipped=%llu "
-          "gaps[cap/send]=%.2f/%.2fms send-p95=%.2fms",
+          "depth=%s%ux%u/%llu gaps[cap/send]=%.2f/%.2fms send-p95=%.2fms",
           (unsigned long long)s.framesCaptured, (unsigned long long)s.framesEncoded,
           (unsigned long long)s.framesSent, (unsigned long long)s.framesDroppedLate,
           (unsigned long long)s.missedUpdates, s.capQueue, s.encQueue, s.sendQueue,
           s.convP50Ms, s.convP95Ms, s.encP50Ms, s.encP95Ms, s.kbpsOut, s.fpsOut,
           int(s.pointerState), s.encoder.c_str(), s.targetKbps, s.encWidth, s.encHeight,
           s.zeroCopy ? "gpu-texture" : "cpu-copy", (unsigned long long)s.skippedForLink,
+          s.depthPacking ? "on" : "off", s.depthMapWidth, s.depthMapHeight,
+          (unsigned long long)s.depthValidFrames,
           s.captureGapMaxMs, s.sendGapMaxMs, s.sendP95Ms);
       if (channel) {
         const auto link = channel->link();

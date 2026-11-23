@@ -1,4 +1,5 @@
 #include "session/media_session.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -12,7 +13,7 @@ struct Received {
 };
 class SlowReceiver : public MediaChannel {
  public:
-  explicit SlowReceiver(Received& received) : received_(received) {}
+  explicit SlowReceiver(Received& received, DWORD delay = 80) : received_(received), delay_(delay) {}
   bool Send(const uint8_t* bytes, size_t count) override {
     auto packet = PacketView::Parse(bytes, count);
     if (!packet) return false;
@@ -23,17 +24,23 @@ class SlowReceiver : public MediaChannel {
         std::lock_guard<std::mutex> lock(received_.mutex);
         received_.pictures.push_back(*picture);
       }
-      Sleep(80);  // a link five times slower than the 60 fps source
+      if (delay_) Sleep(delay_);
     }
     return open_;
   }
   std::optional<std::vector<uint8_t>> RecvPacket(uint32_t) override { Sleep(5); return std::nullopt; }
   size_t BacklogBytes() const override { return 0; }
   uint32_t VideoBitrateLimitKbps() const override { return 0; }
+  uint32_t VideoFrameRateLimit() const override { return frameRate; }
+  uint32_t VideoEpoch() const override { return epoch; }
+  bool PreferVideoQuality() const override { return preferQuality; }
   bool IsConnected() const override { return open_; }
   void Close() override { open_ = false; }
+  std::atomic<uint32_t> frameRate{0}, epoch{1};
+  std::atomic<bool> preferQuality{true};
  private:
   Received& received_;
+  DWORD delay_;
   std::atomic<bool> open_{true};
 };
 
@@ -92,5 +99,40 @@ int main() {
     }
     CHECK(gap && delta);
   }
-  puts("slow-link hold-back, ordered delivery and bounded-queue recovery passed");
+  {
+    SessionConfig config;
+    config.codec = "null";
+    config.synWidth = 640;
+    config.synHeight = 360;
+    GenCounters generations;
+    Received received;
+    auto receiver = std::make_shared<SlowReceiver>(received, 0);
+    receiver->frameRate = 30;
+    MediaSession session(config, generations);
+    session.synthetic = true;
+    CHECK(SUCCEEDED(session.Start(receiver)));
+    Sleep(200);
+    const auto before = session.GetSnapshot();
+    Sleep(1000);
+    const auto capped = session.GetSnapshot();
+    CHECK(capped.framesCaptured - before.framesCaptured >= 15);
+    CHECK(capped.framesCaptured - before.framesCaptured <= 34);
+
+    receiver->epoch = 2;
+    Sleep(125);
+    const auto hidden = session.GetSnapshot();
+    Sleep(200);
+    CHECK(session.GetSnapshot().framesEncoded == hidden.framesEncoded);
+    receiver->preferQuality = false;
+    receiver->epoch = 3;
+    Sleep(300);
+    session.Stop();
+
+    std::lock_guard<std::mutex> lock(received.mutex);
+    const auto first = std::find_if(received.pictures.begin(), received.pictures.end(),
+                                    [](const auto& picture) { return picture.videoEpoch == 3; });
+    CHECK(first != received.pictures.end() && (first->flags & 1));
+    CHECK(first != received.pictures.begin() && first->codecGen > received.pictures.front().codecGen);
+  }
+  puts("slow-link delivery, frame-rate cap and pause/resume recovery passed");
 }

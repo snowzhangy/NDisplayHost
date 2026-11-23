@@ -45,6 +45,15 @@ try:
         tcp.bind(("127.0.0.1", 0))
         tcp.listen()
         port = tcp.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            udp.bind(("0.0.0.0", port))
+            blocked = subprocess.run([CLI, "stream", "--listen", str(port), "--no-discovery",
+                                      "--no-pair"], capture_output=True, text=True, timeout=4,
+                                     env={**os.environ, "WVM_HOME": home},
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
+            assert blocked.returncode == 1, (blocked.stdout, blocked.stderr)
+            assert f"HOST_LISTEN_ERROR UDP {port}:" in blocked.stdout, blocked.stdout
         with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as logs:
             host = subprocess.Popen([CLI, "stream", "--listen", str(port), "--no-discovery", "--no-pair",
                                        "--stop-event", name],

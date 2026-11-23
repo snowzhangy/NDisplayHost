@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <utility>
 
@@ -357,9 +358,17 @@ class MfEncoder final : public IVideoEncoder {
     if (!au.bytes.empty()) {
       producedOutput_ = true;
       au.key = au.key || ContainsKeyframe(codec_, au.bytes.data(), au.bytes.size());
+      // An async MFT can return an EARLIER picture than the one just
+      // submitted; AppendSample resolved that picture's identity from the
+      // sample time. Only a picture we could not match falls back to the
+      // current input (never stamp a lagged output with fresh identity).
+      if (!au.qpcCapture) {
+        au.qpcCapture = src.qpcCapture;
+        au.contentVer = src.contentVer;
+        au.refinement = src.qualityBoost;
+        au.depthValid = src.depthValid;
+      }
     }
-    au.contentVer = src.contentVer;
-    au.qpcCapture = src.qpcCapture;
     au.qpcEncodeOut = QpcNow();
     return S_OK;
   }
@@ -410,7 +419,8 @@ class MfEncoder final : public IVideoEncoder {
     if (FAILED(hr)) return hr;
     sample->AddBuffer(buf.Get());
     const LONGLONG dur = 10'000'000LL * desc_.fpsDen / desc_.fpsNum;
-    sample->SetSampleTime(frameIndex_ * dur);
+    const LONGLONG time = frameIndex_ * dur;
+    sample->SetSampleTime(time);
     sample->SetSampleDuration(dur);
     ++frameIndex_;
 
@@ -422,7 +432,8 @@ class MfEncoder final : public IVideoEncoder {
       codecApi_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
     }
 
-    return async_ ? EncodeAsync(sample.Get(), au) : EncodeSync(sample.Get(), au);
+    return async_ ? EncodeAsync(sample.Get(), src, time, au)
+                  : EncodeSync(sample.Get(), src, time, au);
   }
 
   void SetCodecU32(const GUID& api, UINT32 value) {
@@ -522,6 +533,7 @@ class MfEncoder final : public IVideoEncoder {
     const UINT32 fps = Fps();
     // Low latency first: some MFTs reset other knobs when it changes.
     SetCodecBool(CODECAPI_AVLowLatencyMode, true);
+    SetCodecU32(CODECAPI_AVEncCommonQualityVsSpeed, desc_.preferQuality ? 70 : 0);
     SetCodecU32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
     SetCodecU32(CODECAPI_AVEncCommonMeanBitRate, desc_.bitrateKbps * 1000);
     SetCodecU32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -628,10 +640,43 @@ class MfEncoder final : public IVideoEncoder {
     events_.reset();
     async_ = false;
     csd_.clear();
+    pending_.clear();
+    pendingOut_.clear();
   }
 
+  // Encode() runs single-threaded on the session's encode thread, like
+  // frameIndex_, so these two queues need no lock of their own.
+  struct Pending {
+    int64_t qpcCapture = 0;
+    uint64_t contentVer = 0;
+    bool refinement = false;
+    bool depthValid = false;
+    LONGLONG time = 0;
+  };
+  void RegisterPending(const SourcePicture& src, LONGLONG time) {
+    pending_.push_back(
+        Pending{src.qpcCapture, src.contentVer, src.qualityBoost, src.depthValid, time});
+    // An input that never produced output must not age the queue forever.
+    while (pending_.size() > 64) pending_.pop_front();
+  }
+
+  // Resolve WHICH input picture this output belongs to: by sample time when
+  // the MFT preserves it, else in submission order. A lagged output must
+  // carry the identity of ITS input, not the one currently being submitted.
   void AppendSample(IMFSample* s, EncodedAu& au) {
     if (!s) return;
+    LONGLONG t = 0;
+    const bool haveTime = SUCCEEDED(s->GetSampleTime(&t));
+    for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+      if ((haveTime && it->time == t) || (!haveTime && it == pending_.begin())) {
+        au.contentVer = it->contentVer;
+        au.qpcCapture = it->qpcCapture;
+        au.refinement = it->refinement;
+        au.depthValid = it->depthValid;
+        pending_.erase(it);
+        break;
+      }
+    }
     ComPtr<IMFMediaBuffer> b;
     if (FAILED(s->ConvertToContiguousBuffer(&b))) return;
     BYTE* p = nullptr;
@@ -685,26 +730,53 @@ class MfEncoder final : public IVideoEncoder {
     return S_OK;
   }
 
-  HRESULT EncodeSync(IMFSample* s, EncodedAu& au) {
+  // One complete access unit per OUTPUT PICTURE. Outputs pulled beyond the
+  // one this call returns are parked in pendingOut_ and handed out by the
+  // next calls — never concatenated into a single AU, whose packet header
+  // could only describe one of the pictures inside it.
+  HRESULT TakeOne(EncodedAu& au) {
+    if (pendingOut_.empty()) return S_OK;
+    au = std::move(pendingOut_.front());
+    pendingOut_.pop_front();
+    return S_OK;
+  }
+
+  HRESULT ParkOutput(EncodedAu&& one) {
+    if (one.bytes.empty()) return S_OK;
+    pendingOut_.push_back(std::move(one));
+    return S_OK;
+  }
+
+  HRESULT EncodeSync(IMFSample* s, const SourcePicture& src, LONGLONG time, EncodedAu& au) {
     HRESULT hr = mft_->ProcessInput(inId_, s, 0);
     if (hr == MF_E_NOTACCEPTING) {
-      DrainSync(au);
+      DrainSync(nullptr);
       hr = mft_->ProcessInput(inId_, s, 0);
     }
     if (FAILED(hr)) return hr;
-    return DrainSync(au);
+    RegisterPending(src, time);
+    return DrainSync(&au);
   }
 
-  HRESULT DrainSync(EncodedAu& au) {
+  HRESULT DrainSync(EncodedAu* au) {
+    // A picture collected earlier leaves first: output order is decode order.
+    if (au && !pendingOut_.empty()) TakeOne(*au);
     for (int i = 0; i < 8; ++i) {
-      const HRESULT hr = PullOneOutput(au);
-      if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK;
+      if (au && !au->bytes.empty()) break;  // this call's picture collected
+      EncodedAu one;
+      const HRESULT hr = PullOneOutput(one);
+      if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
       if (FAILED(hr)) return hr;
+      if (au && au->bytes.empty())
+        *au = std::move(one);
+      else
+        ParkOutput(std::move(one));
     }
     return S_OK;
   }
 
-  HRESULT CollectAsync(EncodedAu& au) {
+  // Async: move every output the event pump counted into pendingOut_.
+  HRESULT CollectAsync() {
     for (int guard = 0; guard < 16; ++guard) {
       {
         std::lock_guard<std::mutex> lk(events_->m);
@@ -712,7 +784,8 @@ class MfEncoder final : public IVideoEncoder {
         if (events_->haveOutput == 0) return S_OK;
         --events_->haveOutput;
       }
-      const HRESULT hr = PullOneOutput(au);
+      EncodedAu one;
+      const HRESULT hr = PullOneOutput(one);
       if (hr == S_FALSE) {  // renegotiated: the same output is still pending
         std::lock_guard<std::mutex> lk(events_->m);
         ++events_->haveOutput;
@@ -720,15 +793,17 @@ class MfEncoder final : public IVideoEncoder {
       }
       if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) continue;
       if (FAILED(hr)) return hr;
+      ParkOutput(std::move(one));
     }
     return S_OK;
   }
 
-  HRESULT EncodeAsync(IMFSample* s, EncodedAu& au) {
-    // 1) Wait for an input credit, collecting outputs that arrive meanwhile.
+  HRESULT EncodeAsync(IMFSample* s, const SourcePicture& src, LONGLONG time, EncodedAu& au) {
+    // 1) Wait for an input credit, collecting outputs that arrive meanwhile
+    // into pendingOut_ (each keeps its own input identity; one per call).
     ULONGLONG deadline = GetTickCount64() + 1000;
     for (;;) {
-      HRESULT hr = CollectAsync(au);
+      HRESULT hr = CollectAsync();
       if (FAILED(hr)) return hr;
       {
         std::lock_guard<std::mutex> lk(events_->m);
@@ -748,6 +823,7 @@ class MfEncoder final : public IVideoEncoder {
     }
     HRESULT hr = mft_->ProcessInput(inId_, s, 0);
     if (FAILED(hr)) return hr;
+    RegisterPending(src, time);
 
     // 2) Low-latency MFTs answer every input with one output within a few ms.
     // Wait for it so a still desktop's last change is not left inside the
@@ -760,10 +836,14 @@ class MfEncoder final : public IVideoEncoder {
         if (events_->haveOutput > 0) break;
       }
       const DWORD left = MsLeft(deadline);
-      if (!left) return S_OK;
+      if (!left) break;
       WaitForSingleObject(events_->signal, left);
     }
-    return CollectAsync(au);
+    hr = CollectAsync();
+    if (FAILED(hr)) return hr;
+    // Exactly one AU per call; whatever else completed waits its turn and
+    // keeps ITS OWN input identity (resolved in AppendSample).
+    return TakeOne(au);
   }
 
   EncoderInitDesc desc_;
@@ -790,6 +870,11 @@ class MfEncoder final : public IVideoEncoder {
   std::shared_ptr<EventState> events_;
   EventPump* pump_ = nullptr;
   std::vector<uint8_t> csd_;
+  // Inputs submitted with their sample time, waiting for the output that
+  // carries the same time (encode thread only — see RegisterPending).
+  std::deque<Pending> pending_;
+  // Completed output AUs not yet handed to the caller (encode thread only).
+  std::deque<EncodedAu> pendingOut_;
   LONGLONG frameIndex_ = 0;
   std::atomic<bool> forceKey_{true};  // first picture is a random access point (§6.6)
 };

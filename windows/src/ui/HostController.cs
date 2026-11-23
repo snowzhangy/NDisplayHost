@@ -130,13 +130,19 @@ namespace WvdHost {
               "--token", auth, "--stop-event", NewStopEvent(out inputStop)}, false);
             args.AddRange(new [] {"--input", "\\\\.\\pipe\\" + pipeName, "--input-token", auth, "--allow-input"});
           }
-          var listening = new TaskCompletionSource<bool>();
+          var listening = new TaskCompletionSource<string>();
           string readyLine = "HOST_READY " + Port.ToString(CultureInfo.InvariantCulture);
+          const string listenError = "HOST_LISTEN_ERROR ";
           media = Spawn(args, true, line => {
-            if (line == readyLine) listening.TrySetResult(true);
+            if (line == readyLine) listening.TrySetResult("");
+            if (line.StartsWith(listenError, StringComparison.Ordinal))
+              listening.TrySetResult(line.Substring(listenError.Length));
           });
           var timeout = Stopwatch.StartNew();
           while (!listening.Task.Wait(50) && timeout.ElapsedMilliseconds < 8000 && Running) { }
+          if (!Running) media.WaitForExit(); // include the worker's final stdout
+          if (listening.Task.IsCompleted && listening.Task.Result.Length != 0)
+            throw new InvalidOperationException(listening.Task.Result);
           if (!listening.Task.IsCompleted || !Running || (options.AllowInput && !Alive(input)))
             throw new InvalidOperationException("Could not start the UDP listener. See the activity log.");
           Emit("UI_HOST_STARTED");
@@ -158,6 +164,18 @@ namespace WvdHost {
       token = 0; pipeName = null;
     }
     public Task Stop() { return Task.Run(delegate { StopCore(); Emit("UI_HOST_STOPPED"); }); }
+    public Task AllowFirewall() {
+      return Task.Run(delegate {
+        var info = new ProcessStartInfo(Cli, "diag firewall --install") {
+          WorkingDirectory = Root, UseShellExecute = true, Verb = "runas",
+          WindowStyle = ProcessWindowStyle.Hidden
+        };
+        using (var process = Process.Start(info)) {
+          if (process == null || !process.WaitForExit(15000) || process.ExitCode != 0)
+            throw new IOException("Windows Firewall did not add the UDP 47800 rule.");
+        }
+      });
+    }
     public async Task ProbeListener() {
       if (!Running) throw new InvalidOperationException("Start the host before testing the listener.");
       await Probe("diag quic-probe " + Port.ToString(CultureInfo.InvariantCulture));

@@ -63,6 +63,9 @@ struct FrameDescriptor {
   uint32_t contentVer = 0;
   bool randomAccess = false;
   bool refinement = false;
+  // WIRE.md §4.1 bit4: the coded picture carries a valid depth strip for this
+  // picture (the generation's CodecConfig names the layout).
+  bool depthValid = false;
   uint64_t captureTimeUs = 0;
   uint16_t deadlineBudgetMs = 100;
 };

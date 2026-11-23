@@ -201,6 +201,9 @@ dg::MediaShardHeader PacketizedFrame::MakeHeader(uint8_t extraFlags, int blockId
   const Block& blk = blocks_[blockIdx];
   dg::MediaShardHeader h;
   h.flags = extraFlags;
+  // WIRE.md §4.1: DEPTH_VALID is identical on data, parity and retransmissions
+  // of a picture, so it belongs on every header this frame emits.
+  if (desc_.depthValid) h.flags |= dg::MediaShardHeader::kDepthValid;
   h.monitorId = desc_.monitorId;
   h.sessionGen = desc_.sessionGen;
   h.layoutGen = desc_.layoutGen;

@@ -53,7 +53,7 @@ repeats `FlowHello` every 100 ms until confirmed, because datagrams are unreliab
 | Offset | Type | Field | Notes |
 | --- | --- | --- | --- |
 | 0 | u8 | type | `0x01` |
-| 1 | u8 | flags | bit0 RANDOM_ACCESS (IRAP picture), bit1 PARITY, bit2 REFINEMENT, bit3 RETRANSMIT |
+| 1 | u8 | flags | bit0 RANDOM_ACCESS (IRAP picture), bit1 PARITY, bit2 REFINEMENT, bit3 RETRANSMIT, bit4 DEPTH_VALID |
 | 2 | u16 | monitor_id | |
 | 4 | u32 | session_gen | from `HelloAck` |
 | 8 | u32 | layout_gen | from `MonitorLayout` |
@@ -74,6 +74,13 @@ repeats `FlowHello` every 100 ms until confirmed, because datagrams are unreliab
 Receivers reject a header unless: `shard_bytes > 0`, `k > 0`, `k + m <= 255`, `shard_index < k + m`,
 `block_first_shard + k <= N`, the datagram holds `shard_bytes` payload bytes, and
 `(N-1)*shard_bytes < frame_bytes <= N*shard_bytes`.
+
+**DEPTH_VALID (bit4)** — this picture's depth strip (`EmbeddedDepthLayout` in the generation's
+`CodecConfig`) holds depth for this picture. It is set identically on every shard of the picture:
+data, parity and retransmissions. The client reads it from whichever shard header the reassembler
+keeps. Clear it when the strip holds nothing this frame (a loading screen, a menu with no depth
+buffer, the depth source missed the frame) and write the strip black. A receiver ignores the bit
+when the generation has no `embedded_depth`: `DEPTH_VALID` without a layout means nothing.
 
 ### 4.2 Cursor position, type `0x02` (host -> client), 32 bytes
 
@@ -158,6 +165,40 @@ parity_j = XOR_i  C[j][i] * data_i      C[j][i] = 1 / ((k + j) XOR i)     j < m,
 - RANDOM_ACCESS must be set exactly for IRAP pictures (HEVC NAL types 16-21, H.264 IDR); clients verify it.
 - Profile: HEVC Main (8-bit 4:2:0), no B-frames, no periodic IDR, IDR on demand. Main10/HDR is a later
   version.
+
+### 6.1 Embedded depth (GAME_DEPTH_HOST_PLAN.md §3–6)
+
+A client that advertises `DecoderCaps.embedded_depth` can receive the game's true depth inside the
+same coded picture. The host packs a monitor only while the client advertised the capability **and**
+the latest `StreamSettings.depth_monitors` names that monitor **and** the host has a depth source for
+it. Never pack because the capability alone is set.
+
+Layout for a colour picture of `W`×`H` (both even):
+
+```
+map_width    = floor(W / 4)
+slices       = 4
+map_height   = floor(H / 16) * 4          (divisible by slices)
+slice_rows   = map_height / slices
+strip_y      = align_up(H, 8) + 16        (16 guard rows under the colour)
+coded width  = W
+coded height = align_up(strip_y + slice_rows, 8)
+```
+
+Map row `y` is strip row `y % slice_rows` of slice `y / slice_rows`, and slice `i` starts at strip
+column `i * map_width`. The guard band repeats the last colour row; strip chroma is neutral (128);
+unused strip columns and padding rows are black. Depth is inverse depth (larger = nearer), 8-bit
+full-range luma, normalised by the host (`DEPTH_INVERSE_NEAR_WHITE`).
+
+Rules:
+
+1. `codec_gen` changes whenever the layout does (packing start/stop, size or slice change); the first
+   picture of the new generation is an IDR with `CodecConfig.embedded_depth` before it. Frame-to-frame
+   gaps use `DEPTH_VALID`, not new generations.
+2. `CodecConfig.width`/`height` are the coded size (strip included); `MonitorLayout` keeps the
+   monitor's real size.
+3. The SPS conformance window may crop only the encoder's own alignment padding below the coded
+   height — never the strip.
 
 ## 7. Pairing and authentication
 

@@ -8,6 +8,7 @@
 #include "identity.h"
 #include "wdauth.h"
 #include "wvd/annex_b.h"
+#include "wvd/depth.h"
 #include "wvd/logging.h"
 #include "wvd/pacing.h"
 #include "wvd/time.h"
@@ -72,7 +73,8 @@ void DatagramPacer::Stop() {
 }
 
 bool DatagramPacer::Enqueue(std::vector<std::vector<uint8_t>>&& datagrams,
-                            double frameIntervalUs, double avgBitrateBps, int64_t deadlineQpc) {
+                            double frameIntervalUs, double avgBitrateBps, int64_t deadlineQpc,
+                            uint32_t videoEpoch) {
   if (datagrams.empty()) return true;
   size_t bytes = 0;
   for (const auto& d : datagrams) bytes += d.size();
@@ -85,7 +87,7 @@ bool DatagramPacer::Enqueue(std::vector<std::vector<uint8_t>>&& datagrams,
       droppedBytes_ += bytes;
       return false;
     }
-    queue_.push_back(Item{std::move(datagrams), 0, bytes, rate, deadlineQpc});
+    queue_.push_back(Item{std::move(datagrams), 0, bytes, rate, deadlineQpc, videoEpoch});
     queuedBytes_ += bytes;
   }
   available_.notify_one();
@@ -97,10 +99,16 @@ size_t DatagramPacer::BacklogBytes() const {
   return queuedBytes_;
 }
 
+void DatagramPacer::Clear() {
+  std::lock_guard<std::mutex> lock(m_);
+  queue_.clear();
+  queuedBytes_ = 0;
+}
+
 void DatagramPacer::Run() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   PrecisionSleeper sleeper;
-  std::vector<std::vector<uint8_t>> batch;
+  std::vector<std::pair<std::vector<uint8_t>, uint32_t>> batch;
   batch.reserve(64);
   double budget = 0;
   int64_t last = QpcNow();
@@ -133,7 +141,7 @@ void DatagramPacer::Run() {
         budget -= double(bytes);
         item.remainingBytes -= bytes;
         queuedBytes_ -= bytes;
-        batch.push_back(std::move(datagram));
+        batch.emplace_back(std::move(datagram), item.videoEpoch);
         if (++item.next == item.datagrams.size()) {
           queue_.pop_front();
           // Each picture has its own rate. Do not spend its unused burst
@@ -143,7 +151,7 @@ void DatagramPacer::Run() {
         }
       }
     }
-    for (auto& datagram : batch) sender_(std::move(datagram));
+    for (auto& [datagram, epoch] : batch) sender_(std::move(datagram), epoch);
     batch.clear();
     sleeper.SleepMs(cfg_.quantumUs / 1000.0);
   }
@@ -297,9 +305,10 @@ bool Wire1Channel::OnDatagram(const uint8_t* data, size_t len) {
         mediaFlowBound_ || UsableDatagramPayload() < kMinMediaDatagram)
       return false;
     mediaFlowBound_ = true;
-    pacer_.Start([this](std::vector<uint8_t>&& datagram) {
+    pacer_.Start([this](std::vector<uint8_t>&& datagram, uint32_t epoch) {
       std::lock_guard<std::mutex> lock(m_);
-      return conn_ && peerConnected_ && quic::SendDatagram(conn_, std::move(datagram));
+      return epoch == videoEpoch_ && conn_ && peerConnected_ &&
+             quic::SendDatagram(conn_, std::move(datagram));
     });
     SendSessionState();
     WVD_LOGI("quic: datagram flow bound to session %u (payload <= %u B)", sessionGen(),
@@ -404,9 +413,15 @@ void Wire1Channel::HandleHello(const msg::Hello& hello) {
   peerModel_ = hello.deviceModel;
   peerMaxDatagram_ = hello.maxDatagramSize;
   thermal_ = hello.thermal;
-  WVD_LOGI("quic: hello from '%s' (%s), device %s, max datagram %u B, decoder hevc=%u h264=%u",
-           peerName_.c_str(), hello.deviceModel.c_str(), hello.deviceId.c_str(),
-           hello.maxDatagramSize, hello.decoder.hevc ? 1u : 0u, hello.decoder.h264 ? 1u : 0u);
+  peerEmbeddedDepth_.store(hello.decoder.embeddedDepth);
+  peerMaxPixelRate_.store(hello.decoder.maxPixelRate);
+  WVD_LOGI(
+      "quic: hello from '%s' (%s), device %s, max datagram %u B, decoder hevc=%u h264=%u "
+      "embedded_depth=%u max_pixel_rate=%llu",
+      peerName_.c_str(), hello.deviceModel.c_str(), hello.deviceId.c_str(),
+      hello.maxDatagramSize, hello.decoder.hevc ? 1u : 0u, hello.decoder.h264 ? 1u : 0u,
+      hello.decoder.embeddedDepth ? 1u : 0u,
+      (unsigned long long)hello.decoder.maxPixelRate);
 
   msg::HelloAck ack;
   ack.protocolVersion = kWire1ProtocolVersion;
@@ -582,10 +597,41 @@ void Wire1Channel::SendSessionState() {
   msg::Envelope out;
   out.kind = msg::Envelope::Kind::SessionState;
   out.sessionState.input =
-      ctx_.cfg.inputAllowed ? msg::InputArmState::Armed : msg::InputArmState::Disarmed;
+      ctx_.cfg.inputAllowed && workstationState_ == WorkstationState::Available
+          ? msg::InputArmState::Armed : msg::InputArmState::Disarmed;
   out.sessionState.inputGen = inputGen_;
+  out.sessionState.workstationLocked = workstationState_ != WorkstationState::Available;
+  if (workstationState_ == WorkstationState::Locked)
+    out.sessionState.message = "Unlock the Windows PC to resume streaming.";
+  else if (workstationState_ == WorkstationState::SecureDesktop)
+    out.sessionState.message = "Return to the Windows desktop to resume streaming.";
   out.sessionState.mediaFlowBound = mediaFlowBound_;
   SendEnvelopeOn(control_, out, streams_[control_]);
+}
+
+void Wire1Channel::SetWorkstationState(WorkstationState state) {
+  std::lock_guard<std::mutex> lock(m_);
+  if (state == workstationState_ || auth_ != Auth::Ready) return;
+  const auto previousEpoch = videoEpoch_.load();
+  workstationState_ = state;
+  UpdateVideoVisibility();
+  if (videoEpoch_ == previousEpoch) SendSessionState();
+}
+
+void Wire1Channel::UpdateVideoVisibility() {
+  const bool visible = workstationState_ == WorkstationState::Available &&
+                       (allMonitorsHidden_ == bool(visibilityExceptions_.count(captureMonitorId_)));
+  if (visible == bool(videoEpoch_ & 1u)) return;
+  ++videoEpoch_;
+  awaitingVisibleIdr_ = visible;
+  if (!visible) {
+    pacer_.Clear();
+    history_.clear();
+    historyBytes_ = 0;
+    ++inputGen_;
+    QueueInputRelease(kReleaseIdleTimeout);
+  }
+  SendSessionState();
 }
 
 // ---- control-plane handlers -------------------------------------------------
@@ -603,7 +649,7 @@ void Wire1Channel::HandleControl(const msg::Envelope& env) {
       SendPong(env.ping);
       break;
     case K::RecoveryRequest:
-      if (auth_ == Auth::Ready)
+      if (auth_ == Auth::Ready && (videoEpoch_ & 1u))
         QueueRecovery(env.recoveryRequest.codecGen, uint32_t(env.recoveryRequest.kind),
                       env.recoveryRequest.lastGoodPicSeq);
       break;
@@ -613,21 +659,48 @@ void Wire1Channel::HandleControl(const msg::Envelope& env) {
     case K::StreamSettings:
       if (auth_ == Auth::Ready) {
         const bool audio = env.streamSettings.audio;
-        if (audio != audioWanted_) {
+        // The pipeline learns the audio wish and the embedded-depth capability
+        // from the same HelloPayload.reserved bits; re-queue whenever either
+        // one moves (the depth capability is only ever known by then).
+        const uint32_t reserved =
+            (audio ? kHelloWantsAudio : 0u) |
+            (peerEmbeddedDepth_.load() ? kHelloEmbeddedDepth : 0u);
+        if (reserved != helloReservedQueued_) {
+          helloReservedQueued_ = reserved;
           audioWanted_ = audio;
           QueueHello(audio, peerName_);
+        } else {
+          audioWanted_ = audio;
         }
         clientBitrateKbps_ = env.streamSettings.maxBitrateKbps;
+        clientFrameRate_ = env.streamSettings.frameRate;
+        clientPreferQuality_ = env.streamSettings.preferQuality;
+        // depth_monitors: the full current list on every message (§3.1); only
+        // bother the pipeline when it actually moved.
+        if (env.streamSettings.depthMonitors != clientDepthMonitors_) {
+          clientDepthMonitors_ = env.streamSettings.depthMonitors;
+          QueueDepthMonitors(clientDepthMonitors_);
+        }
       }
       break;
     case K::DisplayModeRequest:
       if (auth_ == Auth::Ready) QueueModeChange(env.displayModeRequest);
       break;
     case K::Visibility:
-      // The headset shows or hides its window. Stopping the encoder would need
-      // a media-session knob; until it exists we keep streaming and only
-      // release held input, which a hidden monitor must not keep.
-      if (auth_ == Auth::Ready && !env.visibility.visible) QueueInputRelease(kReleaseIdleTimeout);
+      if (auth_ == Auth::Ready) {
+        if (env.visibility.monitorIds.empty()) {
+          allMonitorsHidden_ = !env.visibility.visible;
+          visibilityExceptions_.clear();
+        } else {
+          for (uint32_t id : env.visibility.monitorIds) {
+            // When the default for all monitors is hidden, the set stores
+            // the visible exceptions.
+            if (env.visibility.visible == allMonitorsHidden_) visibilityExceptions_.insert(id);
+            else visibilityExceptions_.erase(id);
+          }
+        }
+        UpdateVideoVisibility();
+      }
       break;
     case K::ThermalUpdate:
       thermal_ = env.thermal.state;
@@ -652,7 +725,7 @@ void Wire1Channel::HandleInput(const msg::Envelope& env) {
   using K = msg::Envelope::Kind;
   switch (env.kind) {
     case K::InputEvents:
-      if (!ctx_.cfg.inputAllowed) return;  // disarmed: events are dropped, not queued
+      if (!ctx_.cfg.inputAllowed || !(videoEpoch_ & 1u) || env.input.inputGen != inputGen_) return;
       QueueInput(env.input);
       break;
     case K::InputRelease:
@@ -753,7 +826,8 @@ void Wire1Channel::OnLegacyLayout(const uint8_t* payload, uint32_t size) {
   std::memcpy(&ml, payload, sizeof(ml));
   std::vector<MonitorDesc> list;
   const uint32_t count = ml.count;
-  if (count > 16 || size < sizeof(MonitorLayoutPayload) + count * sizeof(MonitorDesc)) return;
+  if (count > 16 || ml.captureIndex >= count ||
+      size < sizeof(MonitorLayoutPayload) + count * sizeof(MonitorDesc)) return;
   list.resize(count);
   std::memcpy(list.data(), payload + sizeof(MonitorLayoutPayload),
               size_t(count) * sizeof(MonitorDesc));
@@ -769,9 +843,7 @@ void Wire1Channel::OnLegacyLayout(const uint8_t* payload, uint32_t size) {
     m.name = std::string(list[i].id, strnlen(list[i].id, sizeof(list[i].id)));
     m.width = list[i].width;
     m.height = list[i].height;
-    // The packed layout carries no refresh rate; the headset's size menu reads
-    // it from DisplayModes, which does, so this stays informational.
-    m.refreshMhz = 60000;
+    m.refreshMhz = list[i].refreshMilliHz;
     m.ppi = UINT(list[i].dpiX ? list[i].dpiX : 96);
     m.desktopX = list[i].x;
     m.desktopY = list[i].y;
@@ -779,6 +851,8 @@ void Wire1Channel::OnLegacyLayout(const uint8_t* payload, uint32_t size) {
     out.monitorLayout.monitors.push_back(std::move(m));
   }
   layoutGenOut_ = out.monitorLayout.layoutGen;
+  captureMonitorId_ = uint16_t(ml.captureIndex + 1);
+  UpdateVideoVisibility();
   SendEnvelopeOn(control_, out, streams_[control_]);
   WVD_LOGI("quic: layout gen %u with %u monitor(s)", out.monitorLayout.layoutGen, count);
 }
@@ -794,10 +868,27 @@ void Wire1Channel::OnLegacyCodecConfig(const uint8_t* payload, uint32_t size) {
   out.codecConfig.codec = codecOut_ == Codec::H264 ? msg::Codec::H264
                           : codecOut_ == Codec::AV1 ? msg::Codec::Av1
                                                    : msg::Codec::Hevc;
-  out.codecConfig.width = cc.width;
+  out.codecConfig.width = cc.width;   // coded size: the depth strip is inside it
   out.codecConfig.height = cc.height;
-  if (cc.csdSize <= size - sizeof(cc)) {
-    ForEachAnnexBNal(payload + sizeof(cc), cc.csdSize, [&](const uint8_t* nal, size_t nalSize) {
+  // An optional EmbeddedDepthPayload sits between the struct and the CSD
+  // (game-depth plan §3.1; WIRE.md §6.1).
+  size_t off = sizeof(cc);
+  if (cc.reserved & kCodecConfigEmbeddedDepth) {
+    if (size < off + sizeof(EmbeddedDepthPayload)) return;
+    EmbeddedDepthPayload dep{};
+    std::memcpy(&dep, payload + off, sizeof(dep));
+    off += sizeof(dep);
+    out.codecConfig.hasEmbeddedDepth = true;
+    out.codecConfig.embeddedDepth.pictureWidth = dep.pictureWidth;
+    out.codecConfig.embeddedDepth.pictureHeight = dep.pictureHeight;
+    out.codecConfig.embeddedDepth.stripY = dep.stripY;
+    out.codecConfig.embeddedDepth.mapWidth = dep.mapWidth;
+    out.codecConfig.embeddedDepth.mapHeight = dep.mapHeight;
+    out.codecConfig.embeddedDepth.slices = dep.slices;
+    out.codecConfig.embeddedDepth.encoding = msg::DepthEncoding(dep.encoding);
+  }
+  if (cc.csdSize <= size - off) {
+    ForEachAnnexBNal(payload + off, cc.csdSize, [&](const uint8_t* nal, size_t nalSize) {
       if (out.codecConfig.parameterSets.size() < 8)
         out.codecConfig.parameterSets.emplace_back(nal, nal + nalSize);
     });
@@ -818,10 +909,18 @@ void Wire1Channel::OnLegacyCodecConfig(const uint8_t* payload, uint32_t size) {
   codecGenOut_ = uint32_t(cc.codecGen);
   history_.clear();
   historyBytes_ = 0;
-  WVD_LOGI("quic: codec gen %u %s %ux%u, %zu parameter set(s), FEC %.0f%%",
+  std::string depthNote;
+  if (out.codecConfig.hasEmbeddedDepth) {
+    const auto& L = out.codecConfig.embeddedDepth;
+    depthNote = ", depth strip: map " + std::to_string(L.mapWidth) + "x" +
+                std::to_string(L.mapHeight) + " /" + std::to_string(L.slices) +
+                " slices @ y=" + std::to_string(L.stripY);
+  }
+  WVD_LOGI("quic: codec gen %u %s %ux%u, %zu parameter set(s), FEC %.0f%%%s",
            out.codecConfig.codecGen,
            out.codecConfig.codec == msg::Codec::H264 ? "H.264" : "HEVC", cc.width, cc.height,
-           out.codecConfig.parameterSets.size(), packetCfg_.fecRatio * 100.0);
+           out.codecConfig.parameterSets.size(), packetCfg_.fecRatio * 100.0,
+           depthNote.c_str());
   pendingCodecConfig_ = std::move(out);
 }
 
@@ -945,9 +1044,10 @@ void Wire1Channel::OnAudioPacket(const AudioPayload& a, const int16_t* pcm, uint
 
 void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes,
                            std::unique_lock<std::mutex>& lock) {
-  if (!mediaFlowBound_ || !auBytes || mh.codecGen != codecGenOut_) return;
+  if (!mediaFlowBound_ || !auBytes || mh.codecGen != codecGenOut_ ||
+      mh.videoEpoch != videoEpoch_ || !(mh.videoEpoch & 1u)) return;
   const auto monitorId = uint16_t(mh.monitor + 1);
-  captureMonitorId_ = monitorId;
+  if (monitorId != captureMonitorId_ || (awaitingVisibleIdr_ && !(mh.flags & 1u))) return;
   if (pendingCodecConfig_) {
     pendingCodecConfig_->codecConfig.monitorId = monitorId;
     SendEnvelope(*pendingCodecConfig_);
@@ -980,6 +1080,9 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   desc.contentVer = mh.contentVer;
   desc.randomAccess = (mh.flags & 1u) != 0;
   desc.refinement = (mh.flags & 2u) != 0;
+  // Packed bit3 -> WIRE.md §4.1 flag bit4 DEPTH_VALID (identical on data,
+  // parity and retransmissions; the Packetizer stamps it from the descriptor).
+  desc.depthValid = (mh.flags & kMediaDepthValid) != 0;
   desc.captureTimeUs = QpcMicroseconds((std::max)(int64_t(0), captureQpc));
   desc.deadlineBudgetMs = uint16_t(ctx_.cfg.deadlineBudgetMs);
 
@@ -1003,14 +1106,16 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   frame.AppendInterleavedParity(datagrams);
   lock.lock();
 
-  if (!peerConnected_ || mh.codecGen != codecGenOut_) return;
+  if (!peerConnected_ || mh.codecGen != codecGenOut_ || mh.videoEpoch != videoEpoch_ ||
+      monitorId != captureMonitorId_) return;
   const size_t pictureBytes = size_t(frame.totalDataShards()) *
                               (frame.shardBytes() + dg::MediaShardHeader::kSize);
-  if (!pacer_.Enqueue(std::move(datagrams), frameIntervalUs_, targetBitrateBps_, deadline)) {
+  if (!pacer_.Enqueue(std::move(datagrams), frameIntervalUs_, targetBitrateBps_, deadline, mh.videoEpoch)) {
     QueueRecovery(codecGenOut_, uint32_t(msg::RecoveryKind::Idr), 0);
     return;
   }
   ++picturesOut_;
+  awaitingVisibleIdr_ = false;
   if (desc.randomAccess) ++idrCount_;
   bytesOut_ += pictureBytes;
 
@@ -1031,6 +1136,7 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
 }
 
 void Wire1Channel::Retransmit(const dg::Nack& nack) {
+  if (!(videoEpoch_ & 1u)) return;
   const auto it = history_.find(nack.picSeq);
   if (it == history_.end()) return;
   const auto& frame = it->second;
@@ -1043,7 +1149,7 @@ void Wire1Channel::Retransmit(const dg::Nack& nack) {
   const int64_t deadline = QpcNow() + MsToQpc(double(budgetUs - ageUs) / 1000.0);
   auto shards = frame.Retransmission(nack.missing);
   const size_t count = shards.size();
-  if (pacer_.Enqueue(std::move(shards), 2000.0, targetBitrateBps_, deadline))
+  if (pacer_.Enqueue(std::move(shards), 2000.0, targetBitrateBps_, deadline, videoEpoch_))
     retransmitted_ += count;
 }
 
@@ -1132,9 +1238,24 @@ void Wire1Channel::QueueHello(bool wantsAudio, const std::string& deviceName) {
                                  : uint32_t(peerHello_.decoder.maxPixelRate);
   h.wantsAv1 = peerHello_.decoder.av1 ? 1 : 0;
   h.thermalState = uint8_t(thermal_);
-  h.reserved = wantsAudio ? kHelloWantsAudio : 0;
+  h.reserved = uint16_t((wantsAudio ? kHelloWantsAudio : 0u) |
+                        (peerEmbeddedDepth_.load() ? kHelloEmbeddedDepth : 0u));
   strncpy_s(h.deviceName, deviceName.c_str(), _TRUNCATE);
   w.Append(h);
+  QueueForPipeline(w.Take());
+}
+
+void Wire1Channel::QueueDepthMonitors(const std::vector<uint32_t>& monitorIds) {
+  // The headset names monitors by layout index + 1 (WIRE.md); the pipeline
+  // uses 0-based indices into its own MonitorLayout.
+  std::vector<uint16_t> indices;
+  for (uint32_t id : monitorIds)
+    if (id > 0 && id <= 0xFFFF) indices.push_back(uint16_t(id - 1));
+  PacketWriter w(PacketKind::DepthMonitors);
+  DepthMonitorsPayload p{};
+  p.count = uint32_t(indices.size());
+  w.Append(p);
+  w.AppendArray(indices);
   QueueForPipeline(w.Take());
 }
 
@@ -1157,7 +1278,6 @@ void Wire1Channel::QueueModeChange(const msg::DisplayModeRequest& r) {
   m.height = r.height;
   m.refreshMilliHz = r.refreshMhz;
   w.Append(m);
-  captureMonitorId_ = uint16_t(r.monitorId > 0 ? r.monitorId : 1);
   QueueForPipeline(w.Take());
 }
 
@@ -1179,6 +1299,7 @@ void Wire1Channel::QueueInput(const msg::InputEvents& batch) {
     switch (e.kind) {
       case msg::InputEvent::Kind::Move: {
         const auto& mv = e.move;
+        if (mv.monitorId != captureMonitorId_ || mv.layoutGen != layoutGenOut_) continue;
         if (!std::isfinite(mv.x) || !std::isfinite(mv.y) || mv.x < 0 || mv.y < 0) continue;
         out.kind = uint8_t(InputKind::MoveAbs);
         out.x = int32_t(mv.x);
@@ -1188,6 +1309,7 @@ void Wire1Channel::QueueInput(const msg::InputEvents& batch) {
       }
       case msg::InputEvent::Kind::Button: {
         const auto& b = e.button;
+        if (b.monitorId != captureMonitorId_ || b.layoutGen != layoutGenOut_) continue;
         if (!std::isfinite(b.x) || !std::isfinite(b.y) || b.x < 0 || b.y < 0) continue;
         out.kind = uint8_t(InputKind::Button);
         out.flags = uint8_t(b.down ? 0 : kKeyUp);

@@ -1,12 +1,11 @@
 #include "discovery.h"
-#include "wvd/platform.h"
 
-#include <iphlpapi.h>
-#include <windns.h>
 #include <ws2ipdef.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#include <windns.h>
 
-#include <atomic>
-#include <string>
+#include <cstdio>
 #include <vector>
 
 #include "wvd/logging.h"
@@ -16,107 +15,181 @@
 
 namespace wvd {
 
-// SDK shape (windns.h, 10.0.26100): the register request carries the
-// instance only; Stop() calls DnsServiceDeRegister with the same request.
 struct DnsRegistrationCtx {
-  DNS_SERVICE_REGISTER_REQUEST req{};
-  PDNS_SERVICE_INSTANCE inst = nullptr;
-  std::wstring instanceFq;  // "<name>._wvd._udp.local."
-  std::wstring hostName;    // DNS host name of this PC
-  IP4_ADDRESS ip4 = 0;      // network-byte-order IPv4
-  // msdns calls our completion for the register *and* for the de-register, and
-  // it may still do so after a call reported a failure. Until that callback
-  // has run the request, the instance and this struct are not ours to free.
-  std::atomic<bool> registered{false};
-  std::atomic<bool> retiring{false};
+  ~DnsRegistrationCtx() { if (instance) DnsServiceFreeInstance(instance); }
+  DNS_SERVICE_REGISTER_REQUEST request{};
+  PDNS_SERVICE_INSTANCE instance = nullptr;
+  std::atomic<DWORD> result{DNS_REQUEST_PENDING};
+  bool retiring = false;
+  bool logged = false;
+  IP4_ADDRESS address = 0;
 };
 
-static VOID WINAPI RegisterComplete(DWORD status, PVOID ctx, PDNS_SERVICE_INSTANCE instance) {
-  if (instance) DnsServiceFreeInstance(instance);
-  auto* c = static_cast<DnsRegistrationCtx*>(ctx);
-  if (!c) return;
-  if (c->retiring.exchange(false)) return;  // the answer to our own de-register
-  if (status == 0)
-    WVD_LOGI("DNS-SD: registered %ls", c->instanceFq.c_str());
-  else
-    WVD_LOGW("DNS-SD register completion status=0x%lx (hint only, §4.7-7)", status);
+namespace {
+
+struct LanAddress {
+  IP4_ADDRESS address = 0;
+  ULONG index = 0;
+  ULONG metric = 0;
+  bool gateway = false;
+};
+
+bool UsableAddress(const SOCKET_ADDRESS& socket) {
+  if (!socket.lpSockaddr || socket.iSockaddrLength < sizeof(SOCKADDR_IN) ||
+      socket.lpSockaddr->sa_family != AF_INET) return false;
+  const auto& ip = reinterpret_cast<const SOCKADDR_IN*>(socket.lpSockaddr)->sin_addr.S_un.S_un_b;
+  return ip.s_b1 != 0 && ip.s_b1 != 127 && ip.s_b1 < 224 &&
+         !(ip.s_b1 == 169 && ip.s_b2 == 254);
 }
 
-static bool FirstRoutableIpv4(IP4_ADDRESS& out) {
-  ULONG len = 15000;
-  std::vector<uint8_t> bytes(len);
-  auto adapters = [&] { return reinterpret_cast<PIP_ADAPTER_ADDRESSES>(bytes.data()); };
-  constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-  DWORD status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &len);
-  if (status == ERROR_BUFFER_OVERFLOW) {
-    bytes.resize(len);
-    status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &len);
+LanAddress SelectLanAddress() {
+  ULONG size = 15000;
+  std::vector<uint8_t> data(size);
+  const auto adapters = [&] { return reinterpret_cast<PIP_ADAPTER_ADDRESSES>(data.data()); };
+  constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                          GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS;
+  DWORD result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &size);
+  for (int retry = 0; result == ERROR_BUFFER_OVERFLOW && retry < 2; ++retry) {
+    data.resize(size);
+    result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters(), &size);
   }
-  if (status != ERROR_SUCCESS) return false;
+  LanAddress best;
+  if (result != ERROR_SUCCESS) return best;
   for (auto* adapter = adapters(); adapter; adapter = adapter->Next) {
-    if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
-        adapter->IfType == IF_TYPE_TUNNEL) continue;
-    for (auto* ua = adapter->FirstUnicastAddress; ua; ua = ua->Next) {
-      const auto* address = reinterpret_cast<const SOCKADDR_IN*>(ua->Address.lpSockaddr);
-      if (!address || address->sin_family != AF_INET) continue;
-      out = address->sin_addr.S_un.S_addr;
-      return true;
+    if (adapter->OperStatus != IfOperStatusUp ||
+        (adapter->IfType != IF_TYPE_ETHERNET_CSMACD && adapter->IfType != IF_TYPE_IEEE80211))
+      continue;
+    MIB_IF_ROW2 iface{};
+    iface.InterfaceLuid = adapter->Luid;
+    if (GetIfEntry2(&iface) != NO_ERROR || !iface.InterfaceAndOperStatusFlags.HardwareInterface ||
+        iface.AccessType != NET_IF_ACCESS_BROADCAST) continue;
+    bool gateway = false;
+    for (auto* next = adapter->FirstGatewayAddress; next; next = next->Next)
+      gateway |= UsableAddress(next->Address);
+    for (auto* unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+      if (unicast->DadState != IpDadStatePreferred || !UsableAddress(unicast->Address)) continue;
+      const auto* ip = reinterpret_cast<const SOCKADDR_IN*>(unicast->Address.lpSockaddr);
+      if (!best.address || (gateway && !best.gateway) ||
+          (gateway == best.gateway && adapter->Ipv4Metric < best.metric))
+        best = {ip->sin_addr.S_un.S_addr, adapter->IfIndex, adapter->Ipv4Metric, gateway};
+      break;
     }
   }
-  return false;
+  return best;
 }
 
-bool DnsRegistration::Start(const std::wstring& instanceName, uint16_t port,
+void WINAPI RegisterComplete(DWORD status, PVOID context, PDNS_SERVICE_INSTANCE instance) {
+  if (instance) DnsServiceFreeInstance(instance);
+  static_cast<DnsRegistrationCtx*>(context)->result = status;
+}
+
+void WINAPI InterfaceChanged(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
+  *static_cast<std::atomic<bool>*>(context) = true;
+}
+
+void WINAPI AddressChanged(PVOID context, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE) {
+  *static_cast<std::atomic<bool>*>(context) = true;
+}
+
+void Deregister(DnsRegistrationCtx& entry) {
+  entry.retiring = true;
+  entry.result = DNS_REQUEST_PENDING;
+  const DWORD result = DnsServiceDeRegister(&entry.request, nullptr);
+  if (result != DNS_REQUEST_PENDING) entry.result = result;
+}
+
+}  // namespace
+
+DnsRegistration::DnsRegistration() = default;
+
+void DnsRegistration::Start(const std::wstring& instanceName, uint16_t port,
                             const std::string& hostId) {
-  if (registration_) return false;
-  auto* c = new DnsRegistrationCtx();
-  c->instanceFq = instanceName + L"._wvd._udp.local.";
+  instanceFq_ = instanceName + L"._wvd._udp.local.";
+  wchar_t name[256]{};
+  DWORD length = ARRAYSIZE(name);
+  GetComputerNameExW(ComputerNameDnsHostname, name, &length);
+  hostName_ = std::wstring(name[0] ? name : L"localhost") + L".local.";
+  hostId_ = Utf8ToWide(hostId.c_str());
+  port_ = port;
+  NotifyIpInterfaceChange(AF_INET, InterfaceChanged, &dirty_, FALSE, &interfaceChange_);
+  NotifyUnicastIpAddressChange(AF_INET, AddressChanged, &dirty_, FALSE, &addressChange_);
+  Refresh();
+}
 
-  wchar_t host[256] = {};
-  DWORD hl = 256;
-  GetComputerNameExW(ComputerNameDnsHostname, host, &hl);
-  c->hostName = std::wstring(host[0] ? host : L"localhost") + L".local.";
-
-  if (!FirstRoutableIpv4(c->ip4))
-    WVD_LOGW("DNS-SD: no routable IPv4 found; registering with empty address");
-
-  const auto id = Utf8ToWide(hostId.c_str());
-  PCWSTR keys[] = {L"v", L"id"};
-  PCWSTR values[] = {L"1", id.c_str()};
-  c->inst = DnsServiceConstructInstance(c->instanceFq.c_str(), c->hostName.c_str(),
-                                        c->ip4 ? &c->ip4 : nullptr, nullptr,
-                                        port, 0, 0, ARRAYSIZE(keys), keys, values);
-  if (!c->inst) {
-    WVD_LOGE("DnsServiceConstructInstance failed");
-    delete c;
-    return false;
+void DnsRegistration::Refresh() {
+  if (!port_) return;
+  const uint64_t now = GetTickCount64();
+  if (dirty_.exchange(false) || now >= nextScan_) {
+    const bool first = nextScan_ == 0;
+    nextScan_ = now + 5000;  // covers a route/metric change or unavailable notifications
+    const auto lan = SelectLanAddress();
+    if (first || lan.address != address_ || lan.index != interfaceIndex_) {
+      address_ = lan.address;
+      interfaceIndex_ = lan.index;
+      nextRetry_ = 0;
+      if (address_) {
+        IN_ADDR ip{};
+        ip.S_un.S_addr = address_;
+        const auto& b = ip.S_un.S_un_b;
+        printf("HOST_LAN_ADDRESS %u.%u.%u.%u\n", unsigned(b.s_b1), unsigned(b.s_b2),
+               unsigned(b.s_b3), unsigned(b.s_b4));
+      } else {
+        puts("HOST_LAN_ADDRESS unavailable");
+      }
+      fflush(stdout);
+    }
   }
 
-  c->req.Version = 1;
-  c->req.InterfaceIndex = 0;
-  c->req.pServiceInstance = c->inst;
-  c->req.pRegisterCompletionCallback = RegisterComplete;
-  c->req.pQueryContext = c;
-  c->req.hCredentials = nullptr;
-  c->req.unicastEnabled = FALSE;
+  if (registration_) {
+    auto& entry = *registration_;
+    const DWORD result = entry.result;
+    if (result == DNS_REQUEST_PENDING) return;
+    if (entry.retiring || result != ERROR_SUCCESS) {
+      if (result != ERROR_SUCCESS) {
+        WVD_LOGW("DNS-SD %s failed (0x%lx)",
+                 entry.retiring ? "deregistration" : "registration", result);
+        nextRetry_ = now + 5000;
+      }
+      registration_.reset();
+    } else if (entry.address != address_ || entry.request.InterfaceIndex != interfaceIndex_) {
+      Deregister(entry);
+      return;
+    } else if (!entry.logged) {
+      WVD_LOGI("DNS-SD registered %ls on interface %u", instanceFq_.c_str(), interfaceIndex_);
+      entry.logged = true;
+    }
+  }
+  if (registration_ || !address_ || now < nextRetry_) return;
 
-  const DWORD status = DnsServiceRegister(&c->req, nullptr);
-  registration_ = c;
-  c->registered = status == ERROR_SUCCESS || status == DNS_REQUEST_PENDING;
-  if (!c->registered)
-    WVD_LOGW("DNS-SD registration failed (status 0x%lx)", status);
-  return c->registered;
+  auto entry = std::make_unique<DnsRegistrationCtx>();
+  entry->address = address_;
+  PCWSTR keys[] = {L"v", L"id"};
+  PCWSTR values[] = {L"1", hostId_.c_str()};
+  entry->instance = DnsServiceConstructInstance(instanceFq_.c_str(), hostName_.c_str(),
+      &entry->address, nullptr, port_, 0, 0, ARRAYSIZE(keys), keys, values);
+  if (!entry->instance) {
+    WVD_LOGW("DNS-SD could not construct the service instance");
+    nextRetry_ = now + 5000;
+    return;
+  }
+  entry->request.Version = DNS_QUERY_REQUEST_VERSION1;
+  entry->request.InterfaceIndex = interfaceIndex_;
+  entry->request.pServiceInstance = entry->instance;
+  entry->request.pRegisterCompletionCallback = RegisterComplete;
+  entry->request.pQueryContext = entry.get();
+  const DWORD result = DnsServiceRegister(&entry->request, nullptr);
+  if (result != DNS_REQUEST_PENDING) entry->result = result;
+  registration_ = std::move(entry);
 }
 
 DnsRegistration::~DnsRegistration() {
-  auto* c = static_cast<DnsRegistrationCtx*>(registration_);
-  if (!c || !c->registered) return;
-  c->retiring = true;
-  const DWORD status = DnsServiceDeRegister(&c->req, nullptr);
-  if (status != ERROR_SUCCESS && status != DNS_REQUEST_PENDING)
-    WVD_LOGW("DNS-SD deregistration failed (status 0x%lx)", status);
-  // The sole registration's request and instance stay valid for the process.
-  // DNSAPI can complete deregistration after this destructor returns.
+  if (interfaceChange_) CancelMibChangeNotify2(interfaceChange_);
+  if (addressChange_) CancelMibChangeNotify2(addressChange_);
+  if (registration_ && !registration_->retiring && registration_->result == ERROR_SUCCESS)
+    Deregister(*registration_);
+  // DNSAPI can finish after the worker exits this scope. The OS withdraws any
+  // registration that is still in flight at process exit.
+  if (registration_ && registration_->result == DNS_REQUEST_PENDING) registration_.release();
 }
 
 }  // namespace wvd

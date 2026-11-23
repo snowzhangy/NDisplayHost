@@ -588,13 +588,15 @@ int CmdCurtainTest() {
 }  // namespace
 
 namespace wvd {
+int DiagFirewall(bool install);
+
 int RoleDiag(int argc, char** argv) {
   // Physical-pixel coordinates (§4.1). Runs before any display query.
   wvd::EnablePerMonitorDpiAwareness();
 
   log::Init("diag", log::Level::Info);
   if (argc < 2) {
-    printf("ndisplay diag: adapters|topology|caps|modes|capture|quic-probe|owner-ping|coords-selftest|curtain-test\n");
+    printf("ndisplay diag: adapters|topology|caps|modes|capture|quic-probe|firewall|owner-ping|coords-selftest|curtain-test\n");
     return 2;
   }
   std::string c = argv[1];
@@ -604,6 +606,11 @@ int RoleDiag(int argc, char** argv) {
   if (c == "modes") return CmdModes();
   if (c == "capture") return CmdCapture(argc, argv);
   if (c == "quic-probe") return CmdQuicProbe(argc, argv);
+  if (c == "firewall") {
+    if (argc == 2) return DiagFirewall(false);
+    if (argc == 3 && std::string(argv[2]) == "--install") return DiagFirewall(true);
+    return 2;
+  }
   if (c == "owner-ping") return CmdOwnerPing();
   if (c == "coords-selftest") return CmdCoordsSelftest();
   if (c == "curtain-test") return CmdCurtainTest();

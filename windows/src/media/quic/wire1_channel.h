@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,6 +53,7 @@
 namespace wvd {
 
 class HostIdentity;
+enum class WorkstationState { Available, Locked, SecureDesktop };
 
 struct Wire1Config {
   // HelloAck identity. hostId is stable across reconnects; the client keys its
@@ -100,7 +102,7 @@ class DatagramPacer {
     static constexpr size_t maxQueuedBytes = 2u << 20;
   };
   // Sends one datagram; false when the peer is not reading (a loss).
-  using Sender = std::function<bool(std::vector<uint8_t>&&)>;
+  using Sender = std::function<bool(std::vector<uint8_t>&&, uint32_t videoEpoch)>;
 
   DatagramPacer() = default;
   ~DatagramPacer() { Stop(); }
@@ -109,10 +111,11 @@ class DatagramPacer {
 
   void Start(Sender sender);
   void Stop();
+  void Clear();
   // One picture's datagrams. Returns false when the queue is full: bounded by
   // design, the receiver notices the gap and asks for recovery.
   bool Enqueue(std::vector<std::vector<uint8_t>>&& datagrams, double frameIntervalUs,
-               double avgBitrateBps, int64_t deadlineQpc);
+               double avgBitrateBps, int64_t deadlineQpc, uint32_t videoEpoch);
   size_t BacklogBytes() const;
   uint64_t DroppedBytes() const { return droppedBytes_.load(); }
 
@@ -127,6 +130,7 @@ class DatagramPacer {
     size_t remainingBytes = 0;
     double rateBps = 0;
     int64_t deadlineQpc = 0;
+    uint32_t videoEpoch = 0;
   };
   mutable std::mutex m_;
   std::condition_variable available_;
@@ -169,6 +173,11 @@ class Wire1Channel : public MediaChannel,
   bool IsConnected() const override;
   size_t BacklogBytes() const override;
   uint32_t VideoBitrateLimitKbps() const override { return clientBitrateKbps_; }
+  uint32_t VideoFrameRateLimit() const override { return clientFrameRate_; }
+  uint64_t MaxVideoPixelsPerSec() const override { return peerMaxPixelRate_.load(); }
+  bool PreferVideoQuality() const override { return clientPreferQuality_; }
+  uint32_t VideoEpoch() const override { return videoEpoch_; }
+  void SetWorkstationState(WorkstationState state);
 
   // ---- driven from the listener's msquic callbacks ------------------------
   void OnConnected(QuicConn conn, const std::vector<uint8_t>& peerCertSha256);
@@ -226,6 +235,7 @@ class Wire1Channel : public MediaChannel,
   void FinishPairing(bool success, const std::string& reason);
   void Authenticated();
   void SendSessionState();
+  void UpdateVideoVisibility();
   void SendGoodbyeAndClose(const std::string& reason);
 
   // media out
@@ -247,6 +257,8 @@ class Wire1Channel : public MediaChannel,
   // WIRE in -> packed packets for the pipeline
   void QueueForPipeline(std::vector<uint8_t> framedPacket);
   void QueueHello(bool wantsAudio, const std::string& deviceName);
+  // StreamSettings.depth_monitors: headset 1-based ids -> 0-based layout indices.
+  void QueueDepthMonitors(const std::vector<uint32_t>& monitorIds);
   void QueueRecovery(uint32_t codecGen, uint32_t kind, uint32_t refPicSeq);
   void QueueModeChange(const msg::DisplayModeRequest& r);
   void QueueInput(const msg::InputEvents& batch);
@@ -307,6 +319,21 @@ class Wire1Channel : public MediaChannel,
   std::atomic<bool> peerConnected_{true};
   std::atomic<bool> linked_{false};
   std::atomic<uint32_t> clientBitrateKbps_{0};
+  std::atomic<uint32_t> clientFrameRate_{0};
+  std::atomic<bool> clientPreferQuality_{true};
+  // DecoderCaps.embedded_depth / max_pixel_rate (game-depth plan §3.1). Set
+  // once at Hello; read without m_ from the pipeline.
+  std::atomic<bool> peerEmbeddedDepth_{false};
+  std::atomic<uint64_t> peerMaxPixelRate_{0};
+  // The HelloPayload.reserved combination last queued to the pipeline, and
+  // the depth monitor list last seen from the headset (both under m_).
+  uint32_t helloReservedQueued_ = 0xFFFFFFFF;
+  std::vector<uint32_t> clientDepthMonitors_;
+  std::atomic<uint32_t> videoEpoch_{1};
+  WorkstationState workstationState_ = WorkstationState::Available;
+  std::set<uint32_t> visibilityExceptions_;
+  bool allMonitorsHidden_ = false;
+  bool awaitingVisibleIdr_ = false;
 
   // Which monitor the media belongs to is only stated on the packed media
   // packet, so a codec configuration or cursor shape that arrives before the

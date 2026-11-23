@@ -1,5 +1,6 @@
 #include "capture/dda_capture.h"
 #include "preprocess/nv12_convert.h"
+#include "wvd/depth.h"
 #include <algorithm>
 #include <vector>
 #include <cstdio>
@@ -113,5 +114,89 @@ int main() {
     for (size_t i = 0; i < size_t(w / 2) * (h / 2); ++i) CHECK(abs(int(out[i]) - 18) <= 1);
     CHECK(abs(int(out[size_t(w / 2) * (h / 2)]) - 255) <= 1);
     puts("GPU scaled conversion (1280x720 -> 640x360) passed");
+  }
+
+  // Embedded depth (GAME_DEPTH_HOST_PLAN.md §4): colour + guard band + sliced
+  // strip + black padding land exactly in the coded texture.
+  {
+    const UINT w = 640, h = 360;
+    EmbeddedDepthPayload lay{};
+    CHECK(ComputeEmbeddedDepth(w, h, lay));
+    CHECK(lay.mapWidth == 160 && lay.mapHeight == 88 && lay.sliceRows == 22);
+    CHECK(lay.stripY == 376 && lay.codedHeight == 400);
+    FrameRing ring;
+    CHECK(SUCCEEDED(ring.Init(device.Get(), w, h, 2)));
+    std::vector<uint32_t> frame(size_t(w) * h);
+    for (UINT y = 0; y < h; ++y)
+      for (UINT x = 0; x < w; ++x)
+        frame[size_t(y) * w + x] = 0xFF000000u | ((x * 7 & 255) << 16) |
+                                   (((y * 5 + x) & 255) << 8);
+    const UINT slot = ring.AcquireWriteSlot();
+    ring.WriteCpuFrame(slot, reinterpret_cast<const uint8_t*>(frame.data()), w * 4);
+
+    // Reference: the plain conversion is the colour truth.
+    ID3D11Texture2D* ref = nullptr;
+    CHECK(SUCCEEDED(converter.ConvertToTexture(ring.SlotSrv(slot), w, h, w, h,
+                                               ChromaFilter::Box2x2, &ref)));
+    std::vector<uint8_t> plain;
+    CHECK(SUCCEEDED(converter.Readback(ref, plain)));
+
+    std::vector<uint8_t> map(size_t(lay.mapWidth) * lay.mapHeight);
+    for (UINT y = 0; y < lay.mapHeight; ++y)
+      for (UINT x = 0; x < lay.mapWidth; ++x)
+        map[size_t(y) * lay.mapWidth + x] = uint8_t(1 + ((x * 13 + y * 29) & 254));
+
+    Nv12DepthOverlay ov{};
+    ov.map = map.data();
+    ov.mapWidth = lay.mapWidth;
+    ov.mapHeight = lay.mapHeight;
+    ov.slices = lay.slices;
+    ov.colorHeight = h;
+    ov.stripY = lay.stripY;
+    ov.sliceRows = lay.sliceRows;
+
+    ID3D11Texture2D* packed = nullptr;
+    CHECK(SUCCEEDED(converter.ConvertToTexture(ring.SlotSrv(slot), w, h, w, lay.codedHeight,
+                                               ChromaFilter::Box2x2, &packed, &ov)));
+    std::vector<uint8_t> out;
+    CHECK(SUCCEEDED(converter.Readback(packed, out)));
+    CHECK(out.size() == Nv12Converter::Nv12Size(w, lay.codedHeight));
+
+    // Colour rows are byte-identical to the plain conversion.
+    CHECK(memcmp(out.data(), plain.data(), size_t(w) * h) == 0);
+    // Guard band repeats the last colour row (§4).
+    for (UINT y = h; y < lay.stripY; ++y)
+      for (UINT x = 0; x < w; x += 7)
+        CHECK(out[size_t(y) * w + x] == plain[size_t(h - 1) * w + x]);
+    // Strip: map row y is strip row y % sliceRows of slice y / sliceRows.
+    for (UINT my = 0; my < lay.mapHeight; ++my)
+      for (UINT mx = 0; mx < lay.mapWidth; ++mx)
+        CHECK(out[size_t(lay.stripY + my % lay.sliceRows) * w +
+                  (my / lay.sliceRows) * lay.mapWidth + mx] ==
+              map[size_t(my) * lay.mapWidth + mx]);
+    // Padding below the strip is black.
+    for (UINT y = lay.stripY + lay.sliceRows; y < lay.codedHeight; ++y)
+      for (UINT x = 0; x < w; ++x) CHECK(out[size_t(y) * w + x] == 0);
+    // Colour chroma matches the plain conversion for its own rows, and the
+    // strip + padding chroma is neutral (128), so it costs almost no bits.
+    const size_t uv = size_t(w) * lay.codedHeight;
+    CHECK(memcmp(out.data() + uv, plain.data() + size_t(w) * h, size_t(w) * (h / 2)) == 0);
+    for (UINT cy = lay.stripY / 2; cy <= (lay.stripY + lay.sliceRows) / 2; ++cy)
+      for (UINT cx = 0; cx < w / 2; ++cx) {
+        CHECK(out[uv + size_t(cy) * w + cx * 2] == 128);
+        CHECK(out[uv + size_t(cy) * w + cx * 2 + 1] == 128);
+      }
+
+    // DEPTH_VALID clear: with no map the strip is written black.
+    Nv12DepthOverlay blackOv = ov;
+    blackOv.map = nullptr;
+    ID3D11Texture2D* cleared = nullptr;
+    CHECK(SUCCEEDED(converter.ConvertToTexture(ring.SlotSrv(slot), w, h, w, lay.codedHeight,
+                                               ChromaFilter::Box2x2, &cleared, &blackOv)));
+    CHECK(SUCCEEDED(converter.Readback(cleared, out)));
+    for (UINT y = lay.stripY; y < lay.stripY + lay.sliceRows; ++y)
+      for (UINT x = 0; x < lay.mapWidth * lay.slices; ++x)
+        CHECK(out[size_t(y) * w + x] == 0);
+    puts("GPU embedded depth strip packing passed");
   }
 }
