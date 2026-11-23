@@ -160,6 +160,69 @@ drives a scripted headset through pairing and the code comparison, flow binding,
 negotiation, media datagrams with FEC rebuild and NACK recovery, ping, input translation, a stale
 session being refused, and disconnect.
 
+## Phantom Blade Zero game depth
+
+The Windows host can stream Phantom Blade Zero's D3D12 scene depth to the
+Vision Pro Debug client's live 3D view. The game-side ReShade add-on supplies
+both the back buffer and the scene-depth map from the same render callback.
+
+Build the optional add-on against the [ReShade 6.8.0 SDK](https://github.com/crosire/reshade/tree/v6.8.0).
+From this repository's root, with the Windows prerequisites already installed:
+
+```powershell
+git clone --depth 1 --branch v6.8.0 https://github.com/crosire/reshade.git .local/reshade-v6.8.0
+$sdk = (Resolve-Path .local/reshade-v6.8.0).Path
+windows\devcmd.cmd cmake --preset amd "-DWVD_RESHADE_SDK_DIR=$sdk"
+windows\devcmd.cmd cmake --build --preset amd
+```
+
+1. Install [ReShade with full add-on support](https://reshade.me/#download) for
+   DirectX 12 on the Steam install's `PBZ\platform\steam\PBZ.exe`. Use the
+   game executable rather than the smaller `PBZ\steam\PBZ.exe` launcher.
+2. Copy `windows/build/game-depth/NDisplayGameDepth.addon64` next to the
+   game executable. Copy `NDisplayGameDepth.addonfx` from the same build
+   folder into an effect search directory in `ReShade.ini`. For
+   `EffectSearchPaths=.\reshade-shaders\Shaders\**`, use
+   `reshade-shaders\Shaders` next to the game executable. Keep **Generic
+   Depth** enabled in ReShade's Add-ons tab.
+3. Run the freshly built host. Choose the display the game fills and enable
+   **Use game depth for headset 3D** before starting the host. The
+   equivalent CLI option is `ndisplay stream --game-depth`.
+4. Play in borderless fullscreen on the selected display. For the initial
+   gameplay check, use SDR, native render resolution and no frame generation.
+   On the headset, turn on 3D for that display and check **Depth source** in
+   the statistics panel. A working connection shows **game depth from host**.
+
+The add-on is for opted-in single-player games. It exports only while the
+game is in the foreground on the selected display, running on the host's
+capture adapter, and the headset requests depth. Supported back buffers are
+8-bit SDR or SDR presented through a 10-bit swap chain, up to 8,294,400
+pixels. The current bridge uses fenced readback and local shared memory.
+When no current scene map is available the video continues and the client
+can use ZipDepth. A log line reading `game depth source attached` confirms
+that the host has received game depth.
+
+## Stream a side-by-side source
+
+1. Configure your stereo renderer to put both eyes on a display that the host can share.
+   For full side-by-side, use 5120×1440 for 2560×1440 per eye or 7680×2160 for 3840×2160
+   per eye. A half side-by-side source can use a 2560×1440 or 3840×2160 display.
+2. Select that display in the Windows host. Set **Stereo layout** to match the source,
+   then start the host. The CLI equivalent for a full side-by-side source is
+   `ndisplay stream --stereo-layout sbs`. Use `sbs-half` when the source is already squeezed.
+   Use **Stereo output resolution** to cap the packed frame independently of the desktop.
+   **2560 × 1440 · half side by side** sends two 1280×1440 eye images, which Vision Pro
+   stretches horizontally for presentation. **5120 × 1440 · full side by side** keeps
+   2560×1440 samples per eye when the source and encoder support it.
+3. In the headset app, use the display's **3D from** setting and select the streamed
+   layout if your build requires manual selection. The host logs when it switches a
+   full side-by-side source to half side-by-side. Choose **Half side-by-side** in that case.
+
+Full side-by-side defaults to a 16,588,800-pixel encode budget. At 7680×2160, it is
+capped at 60 fps and requests HEVC Level 6. If the encoder or the headset cannot
+take the full picture, the host squeezes each eye horizontally and keeps both eyes
+in a half side-by-side frame. Its bitrate ceiling uses the existing setting.
+
 ## Run for testing
 
 Open the desktop control panel from the repository root:
@@ -303,7 +366,9 @@ shows `gpu-texture` or `cpu-copy`.
 | `--bitrate KBPS` | 60000 | Ceiling. The target drops while the link is behind and climbs back afterwards |
 | `--min-bitrate KBPS` | ceiling / 8 | Floor for that adaptation |
 | `--fixed-bitrate` | off | Keep the target at `--bitrate` |
-| `--max-pixels N` | 8294400 | Largest encoded picture (3840×2160). A bigger desktop is scaled to fit, keeping its aspect ratio; `0` encodes at desktop size |
+| `--max-pixels N` | 8294400, or 16588800 for full SBS | Largest encoded picture in pixels. `0` removes the host ceiling |
+| `--stereo-layout LAYOUT` | none | Tell the host the shared display's source layout: `sbs`, `sbs-half`, `top-bottom` or `top-bottom-half` |
+| `--stereo-size WIDTHxHEIGHT[:half-sbs]` | automatic | Cap the packed encode size without upscaling. `--stereo-layout sbs --stereo-size 2560x1440:half-sbs` squeezes a full SBS source to half SBS |
 | `--gop-sec N` | 0 | Periodic keyframe every N seconds. `0` = on demand only (first picture, recovery request, encoder switch) |
 | `--synthetic-size WxH` | 1280x720 | Size of the `--synthetic` test source |
 
@@ -362,8 +427,8 @@ new `MonitorLayout` and `CodecConfig` and its window takes the new shape.
   goes back to its configured mode. The headset remembers the last size per
   host and asks for it again on the next connection.
 * The WVD virtual monitor offers 16:9 (up to 3840×2160), 21:9 (2560×1080,
-  3440×1440, 5120×2160) and 32:9 (3840×1080, 5120×1440). Sizes over the encode
-  budget are marked "streamed scaled" in the menu.
+  3440×1440, 5120×2160) and 32:9 (2560×720, 3840×1080, 5120×1440, 7680×2160).
+  Sizes that require encoder scaling are marked "streamed scaled" in the menu.
 * A physical monitor offers what its driver lists, at its current refresh rate
   when that size supports it. Sizes below 1280×720 are left out, and a rotated
   monitor offers only its current mode.

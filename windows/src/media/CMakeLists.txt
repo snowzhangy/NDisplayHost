@@ -3,6 +3,7 @@ add_library(wvd_capture_core STATIC
   dx.cpp
   display_modes.cpp
   capture/dda_capture.cpp
+  depth/game_depth_capture.cpp
   depth/synthetic_depth.cpp
   preprocess/nv12_convert.cpp
   encode/factory.cpp
@@ -17,7 +18,7 @@ add_library(wvd_capture_core STATIC
   session/media_session.cpp
 )
 target_include_directories(wvd_capture_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(wvd_capture_core PUBLIC wvd_common d3d11 dxgi d3dcompiler dnsapi
+target_link_libraries(wvd_capture_core PUBLIC wvd_common wvd_wire_core d3d11 dxgi d3dcompiler dnsapi
   mfplat mfuuid ole32 oleaut32 uuid user32)
 
 if(DEFINED NVENC_INCLUDE_DIR)
@@ -30,3 +31,20 @@ endif()
 add_library(wvd_stream_role STATIC main.cpp discovery.cpp workstation.cpp)
 target_include_directories(wvd_stream_role PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(wvd_stream_role PUBLIC wvd_capture_core wvd_quic wtsapi32)
+
+# Optional ReShade SDK for the game-side D3D12 capture add-on.
+set(WVD_RESHADE_SDK_DIR "" CACHE PATH "ReShade 6.8.0 source root")
+if(WVD_RESHADE_SDK_DIR)
+  if(NOT EXISTS "${WVD_RESHADE_SDK_DIR}/include/reshade.hpp")
+    message(FATAL_ERROR "WVD_RESHADE_SDK_DIR must point to a ReShade source checkout")
+  endif()
+  add_library(NDisplayGameDepth MODULE depth/reshade/game_depth_addon.cpp)
+  target_include_directories(NDisplayGameDepth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(NDisplayGameDepth SYSTEM PRIVATE "${WVD_RESHADE_SDK_DIR}/include")
+  target_link_libraries(NDisplayGameDepth PRIVATE user32)
+  set_target_properties(NDisplayGameDepth PROPERTIES SUFFIX .addon64
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/game-depth"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/game-depth")
+  configure_file(depth/reshade/NDisplayGameDepth.addonfx
+    "${CMAKE_BINARY_DIR}/game-depth/NDisplayGameDepth.addonfx" COPYONLY)
+endif()

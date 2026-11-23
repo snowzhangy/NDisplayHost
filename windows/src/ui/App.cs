@@ -90,6 +90,8 @@ namespace WvdHost {
       };
       Find<Button>("StartButton").Click += async delegate { await Run(StartHost); };
       Find<Button>("RefreshDisplaysButton").Click += async delegate { await Run(delegate { return RefreshDisplays(false); }); };
+      Find<ComboBox>("StereoChoice").SelectionChanged += delegate { UpdateStereoSizes(); Refresh(); };
+      UpdateStereoSizes();
       Find<Button>("StopButton").Click += async delegate { await Run(controller.Stop); };
       Find<Button>("ReceiverButton").Click += async delegate { await Run(controller.ProbeListener); };
       Find<Button>("DisableInputButton").Click += async delegate { await Run(controller.DisableInput); };
@@ -139,15 +141,41 @@ namespace WvdHost {
     void Copy(string value, string message) {
       try { Clipboard.SetText(value); Footer(message); } catch { Footer("Clipboard is busy. Please try again."); }
     }
+    string StereoLayout {
+      get {
+        var item = Find<ComboBox>("StereoChoice").SelectedItem as ComboBoxItem;
+        return item == null ? "none" : (string)item.Tag;
+      }
+    }
+    void UpdateStereoSizes() {
+      var choices = Find<ComboBox>("StereoSizeChoice");
+      choices.Items.Clear();
+      choices.Items.Add(new ComboBoxItem { Content = "Automatic", Tag = "" });
+      bool fullSbs = StereoLayout == "sbs";
+      if (fullSbs || StereoLayout == "sbs-half") {
+        foreach (var size in new [] {"1280x720", "1920x1080", "2560x1440", "3840x2160"})
+          choices.Items.Add(new ComboBoxItem { Content = size.Replace("x", " × ") +
+            (fullSbs ? " · half side by side" : ""), Tag = size + (fullSbs ? ":half-sbs" : "") });
+        if (fullSbs)
+          foreach (var size in new [] {"2560x720", "3840x1080", "5120x1440", "7680x2160"})
+            choices.Items.Add(new ComboBoxItem { Content = size.Replace("x", " × ") +
+              " · full side by side", Tag = size });
+      }
+      choices.SelectedIndex = 0;
+    }
     HostOptions Options() {
       var display = Find<ComboBox>("DisplayChoice").SelectedIndex;
       var encoder = Find<ComboBox>("EncoderChoice").SelectedItem as ComboBoxItem;
+      var stereoSize = Find<ComboBox>("StereoSizeChoice").SelectedItem as ComboBoxItem;
       return new HostOptions { Display = display >= 0 && display < displays.Count ? displays[display] : "",
         Encoder = encoder == null ? "auto" : (string)encoder.Tag,
+        StereoLayout = StereoLayout,
+        StereoSize = stereoSize == null ? "" : (string)stereoSize.Tag,
         Fps = new [] {30,60,90}[Find<ComboBox>("FpsChoice").SelectedIndex],
         Bitrate = new [] {20000,40000,60000,80000}[Find<ComboBox>("BitrateChoice").SelectedIndex],
         AllowInput = Find<CheckBox>("AllowInput").IsChecked == true,
         ScreenOff = Find<CheckBox>("ScreenOff").IsChecked == true,
+        GameDepth = Find<CheckBox>("GameDepth").IsChecked == true,
         NoAudio = Find<CheckBox>("SendAudio").IsChecked != true };
     }
     async Task Run(Func<Task> action) {
@@ -286,8 +314,12 @@ namespace WvdHost {
       bool running = controller.Running, direct = controller.NetworkRunning;
       if (lastRunning && !running && !busy && !closing) Footer("The host exited. See Activity log, then start it again.");
       lastRunning = running;
-      foreach (string name in new [] {"DisplayChoice","FpsChoice","BitrateChoice","EncoderChoice"}) Find<ComboBox>(name).IsEnabled = ready && !running && !busy;
-      foreach (string name in new [] {"AllowInput","SendAudio","ScreenOff"}) Find<CheckBox>(name).IsEnabled = ready && !running && !busy;
+      bool canConfigure = ready && !running && !busy;
+      foreach (string name in new [] {"DisplayChoice","FpsChoice","BitrateChoice","EncoderChoice","StereoChoice"}) Find<ComboBox>(name).IsEnabled = canConfigure;
+      foreach (string name in new [] {"AllowInput","SendAudio","ScreenOff"}) Find<CheckBox>(name).IsEnabled = canConfigure;
+      Find<CheckBox>("GameDepth").IsEnabled = canConfigure && StereoLayout == "none";
+      Find<ComboBox>("StereoSizeChoice").IsEnabled =
+        canConfigure && (StereoLayout == "sbs" || StereoLayout == "sbs-half");
       Find<Button>("StartButton").IsEnabled = ready && !running && !busy;
       Find<Button>("RefreshDisplaysButton").IsEnabled = ready && !running && !busy;
       Find<Button>("StopButton").IsEnabled = (running || controller.InputAvailable) && !busy;

@@ -16,6 +16,43 @@ namespace {
 // Encoding waits while this many encoded pictures are still queued for the
 // wire (SessionConfig::backpressureMs bounds the wait).
 constexpr size_t kSendBackpressureDepth = 2;
+constexpr uint64_t kDesktopEncodePixels = 3840ull * 2160;
+
+void FitToBounds(uint32_t& width, uint32_t& height, uint32_t maxWidth, uint32_t maxHeight) {
+  if (maxWidth && width > maxWidth &&
+      (!maxHeight || uint64_t(maxWidth) * height <= uint64_t(maxHeight) * width)) {
+    height = uint32_t(uint64_t(height) * maxWidth / width);
+    width = maxWidth;
+  } else if (maxHeight && height > maxHeight) {
+    width = uint32_t(uint64_t(width) * maxHeight / height);
+    height = maxHeight;
+  }
+}
+
+bool FullStereoNeedsHevc(const StereoEncodePlan& plan) {
+  return (plan.layout == msg::StereoLayout::SideBySide ||
+          plan.layout == msg::StereoLayout::TopBottom) &&
+         (plan.width > 4096 || plan.height > 2304 ||
+          uint64_t(plan.width) * plan.height > kDesktopEncodePixels);
+}
+
+uint32_t StereoHevcLevel(const StereoEncodePlan& plan) {
+  if (plan.layout == msg::StereoLayout::None) return 0;
+  constexpr uint64_t kLevel5PictureSamples = 8912896;
+  constexpr uint64_t kLevel5SampleRate = 267386880;
+  const uint64_t samples = uint64_t(plan.width) * plan.height;
+  const uint64_t sampleRate = samples * plan.fps;
+  // ITU-T H.265 Annex A. Supply levels for the wide and high-rate cases
+  // where a hardware MFT can default to a level below the stream's rate.
+  if (samples <= kLevel5PictureSamples) {
+    if (sampleRate <= kLevel5SampleRate) return 0;
+    if (sampleRate <= 2 * kLevel5SampleRate) return 153;  // 5.1
+    if (sampleRate <= 4 * kLevel5SampleRate) return 156;  // 5.2
+  }
+  if (sampleRate <= 4 * kLevel5SampleRate) return 180;    // 6
+  if (sampleRate <= 8 * kLevel5SampleRate) return 183;    // 6.1
+  return 186;                                            // 6.2
+}
 
 // RAII over a CRITICAL_SECTION (the re-entrant side of the encoder lock).
 struct CsGuard {
@@ -23,6 +60,30 @@ struct CsGuard {
   ~CsGuard() { LeaveCriticalSection(&cs_); }
   CRITICAL_SECTION& cs_;
 };
+
+void NormalizeDepthMap(const DepthFrame& map, uint32_t width, uint32_t height,
+                       const uint8_t* lut, std::vector<uint8_t>& output) {
+  output.resize(size_t(width) * height);
+  if (width == map.mapWidth && height == map.mapHeight) {
+    for (size_t i = 0; i < output.size(); ++i) output[i] = lut[map.v[i]];
+    return;
+  }
+  // The game's back buffer can be larger than the colour encode size.
+  // Preserve foreground geometry when reducing its depth map to fit.
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint32_t y0 = y * map.mapHeight / height;
+    const uint32_t y1 = (std::max)(y0 + 1, (y + 1) * map.mapHeight / height);
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint32_t x0 = x * map.mapWidth / width;
+      const uint32_t x1 = (std::max)(x0 + 1, (x + 1) * map.mapWidth / width);
+      uint16_t nearest = 0;
+      for (uint32_t row = y0; row < y1; ++row)
+        for (uint32_t col = x0; col < x1; ++col)
+          nearest = (std::max)(nearest, map.v[size_t(row) * map.mapWidth + col]);
+      output[size_t(y) * width + x] = lut[nearest];
+    }
+  }
+}
 }  // namespace
 
 void FitEncodeSize(uint32_t srcW, uint32_t srcH, uint64_t maxPixels, uint32_t& outW,
@@ -33,6 +94,97 @@ void FitEncodeSize(uint32_t srcW, uint32_t srcH, uint64_t maxPixels, uint32_t& o
   const double scale = std::sqrt(double(maxPixels) / (double(srcW) * double(srcH)));
   outW = (std::max)(2u, uint32_t(double(srcW) * scale) & ~1u);
   outH = (std::max)(2u, uint32_t(double(srcH) * scale) & ~1u);
+}
+
+StereoEncodePlan PlanStereoEncode(uint32_t width, uint32_t height, uint32_t fps,
+                                  msg::StereoLayout layout, uint64_t maxPixels,
+                                  VideoDecodeLimits limits, bool forceHalfSbs,
+                                  StereoOutputSize output) {
+  using msg::StereoLayout;
+  if (!fps) fps = 60;
+  if (layout == StereoLayout::SideBySide) {
+    uint32_t fullWidth = width, fullHeight = height;
+    FitToBounds(fullWidth, fullHeight, output.width, output.height);
+    const uint64_t pixels = uint64_t(fullWidth) * fullHeight;
+    const uint32_t fullRate = pixels > kDesktopEncodePixels ? (std::min)(fps, 60u) : fps;
+    if (!forceHalfSbs && !output.halfSbs && (!maxPixels || pixels <= maxPixels) &&
+        (!limits.width || fullWidth <= limits.width) &&
+        (!limits.height || fullHeight <= limits.height) &&
+        (!limits.pixelsPerSecond || pixels <= limits.pixelsPerSecond / fullRate)) {
+      width = fullWidth;
+      height = fullHeight;
+      fps = fullRate;
+    } else {
+      width /= 2;   // full height, half the horizontal samples in each eye
+      layout = StereoLayout::SideBySideHalf;
+      FitToBounds(width, height, output.halfSbs ? output.width : output.width / 2,
+                  output.height);
+    }
+  } else {
+    FitToBounds(width, height, output.width, output.height);
+  }
+  if (limits.pixelsPerSecond) {
+    const uint64_t peerPixels = limits.pixelsPerSecond / fps;
+    // FitEncodeSize uses zero for no cap; keep a nonzero budget if the
+    // peer reports fewer samples per second than the requested frame rate.
+    maxPixels = maxPixels ? (std::min)(maxPixels, (std::max)(1ull, peerPixels))
+                          : (std::max)(1ull, peerPixels);
+  }
+  FitToBounds(width, height, limits.width, limits.height);
+  FitEncodeSize(width, height, maxPixels, width, height);
+  // A 4:2:0 chroma sample spans two pixels. Each eye must start on an
+  // even coordinate so chroma never straddles the seam during conversion.
+  if (layout == StereoLayout::SideBySide || layout == StereoLayout::SideBySideHalf)
+    width &= ~3u;
+  else
+    height &= ~3u;
+  return {width, height, fps, layout};
+}
+
+StereoEncodePlan MediaSession::ChooseEncodePlan(UINT width, UINT height, bool forceHalfSbs) const {
+  const auto layout = cfg_.stereoLayout;
+  const uint32_t fps = cfg_.fps ? cfg_.fps : 60;
+  const uint64_t maxPixels = cfg_.maxEncodePixels.value_or(
+      layout == msg::StereoLayout::SideBySide ? 2 * kDesktopEncodePixels : kDesktopEncodePixels);
+  if (layout == msg::StereoLayout::None) {
+    FitEncodeSize(width, height, maxPixels, width, height);
+    return {width, height, fps, layout};
+  }
+  const VideoDecodeLimits limits = channel_ ? channel_->GetVideoDecodeLimits() : VideoDecodeLimits{};
+  const bool h264 = cfg_.codec == "h264" || cfg_.codec == "mf-sw-h264";
+  auto plan = PlanStereoEncode(width, height, fps, layout, maxPixels, limits, forceHalfSbs,
+                               cfg_.stereoOutputSize);
+  if (h264 && layout == msg::StereoLayout::SideBySide && FullStereoNeedsHevc(plan))
+    plan = PlanStereoEncode(width, height, fps, layout, maxPixels, limits, true,
+                            cfg_.stereoOutputSize);
+  return plan;
+}
+
+void MediaSession::ConfigureEncodeSizeLocked(UINT width, UINT height, bool forceHalfSbs) {
+  const auto plan = ChooseEncodePlan(width, height, forceHalfSbs);
+  encSourceW_ = width;
+  encSourceH_ = height;
+  encDesc_.width = encColorW_ = plan.width;
+  encDesc_.height = encColorH_ = plan.height;
+  encDesc_.fpsNum = plan.fps;
+  encDesc_.hevcOnly = FullStereoNeedsHevc(plan);
+  encDesc_.hevcLevel = StereoHevcLevel(plan);
+  encodedStereoLayout_ = plan.layout;
+  encodeRateLimit_ = plan.layout != msg::StereoLayout::None ? plan.fps : 0;
+  if (cfg_.stereoLayout == msg::StereoLayout::SideBySide &&
+      plan.layout == msg::StereoLayout::SideBySideHalf)
+    WVD_LOGI("stereo: half side-by-side from %ux%u, encoding %ux%u@%u", width, height,
+             plan.width, plan.height, plan.fps);
+}
+
+bool MediaSession::FallbackToHalfSbsLocked(UINT width, UINT height) {
+  if (encodedStereoLayout_ != msg::StereoLayout::SideBySide) return false;
+  WVD_LOGW("encoder could not stream full side-by-side at %ux%u@%u; trying half side-by-side",
+           encDesc_.width, encDesc_.height, encDesc_.fpsNum);
+  ConfigureEncodeSizeLocked(width, height, true);
+  if (!RecreateEncoderLocked()) return false;
+  forceFullFrame_ = true;
+  return true;
 }
 
 MediaSession::MediaSession(SessionConfig cfg, GenCounters& gens)
@@ -142,25 +294,19 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
 
   // Encoder (§4.6 tiers). It shares the capture device, so hardware tiers
   // take the converted texture directly.
-  FitEncodeSize(w, h, cfg_.maxEncodePixels, encDesc_.width, encDesc_.height);
+  ConfigureEncodeSizeLocked(w, h);
   if (encDesc_.width != w || encDesc_.height != h)
-    WVD_LOGI("encode size %ux%u for a %ux%u source (pixel budget %llu)", encDesc_.width,
-             encDesc_.height, w, h, (unsigned long long)cfg_.maxEncodePixels);
-  // Remember the COLOUR encode size; with depth packing the codec's height
-  // grows to the coded size (guard band + strip), the colour fit does not.
-  encColorW_ = encDesc_.width;
-  encColorH_ = encDesc_.height;
-  // H1 depth source (§8): the synthetic test pattern. A hook (H2+) attaches
-  // its own here; packing additionally needs the headset's capability and
-  // request (§3.3).
-  if (cfg_.depthTestPattern) {
+    WVD_LOGI("encode size %ux%u for a %ux%u source", encDesc_.width, encDesc_.height, w, h);
+  if (cfg_.stereoLayout == msg::StereoLayout::None && cfg_.depthTestPattern) {
     depthSrc_ = std::make_unique<SyntheticDepthSource>(cfg_.depthTestDropEvery);
     WVD_LOGI("depth: synthetic test source attached (--depth-test-pattern%s); packing waits "
              "for the headset's request",
              cfg_.depthTestDropEvery ? ", with DEPTH_VALID gaps" : "");
     depthEval_.store(true);
+  } else if (cfg_.stereoLayout == msg::StereoLayout::None && cfg_.gameDepth && dda_) {
+    gameDepth_ = std::make_unique<GameDepthCapture>();
+    WVD_LOGI("game depth enabled: waiting for a headset request and a full-screen game with the NDisplay add-on");
   }
-  encDesc_.fpsNum = cfg_.fps ? cfg_.fps : 60;
   encDesc_.fpsDen = 1;
   encDesc_.preferQuality = !channel_ || channel_->PreferVideoQuality();
   encDesc_.bitrateKbps = cfg_.bitrateKbps;
@@ -176,6 +322,7 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
   {
     std::lock_guard<std::mutex> lk(encMutex_);
     encoder_ = CreateBestEncoder(encDesc_, &encoderName_);
+    if (!encoder_) FallbackToHalfSbsLocked(w, h);
     codecConfigPending_ = true;
     csd_.clear();
   }
@@ -231,15 +378,15 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
   // CodecConfig is queued by the encode thread right before the first picture
   // (it needs the encoder's parameter sets).
 
-  thCapture_ = std::thread([this] { synthetic ? CaptureSynthetic() : CaptureDda(); });
-  thEncode_ = std::thread([this] { EncodeLoop(); });
-  thSend_ = std::thread([this] { SendLoop(); });
-  if (channel_) thRecv_ = std::thread([this] { RecvLoop(); });
   WVD_LOGI("media session started: source %ux%u, encode %ux%u@%u enc=%s input=%s "
            "sessionGen=%llu",
            w, h, encDesc_.width, encDesc_.height, encDesc_.fpsNum, encoderName_.c_str(),
            encoder_->zeroCopy() ? "gpu-texture" : "cpu-copy",
            (unsigned long long)gens_.sessionGen.load());
+  thCapture_ = std::thread([this] { synthetic ? CaptureSynthetic() : CaptureDda(); });
+  thEncode_ = std::thread([this] { EncodeLoop(); });
+  thSend_ = std::thread([this] { SendLoop(); });
+  if (channel_) thRecv_ = std::thread([this] { RecvLoop(); });
   return S_OK;
 }
 
@@ -344,7 +491,7 @@ void MediaSession::BuildLayoutLocked(UINT w, UINT h) {
     m.width = w;
     m.height = h;
     m.dpiX = m.dpiY = 96;
-    if (synthetic) m.refreshMilliHz = encDesc_.fpsNum * 1000;
+    if (synthetic) m.refreshMilliHz = (cfg_.fps ? cfg_.fps : 60) * 1000;
     m.primary = 1;
     list.push_back(m);
     captureIndex = 0;
@@ -386,8 +533,15 @@ void MediaSession::SendDisplayModesLocked(uint32_t requestId, ModeChangeStatus s
   const uint16_t index = captureMonitorIndex_.load();
   auto describe = [&](uint32_t mw, uint32_t mh, uint32_t hz, bool current, bool native) {
     uint32_t flags = (current ? kModeCurrent : 0u) | (native ? kModeNative : 0u);
-    if (cfg_.maxEncodePixels && uint64_t(mw) * mh > cfg_.maxEncodePixels)
-      flags |= kModeScaledForEncode;
+    auto plan = ChooseEncodePlan(mw, mh);
+    if (current) {
+      std::lock_guard<std::mutex> lk(encMutex_);
+      if (mw == encSourceW_ && mh == encSourceH_) {
+        plan.width = encColorW_;
+        plan.height = encColorH_;
+      }
+    }
+    if (plan.width != mw || plan.height != mh) flags |= kModeScaledForEncode;
     list.push_back(DisplayModeDesc{mw, mh, hz * 1000u, flags});
   };
   std::vector<DisplayModeInfo> modes;
@@ -520,6 +674,7 @@ void MediaSession::QueueCodecConfigLocked() {
     w.Append(cc);
     w.Append(depthLayout_);
   } else {
+    cc.reserved |= uint8_t(uint32_t(encodedStereoLayout_) << kCodecConfigStereoShift);
     w.Append(cc);
   }
   w.AppendBytes(csd_.data(), csd_.size());
@@ -533,9 +688,7 @@ bool MediaSession::ReconfigureEncoder(UINT width, UINT height) {
   std::lock_guard<std::mutex> lk(encMutex_);
   CsGuard cs(encCs_);
   if (!encoder_) return false;
-  FitEncodeSize(width, height, cfg_.maxEncodePixels, encColorW_, encColorH_);
-  encDesc_.width = encColorW_;
-  encDesc_.height = encColorH_;
+  ConfigureEncodeSizeLocked(width, height);
   // A size change is already a new codec generation: keep packing when it is
   // still wanted, re-derived for the new colour size (§3.3: the layout
   // changing IS a generation change, which this already is).
@@ -550,6 +703,14 @@ bool MediaSession::ReconfigureEncoder(UINT width, UINT height) {
     depthLayout_ = {};
     encDesc_.bitrateKbps = cfg_.bitrateKbps;
   }
+  if (RecreateEncoderLocked()) return true;
+  if (!depthPacking_) return FallbackToHalfSbsLocked(width, height);
+  WVD_LOGW("depth strip unavailable at %ux%u; retrying the colour size",
+           encDesc_.width, encDesc_.height);
+  depthPacking_ = false;
+  depthLayout_ = {};
+  encDesc_.height = encColorH_;
+  encDesc_.bitrateKbps = cfg_.bitrateKbps;
   return RecreateEncoderLocked();
 }
 
@@ -558,32 +719,35 @@ bool MediaSession::ReconfigureEncoder(UINT width, UINT height) {
 // is attached. Never because the capability alone is set.
 bool MediaSession::DepthWantedLocked(EmbeddedDepthPayload& layout) {
   layout = {};
-  if (!channel_ || !depthSrc_ || !clientDepthCap_.load()) return false;
-  const uint16_t idx = captureMonitorIndex_.load();
-  bool requested = false;
-  {
-    std::lock_guard<std::mutex> lk(depthReqMutex_);
-    requested = std::find(depthMonitorsReq_.begin(), depthMonitorsReq_.end(), idx) !=
-                depthMonitorsReq_.end();
-  }
-  if (!requested) return false;
-  if (!ComputeEmbeddedDepth(encColorW_, encColorH_, layout)) return false;
-  // §4: the strip counts against the headset's decode budget
-  // (DecoderCaps.max_pixel_rate), colour + strip together.
-  const uint64_t budget = channel_->MaxVideoPixelsPerSec();
-  const uint32_t fps = EffectiveFrameRate();
-  if (budget && uint64_t(layout.pictureWidth) * layout.codedHeight * fps > budget) {
-    WVD_LOGI("depth: not packing — coded %ux%u@%u exceeds the headset's decode budget "
-             "(%llu samples/s)",
-             layout.pictureWidth, layout.codedHeight, fps, (unsigned long long)budget);
+  return (depthSrc_ || gameDepthAttached_.load()) && DepthRequested() &&
+         DepthLayoutFits(encColorW_, encColorH_, layout);
+}
+
+bool MediaSession::DepthRequested() {
+  if (cfg_.stereoLayout != msg::StereoLayout::None || !channel_ || !clientDepthCap_.load())
     return false;
-  }
-  return true;
+  const uint16_t idx = captureMonitorIndex_.load();
+  std::lock_guard<std::mutex> lk(depthReqMutex_);
+  return std::find(depthMonitorsReq_.begin(), depthMonitorsReq_.end(), idx) !=
+         depthMonitorsReq_.end();
+}
+
+bool MediaSession::DepthLayoutFits(uint32_t width, uint32_t height,
+                                  EmbeddedDepthPayload& layout) const {
+  if (!ComputeEmbeddedDepth(width, height, layout)) return false;
+  const auto limits = channel_->GetVideoDecodeLimits();
+  return (!limits.width || layout.pictureWidth <= limits.width) &&
+         (!limits.height || layout.codedHeight <= limits.height) &&
+         (!limits.pixelsPerSecond ||
+          uint64_t(layout.pictureWidth) * layout.codedHeight <=
+              limits.pixelsPerSecond / EffectiveFrameRate());
 }
 
 // The strip costs roughly 10% more bits while packing (§4; measured in H1).
 uint32_t MediaSession::DepthBitrateLocked() const {
-  return cfg_.bitrateKbps + cfg_.bitrateKbps / 10;
+  const uint64_t raised = uint64_t(cfg_.bitrateKbps) * 11 / 10;
+  const uint32_t limit = channel_->VideoBitrateLimitKbps();
+  return uint32_t((std::min)(raised, uint64_t(limit ? limit : UINT32_MAX)));
 }
 
 // Encode thread, encMutex_ held: honour a depth request/capability change as
@@ -618,8 +782,12 @@ void MediaSession::UpdateDepthPackingLocked() {
     depthLayout_ = {};
     encDesc_.height = encColorH_;
     encDesc_.bitrateKbps = cfg_.bitrateKbps;
-    RecreateEncoderLocked();
+    if (RecreateEncoderLocked()) {
+      forceFullFrame_ = true;
+      return;
+    }
   }
+  stopReq_ = true;
 }
 
 // Capture thread: feed the depth source for the frame it just captured. The
@@ -647,9 +815,11 @@ void MediaSession::PostDepthFrame(int64_t qpc, int32_t ptrX, int32_t ptrY) {
 // newest, and the encoder is never more than a frame or two behind.
 void MediaSession::RecordFrameIdentity(uint64_t ringSeq, uint64_t contentVer,
                                        int64_t qpcCapture, bool refinement,
-                                       uint32_t videoEpoch) {
+                                       uint32_t videoEpoch,
+                                       std::shared_ptr<const DepthFrame> gameDepth) {
   std::lock_guard<std::mutex> lk(identMutex_);
-  idents_.push_back(FrameIdentity{ringSeq, contentVer, qpcCapture, refinement, videoEpoch});
+  idents_.push_back(FrameIdentity{ringSeq, contentVer, qpcCapture, refinement, videoEpoch,
+                                  std::move(gameDepth)});
   while (idents_.size() > 16) idents_.pop_front();
 }
 
@@ -685,8 +855,10 @@ bool MediaSession::RecreateEncoderLocked() {
 
 uint32_t MediaSession::EffectiveFrameRate() const {
   const uint32_t host = cfg_.fps ? cfg_.fps : 60;
+  const uint32_t encodeLimit = encodeRateLimit_.load();
+  const uint32_t rate = encodeLimit ? encodeLimit : host;
   const uint32_t limit = channel_ ? channel_->VideoFrameRateLimit() : 0;
-  return limit ? (std::min)(host, limit) : host;
+  return limit ? (std::min)(rate, limit) : rate;
 }
 
 // ---------------------------------------------------------------------------
@@ -716,10 +888,12 @@ bool MediaSession::CaptureDda() {
   bool lastQuality = !channel_ || channel_->PreferVideoQuality();
   int64_t nextPictureQpc = 0;
   int64_t lastActivityQpc = startedQpc;
+  bool retainedGameFrame = false;
 
   while (!stopReq_) {
     const uint32_t epoch = VideoEpoch();
     if (!(epoch & 1u)) {
+      if (gameDepth_) gameDepth_->StopRequest();
       if (WaitOnStop(25)) break;
       continue;
     }
@@ -747,38 +921,68 @@ bool MediaSession::CaptureDda() {
       forceFullFrame_ = true;
     }
     const uint32_t hostRate = cfg_.fps ? cfg_.fps : 60;
-    const int64_t pictureInterval = MsToQpc(1000.0 / rate * (rate < hostRate ? 1.0 : 0.97));
+    const bool allowSlack = !encodeRateLimit_.load() && rate == hostRate;
+    const int64_t pictureInterval = MsToQpc(1000.0 / rate * (allowSlack ? 0.97 : 1.0));
     if (QpcNow() < nextPictureQpc) {
       sleeper.SleepUntilQpc((std::min)(nextPictureQpc, QpcNow() + MsToQpc(20)));
       continue;
     }
     CapturedFrame f;
+    std::shared_ptr<const DepthFrame> gameMap;
+    bool gameFrame = false;
+    if (gameDepth_) {
+      const auto plan = ChooseEncodePlan(ring_.width(), ring_.height());
+      EmbeddedDepthPayload layout{};
+      if (DepthRequested() && DepthLayoutFits(plan.width, plan.height, layout)) {
+        gameFrame = gameDepth_->Capture(outputInfo_.desktopCoords, outputInfo_.adapterLuid,
+                                        rate, ring_, f, gameMap);
+      } else {
+        gameDepth_->StopRequest();
+      }
+      const int64_t now = QpcNow();
+      const bool attached = gameDepth_->Attached(now);
+      if (attached != gameDepthAttached_.exchange(attached)) {
+        depthEval_.store(true);
+        forceFullFrame_ = true;
+        WVD_LOGI("game depth source %s", attached ? "attached" : "detached");
+      }
+      if (!gameFrame && gameDepth_->HasRecentFrame(now)) {
+        sleeper.SleepMs(1.0);
+        continue;
+      }
+      if (!gameFrame && retainedGameFrame) {
+        oweFirstPicture = true;
+        forceFullFrame_ = true;
+      }
+    }
     // AcquireNextFrame can hold the driver's device lock while waiting. The
     // converter uses the same D3D device, so a blocking wait stalls conversion.
     // Poll without waiting and sleep outside DXGI on an unchanged desktop.
-    HRESULT hr = dda_->Acquire(0, f, forceFullFrame_.load());
+    HRESULT hr;
+    if (gameFrame) {
+      CapturedFrame cursor;
+      if (dda_->Acquire(0, cursor, false, true) == S_OK) f.pointer = std::move(cursor.pointer);
+      hr = S_OK;
+    } else {
+      hr = dda_->Acquire(0, f, forceFullFrame_.load());
+    }
     if (hr == S_OK) {
       reinitDelayMs = 100;
       lastActivityQpc = f.qpcCapture;
 
-      // Mirror the source content counter so the refinement timer and every
-      // generation-aware consumer see the same value the frames carry.
-      gens_.contentVer.store(f.contentVer);
+      // Keep one content counter across desktop and game capture.
+      f.contentVer = f.hadDirtyRects ? gens_.contentVer.fetch_add(1) + 1 : gens_.contentVer.load();
 
       if (f.copied) {
+        retainedGameFrame = gameFrame;
         {
           std::lock_guard<std::mutex> lk(statsMutex_);
           ++capFrames_;
           if (lastCaptureQpc_) captureGapMaxMs_ = (std::max)(captureGapMaxMs_, QpcDeltaMs(lastCaptureQpc_, f.qpcCapture));
           lastCaptureQpc_ = f.qpcCapture;
         }
-        ring_.Publish(f.ringSlot, ++publishSeq);
-        RecordFrameIdentity(publishSeq, f.contentVer, f.qpcCapture, false, epoch);
       }
 
-      // H1 test depth paired with this capture frame (§depth): the square
-      // rides the desktop pointer; DEPTH_VALID follows the source's own
-      // valid flag. Real hooks (H2+) pair by Present time instead.
       if (f.copied && depthSrc_) {
         if (f.pointer.positionUpdated) {
           depthPtrX_ = f.pointer.x;
@@ -786,6 +990,10 @@ bool MediaSession::CaptureDda() {
         }
         const RECT& dc = outputInfo_.desktopCoords;
         PostDepthFrame(f.qpcCapture, depthPtrX_ - dc.left, depthPtrY_ - dc.top);
+      }
+      if (f.copied) {
+        RecordFrameIdentity(++publishSeq, f.contentVer, f.qpcCapture, false, epoch, std::move(gameMap));
+        ring_.Publish(f.ringSlot, publishSeq);
       }
 
       // Cursor packets (shape on change + position) — §6.2.
@@ -824,9 +1032,10 @@ bool MediaSession::CaptureDda() {
       if (oweFirstPicture && now - startedQpc > MsToQpc(400)) {
         UINT bslot = 0;
         if (dda_->CaptureBootstrapFrame(bslot)) {
-          ring_.Publish(bslot, ++publishSeq);
           const uint64_t cv = gens_.contentVer.fetch_add(1) + 1;
-          RecordFrameIdentity(publishSeq, cv, now, false, epoch);
+          RecordFrameIdentity(++publishSeq, cv, now, false, epoch);
+          ring_.Publish(bslot, publishSeq);
+          retainedGameFrame = false;
           lastContentChangeQpc_ = now;
           CaptureWork cw{cv, now, false, true, epoch};
           if (encQueue_.Push(cw)) {
@@ -837,25 +1046,26 @@ bool MediaSession::CaptureDda() {
           }
         }
       }
-      if (!oweFirstPicture && forceFullFrame_.load() && ring_.RepublishNewest(++publishSeq)) {
+      if (!oweFirstPicture && forceFullFrame_.load()) {
         // A keyframe is owed (recovery request) but the desktop is still:
         // re-encode the retained frame so the IDR actually goes out.
-        forceFullFrame_ = false;
         const uint64_t rcv = gens_.contentVer.load();
-        RecordFrameIdentity(publishSeq, rcv, now, false, epoch);
-        CaptureWork cw{rcv, now, false, true, epoch};
-        encQueue_.Push(cw);
-        nextPictureQpc = now + pictureInterval;
-      } else if (lastContentChangeQpc_ && gens_.contentVer.load() != refinedContentVer_ &&
-                 now - lastContentChangeQpc_ > MsToQpc(cfg_.quietMsRefine) &&
-                 ring_.RepublishNewest(++publishSeq)) {
+        RecordFrameIdentity(++publishSeq, rcv, now, false, epoch);
+        if (ring_.RepublishNewest(publishSeq)) {
+          forceFullFrame_ = false;
+          encQueue_.Push(CaptureWork{rcv, now, false, true, epoch});
+          nextPictureQpc = now + pictureInterval;
+        }
+      } else if (!oweFirstPicture && lastContentChangeQpc_ &&
+                 gens_.contentVer.load() != refinedContentVer_ &&
+                 now - lastContentChangeQpc_ > MsToQpc(cfg_.quietMsRefine)) {
         // Refine the newest picture already sitting in the ring (§6.4). It has
         // to be re-offered: the encoder already consumed it once, and
         // AcquireLatest used to report "nothing new", so refinement never ran.
         const uint64_t cv = gens_.contentVer.load();
-        RecordFrameIdentity(publishSeq, cv, now, true, epoch);
-        CaptureWork cw{cv, now, true, false, epoch};
-        if (encQueue_.Push(cw)) refinedContentVer_ = cv;
+        RecordFrameIdentity(++publishSeq, cv, now, true, epoch);
+        if (ring_.RepublishNewest(publishSeq) && encQueue_.Push(CaptureWork{cv, now, true, false, epoch}))
+          refinedContentVer_ = cv;
       }
     } else {
       // ACCESS_LOST or any other failure: re-create with backoff (§4.1:
@@ -916,6 +1126,7 @@ bool MediaSession::CaptureDda() {
         }
       }
       dda_->SetRing(&ring_);
+      outputInfo_.desktopCoords = current.desktopCoords;
       forceFullFrame_ = true;  // new source → owe a full picture (§4.1)
       oweFirstPicture = true;  // ...and it may have to be bootstrapped again
       refinedContentVer_ = 0;
@@ -972,7 +1183,7 @@ bool MediaSession::CaptureSynthetic() {
 
     UINT slot = ring_.AcquireWriteSlot();
     ring_.WriteCpuFrame(slot, frame.data(), w * 4);
-    ring_.Publish(slot, ++n);
+    ++n;
 
     // Synthetic Separate pointer tracing a Lissajous path (§6.2 path).
     CapturedFrame cf;
@@ -1011,6 +1222,7 @@ bool MediaSession::CaptureSynthetic() {
     for (auto& p : cur) PushUrgent(std::move(p));
 
     RecordFrameIdentity(n, cf.contentVer, cf.qpcCapture, false, epoch);
+    ring_.Publish(slot, n);
     CaptureWork cw{cf.contentVer, cf.qpcCapture, false, false, epoch};
     encQueue_.Push(cw);
     {
@@ -1029,7 +1241,6 @@ bool MediaSession::CaptureSynthetic() {
 // ---------------------------------------------------------------------------
 
 bool MediaSession::ApplyBitrate(uint32_t kbps, const char* why) {
-  std::lock_guard<std::mutex> lk(encMutex_);
   if (!encoder_) return false;
   const uint32_t from = encDesc_.bitrateKbps;
   const HRESULT hr = encoder_->SetBitrate(kbps);
@@ -1056,7 +1267,6 @@ void MediaSession::EncodeLoop() {
 
   // Account for both application and MsQuic queues before encoding more.
   // Stale captures are superseded by the newest contents of the capture ring.
-  const int64_t frameQpc = MsToQpc(1000.0 / double(encDesc_.fpsNum));
   const uint32_t maxKbps = cfg_.bitrateKbps;
   const uint32_t minKbps = (std::min)(
       maxKbps, cfg_.minBitrateKbps ? cfg_.minBitrateKbps : (std::max)(1500u, maxKbps / 8));
@@ -1069,13 +1279,16 @@ void MediaSession::EncodeLoop() {
   const int64_t rateClock = QpcNow();
   auto updateRate = [&] {
     if (!canSetBitrate) return;
+    std::lock_guard<std::mutex> lk(encMutex_);
     const uint32_t peerLimit = channel_->VideoBitrateLimitKbps();
-    const uint32_t kbps = peerLimit ? (std::min)(peerLimit, linkRate.target()) : linkRate.target();
+    const uint64_t target = depthPacking_ ? uint64_t(linkRate.target()) * 11 / 10 : linkRate.target();
+    const uint32_t kbps = uint32_t((std::min)(uint64_t(peerLimit ? peerLimit : UINT32_MAX), target));
     if (kbps == appliedKbps) return;
     canSetBitrate = ApplyBitrate(kbps, peerLimit && kbps == peerLimit ?
                                       "headset bitrate limit" : "link queue pressure");
     if (canSetBitrate) appliedKbps = kbps;
   };
+  uint64_t lastSubmittedCodecGen = 0;
 
   while (!stopReq_) {
     auto work = encQueue_.Pop(std::chrono::milliseconds(100));
@@ -1089,8 +1302,11 @@ void MediaSession::EncodeLoop() {
 
     if (channel_) {
       const int64_t waitStart = QpcNow();
+      const uint32_t stereoRate = encodeRateLimit_.load();
+      const uint32_t encoderRate = stereoRate ? stereoRate : (cfg_.fps ? cfg_.fps : 60);
       const size_t transportBudget = (std::max)(size_t(64 * 1024),
-          size_t(appliedKbps) * 250 / (std::max)(1u, cfg_.fps));
+          size_t(appliedKbps) * 250 / encoderRate);
+      const int64_t frameQpc = MsToQpc(1000.0 / encoderRate);
       const int64_t waitBudget = MsToQpc(double(cfg_.backpressureMs));
       while (!stopReq_) {
         const int64_t elapsed = QpcNow() - waitStart;
@@ -1137,6 +1353,7 @@ void MediaSession::EncodeLoop() {
     UINT slot;
     uint64_t ringSeq;
     if (!ring_.AcquireLatest(slot, ringSeq)) continue;
+    FrameRing::ReadSlot readSlot{ring_, slot};
 
     // The texture, its capture stamp and its depth pair through the identity
     // the capture thread attached to THIS published frame — never through
@@ -1144,12 +1361,13 @@ void MediaSession::EncodeLoop() {
     // AcquireLatest, which would pair frame B's colour with frame A's depth
     // and mark it DEPTH_VALID.
     FrameIdentity fi;
-    if (!FindFrameIdentity(ringSeq, fi)) continue;
+    if (!FindFrameIdentity(ringSeq, fi) || fi.videoEpoch != VideoEpoch()) continue;
 
     if (!converterReady_) continue;
 
     EncodedAu au;
     bool encSwitchFailed = false;
+    bool stereoFellBack = false;
     uint64_t codecGen = 0;
     double convMs = 0;
     bool depthValidPic = false;
@@ -1161,15 +1379,18 @@ void MediaSession::EncodeLoop() {
       CsGuard cs(encCs_);  // the capture thread's TryEnter depth-layout read sees this window
       if (!encoder_) break;
       if (fi.videoEpoch != lastEpoch) {
-        lastEpoch = work->videoEpoch;
+        lastEpoch = fi.videoEpoch;
         forcedKeyPending = true;
       }
       const bool quality = !channel_ || channel_->PreferVideoQuality();
       if (quality != encDesc_.preferQuality) {
         encDesc_.preferQuality = quality;
         if (!RecreateEncoderLocked()) {
-          stopReq_ = true;
-          break;
+          stereoFellBack = FallbackToHalfSbsLocked(ring_.width(), ring_.height());
+          if (!stereoFellBack) {
+            stopReq_ = true;
+            break;
+          }
         }
         forcedKeyPending = true;
       }
@@ -1192,9 +1413,9 @@ void MediaSession::EncodeLoop() {
         overlay.slices = depthLayout_.slices;
         overlay.mapWidth = depthLayout_.mapWidth;
         overlay.mapHeight = depthLayout_.mapHeight;
-        if (depthSrc_ && depthSrc_->Find(fi.qpcCapture, df) && df.valid &&
-            df.mapWidth == depthLayout_.mapWidth &&
-            df.mapHeight == depthLayout_.mapHeight) {
+        const DepthFrame* map = fi.gameDepth.get();
+        if (!map && depthSrc_ && depthSrc_->Find(fi.qpcCapture, df) && df.valid) map = &df;
+        if (map) {
           // Percentile normalisation (§5): raw 16-bit inverse depth →
           // full-range 8-bit strip texels through a smoothed interval.
           const int64_t nowQpc = QpcNow();
@@ -1203,13 +1424,11 @@ void MediaSession::EncodeLoop() {
                   ? QpcDeltaMs(lastDepthNormQpc_, nowQpc) / 1000.0
                   : 1.0 / double(encDesc_.fpsNum ? encDesc_.fpsNum : 60);
           lastDepthNormQpc_ = nowQpc;
-          depthNorm_.Observe(df.v.data(), df.v.size(), dt);
+          depthNorm_.Observe(map->v.data(), map->v.size(), dt);
           const uint8_t* lut = depthNorm_.Lut();
-          normalized.resize(df.v.size());
-          for (size_t i = 0; i < df.v.size(); ++i) normalized[i] = lut[df.v[i]];
+          NormalizeDepthMap(*map, depthLayout_.mapWidth, depthLayout_.mapHeight, lut, normalized);
           overlay.map = normalized.data();
           depthValidPic = true;
-          ++depthValidFrames_;
         }
         ovPtr = &overlay;  // map == nullptr → the pass writes a black strip
       }
@@ -1244,6 +1463,11 @@ void MediaSession::EncodeLoop() {
       sp.depthValid = depthValidPic;  // travels with the picture through a
                                       // pipelined encoder to its own header
 
+      const uint64_t currentCodecGen = gens_.codecGen.load();
+      if (currentCodecGen != lastSubmittedCodecGen) {
+        lastSubmittedCodecGen = currentCodecGen;
+        forcedKeyPending = true;
+      }
       if (forcedKeyPending) encoder_->ForceKeyframe();
       forcedKeyPending = false;
       hr = encoder_->Encode(sp, au);
@@ -1256,7 +1480,8 @@ void MediaSession::EncodeLoop() {
         encoder_.reset();
         auto next = CreateNextTier(failed, encDesc_, &encoderName_);
         if (!next) {
-          encSwitchFailed = true;
+          stereoFellBack = FallbackToHalfSbsLocked(ring_.width(), ring_.height());
+          encSwitchFailed = !stereoFellBack;
         } else {
           encoder_ = std::move(next);
           gens_.codecGen.fetch_add(1);
@@ -1265,6 +1490,10 @@ void MediaSession::EncodeLoop() {
           forcedKeyPending = true;
         }
         au.bytes.clear();
+      } else if (!au.bytes.empty() && codecConfigPending_ && !au.key) {
+        au.bytes.clear();
+        forcedKeyPending = true;
+        forceFullFrame_ = true;
       } else if (!au.bytes.empty() && encoder_->vendor() != Vendor::Test) {
         // Parameter sets: keep the newest, and make every keyframe
         // self-contained so a recovery IDR never depends on an old config.
@@ -1287,8 +1516,10 @@ void MediaSession::EncodeLoop() {
         if (csd_.empty()) csd_ = encoder_->codecPrivate();
       }
       if (!au.bytes.empty() && codecConfigPending_) QueueCodecConfigLocked();
+      if (!au.bytes.empty() && au.depthValid) ++depthValidFrames_;
       codecGen = gens_.codecGen.load();
     }
+    if (stereoFellBack && channel_) SendDisplayModes(0, ModeChangeStatus::None);
     {
       std::lock_guard<std::mutex> lk(statsMutex_);
       convTimesMs_.push_back(convMs);

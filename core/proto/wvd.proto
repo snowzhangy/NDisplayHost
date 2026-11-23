@@ -166,6 +166,15 @@ message CodecConfig {
   uint32 nal_length_size = 8;         // media payload NAL length prefix size; always 4
   uint32 frame_rate_mhz = 9;
   EmbeddedDepthLayout embedded_depth = 10;  // present when every picture of this codec_gen carries a depth strip
+  StereoLayout stereo_layout = 11;          // packed left/right images, mutually exclusive with embedded_depth
+}
+
+enum StereoLayout {
+  STEREO_NONE = 0;
+  STEREO_SIDE_BY_SIDE = 1;       // left eye in left half, full width per eye
+  STEREO_SIDE_BY_SIDE_HALF = 2;  // left eye in left half, half width per eye
+  STEREO_TOP_BOTTOM = 3;         // left eye in top half, full height per eye
+  STEREO_TOP_BOTTOM_HALF = 4;    // left eye in top half, half height per eye
 }
 
 // Depth travels inside the coded picture: a grayscale strip drawn under the colour

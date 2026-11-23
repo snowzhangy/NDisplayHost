@@ -279,7 +279,11 @@ void CodecConfig::write(pb::Writer& w) const {
   { pb::Writer c; color.write(c); w.msg(7, c); }
   w.u32(8, nalLengthSize);
   w.u32(9, frameRateMhz);
-  if (hasEmbeddedDepth) { pb::Writer d; embeddedDepth.write(d); w.msg(10, d, true); }
+  if (hasEmbeddedDepth) {
+    pb::Writer d; embeddedDepth.write(d); w.msg(10, d, true);
+  } else {
+    w.u32(11, static_cast<uint32_t>(stereoLayout));
+  }
 }
 bool CodecConfig::read(pb::Reader& r) {
   FIELD_LOOP() {
@@ -298,9 +302,17 @@ bool CodecConfig::read(pb::Reader& r) {
                  pb::Reader sub(p, n);
                  hasEmbeddedDepth = true;
                  if (!embeddedDepth.read(sub)) return false; break; }
+      case 11: {
+        uint32_t v = 0;
+        if (!r.u32(v)) return false;
+        stereoLayout = v <= uint32_t(StereoLayout::TopBottomHalf)
+                           ? static_cast<StereoLayout>(v) : StereoLayout::None;
+        break;
+      }
       SKIP()
     }
   }
+  if (hasEmbeddedDepth) stereoLayout = StereoLayout::None;
   return true;
 }
 

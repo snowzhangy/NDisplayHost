@@ -414,6 +414,8 @@ void Wire1Channel::HandleHello(const msg::Hello& hello) {
   peerMaxDatagram_ = hello.maxDatagramSize;
   thermal_ = hello.thermal;
   peerEmbeddedDepth_.store(hello.decoder.embeddedDepth);
+  peerMaxWidth_.store(hello.decoder.maxWidth);
+  peerMaxHeight_.store(hello.decoder.maxHeight);
   peerMaxPixelRate_.store(hello.decoder.maxPixelRate);
   WVD_LOGI(
       "quic: hello from '%s' (%s), device %s, max datagram %u B, decoder hevc=%u h264=%u "
@@ -886,6 +888,10 @@ void Wire1Channel::OnLegacyCodecConfig(const uint8_t* payload, uint32_t size) {
     out.codecConfig.embeddedDepth.mapHeight = dep.mapHeight;
     out.codecConfig.embeddedDepth.slices = dep.slices;
     out.codecConfig.embeddedDepth.encoding = msg::DepthEncoding(dep.encoding);
+  } else {
+    const auto layout = (cc.reserved & kCodecConfigStereoMask) >> kCodecConfigStereoShift;
+    if (layout <= int(msg::StereoLayout::TopBottomHalf))
+      out.codecConfig.stereoLayout = static_cast<msg::StereoLayout>(layout);
   }
   if (cc.csdSize <= size - off) {
     ForEachAnnexBNal(payload + off, cc.csdSize, [&](const uint8_t* nal, size_t nalSize) {

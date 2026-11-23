@@ -313,13 +313,15 @@ const std::vector<uint8_t>& ParameterSets(Codec codec) {
   return codec == Codec::H264 ? h264 : hevc;
 }
 
-std::vector<uint8_t> PackedCodecConfig(uint64_t codecGen, Codec codec = Codec::HEVC) {
+std::vector<uint8_t> PackedCodecConfig(uint64_t codecGen, Codec codec = Codec::HEVC,
+                                       msg::StereoLayout stereo = msg::StereoLayout::None) {
   PacketWriter w(PacketKind::CodecConfig);
   CodecConfigPayload cc{};
   cc.codecGen = codecGen;
   cc.width = 1920;
   cc.height = 1080;
   cc.codec = uint8_t(codec);
+  cc.reserved = uint8_t(uint32_t(stereo) << kCodecConfigStereoShift);
   cc.fpsNum = 60000;
   cc.fpsDen = 1000;
   cc.bitrateKbps = 24000;
@@ -488,6 +490,8 @@ bool Run(bool measure) {
   hello.hello.maxDatagramSize = 1100;
   hello.hello.decoder.hevc = true;
   hello.hello.decoder.h264 = true;
+  hello.hello.decoder.maxWidth = 8192;
+  hello.hello.decoder.maxHeight = 4320;
   hello.hello.decoder.maxPixelRate = 3840ull * 2160ull * 60ull;
   hello.hello.decoder.embeddedDepth = true;  // game-depth plan: unpack a strip
   headset.SendEnvelope(control, hello);
@@ -711,13 +715,19 @@ bool Run(bool measure) {
 
   // Audio and cursor are sent from the pipeline while the pacer is active.
   // A reconfiguration must also publish a second CodecConfig.
-  const auto nextCodec = PackedCodecConfig(codecGen + 1, Codec::H264);
+  const auto nextCodec = PackedCodecConfig(codecGen + 1, Codec::H264, msg::StereoLayout::SideBySideHalf);
   CHECK(channel->SendPacket(nextCodec), "second codec config send");
   constexpr uint32_t h264Bytes = 80;
   const auto nextPicture = PackedMedia(picSeq + 1, codecGen + 1, h264Bytes, true, Codec::H264);
   CHECK(channel->SendPacket(nextPicture), "send picture in new codec generation");
   CHECK(headset.WaitForEnvelope(msg::Envelope::Kind::CodecConfig, 1000, &codecEnv) &&
         codecEnv.codecConfig.codecGen == codecGen + 1, "second codec config did not arrive");
+  CHECK(codecEnv.codecConfig.stereoLayout == msg::StereoLayout::SideBySideHalf &&
+        !codecEnv.codecConfig.hasEmbeddedDepth, "half side-by-side layout did not arrive");
+  const auto decodeLimits = channel->GetVideoDecodeLimits();
+  CHECK(decodeLimits.width == 8192 && decodeLimits.height == 4320 &&
+        decodeLimits.pixelsPerSecond == hello.hello.decoder.maxPixelRate,
+        "decoder size/rate limits did not reach the pipeline");
   const std::vector<std::vector<uint8_t>> h264Sets{{0x67, 0x64}, {0x68, 0xce}};
   CHECK(codecEnv.codecConfig.codec == msg::Codec::H264 &&
         codecEnv.codecConfig.parameterSets == h264Sets, "bare H.264 SPS and PPS");

@@ -304,7 +304,9 @@ class MfEncoder final : public IVideoEncoder {
       return E_INVALIDARG;
 
     std::vector<std::pair<Codec, GUID>> order;
-    if (!hardware_)
+    if (desc_.hevcOnly)
+      order = {{Codec::HEVC, MFVideoFormat_HEVC}};
+    else if (!hardware_)
       order = {{Codec::H264, MFVideoFormat_H264}};
     else if (desc_.codec == Codec::H264)
       order = {{Codec::H264, MFVideoFormat_H264}, {Codec::HEVC, MFVideoFormat_HEVC}};
@@ -339,7 +341,7 @@ class MfEncoder final : public IVideoEncoder {
     if (!mft_) return E_NOT_VALID_STATE;
     au.bytes.clear();
     au.key = false;
-    au.qpcEncodeIn = QpcNow();
+    const int64_t encodeIn = QpcNow();
 
     HRESULT hr = EncodeOnce(src, au);
     if (FAILED(hr) && gpu_ && !producedOutput_) {
@@ -369,6 +371,8 @@ class MfEncoder final : public IVideoEncoder {
         au.depthValid = src.depthValid;
       }
     }
+    // Async output can replace the AU, so stamp the current call after it returns.
+    au.qpcEncodeIn = encodeIn;
     au.qpcEncodeOut = QpcNow();
     return S_OK;
   }
@@ -558,6 +562,8 @@ class MfEncoder final : public IVideoEncoder {
     out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     out->SetUINT32(MF_MT_MPEG2_PROFILE, c == Codec::HEVC ? UINT32(eAVEncH265VProfile_Main_420_8)
                                                          : UINT32(eAVEncH264VProfile_High));
+    if (c == Codec::HEVC && desc_.hevcLevel)
+      out->SetUINT32(MF_MT_MPEG2_LEVEL, desc_.hevcLevel);
     SetColor(out.Get());
     hr = mft_->SetOutputType(outId_, out.Get(), 0);
     if (FAILED(hr) && c == Codec::H264) {

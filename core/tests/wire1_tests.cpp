@@ -583,6 +583,39 @@ static void TestEmbeddedDepth() {
   CHECK(!(nd.dataDatagrams()[0][1] & dg::MediaShardHeader::kDepthValid));
 }
 
+static void TestStereoLayout() {
+  using msg::StereoLayout;
+  for (const auto layout : {StereoLayout::None, StereoLayout::SideBySide,
+                            StereoLayout::SideBySideHalf, StereoLayout::TopBottom,
+                            StereoLayout::TopBottomHalf}) {
+    msg::CodecConfig tx, rx;
+    tx.stereoLayout = layout;
+    pb::Writer writer;
+    tx.write(writer);
+    pb::Reader reader(writer.bytes.data(), writer.bytes.size());
+    CHECK(rx.read(reader) && rx.stereoLayout == layout && !rx.hasEmbeddedDepth);
+  }
+
+  pb::Writer future;
+  future.u32(11, 99);
+  msg::CodecConfig rx;
+  pb::Reader unknown(future.bytes.data(), future.bytes.size());
+  CHECK(rx.read(unknown) && rx.stereoLayout == StereoLayout::None);
+  const uint8_t halfSbs[] = {0x58, 2};  // field 11, varint, half SBS
+  pb::Reader candidate(halfSbs, sizeof(halfSbs));
+  CHECK(rx.read(candidate) && rx.stereoLayout == StereoLayout::SideBySideHalf);
+
+  msg::CodecConfig tx;
+  tx.stereoLayout = StereoLayout::SideBySide;
+  tx.hasEmbeddedDepth = true;
+  pb::Writer conflict;
+  tx.write(conflict);
+  // Even a peer sending both fields cannot enable stereo on a depth picture.
+  conflict.u32(11, uint32_t(tx.stereoLayout));
+  pb::Reader both(conflict.bytes.data(), conflict.bytes.size());
+  CHECK(rx.read(both) && rx.hasEmbeddedDepth && rx.stereoLayout == StereoLayout::None);
+}
+
 int main() {
   TestPbBasics();
   TestFraming();
@@ -591,6 +624,7 @@ int main() {
   TestFec();
   TestPacketizer();
   TestEmbeddedDepth();
+  TestStereoLayout();
   if (failures) {
     std::printf("wire1_tests: %d FAILURES\n", failures);
     return 1;

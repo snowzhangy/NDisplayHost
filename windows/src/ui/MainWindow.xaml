@@ -58,8 +58,22 @@
                 <StackPanel Grid.Column="2"><TextBlock Text="Max bitrate · adapts to link" Margin="0,0,0,6"/><ComboBox x:Name="BitrateChoice" AutomationProperties.Name="Bitrate" ToolTip="Higher values use more network bandwidth. Try a lower limit when a busy link causes stutter."><ComboBoxItem Content="20 Mbps"/><ComboBoxItem Content="40 Mbps"/><ComboBoxItem Content="60 Mbps" IsSelected="True"/><ComboBoxItem Content="80 Mbps"/></ComboBox></StackPanel>
               </Grid>
               <TextBlock Text="Video encoder" Margin="0,14,0,6"/><ComboBox x:Name="EncoderChoice" AutomationProperties.Name="Video encoder"/>
+              <TextBlock Text="Stereo layout" Margin="0,14,0,6"/>
+              <ComboBox x:Name="StereoChoice" AutomationProperties.Name="Stereo layout"
+                        ToolTip="Match the stereo image already drawn on the shared display. Full side-by-side may fall back to half side-by-side.">
+                <ComboBoxItem Content="None" Tag="none" IsSelected="True"/>
+                <ComboBoxItem Content="Side by side" Tag="sbs"/>
+                <ComboBoxItem Content="Half side by side" Tag="sbs-half"/>
+                <ComboBoxItem Content="Top and bottom" Tag="top-bottom"/>
+                <ComboBoxItem Content="Half top and bottom" Tag="top-bottom-half"/>
+              </ComboBox>
+              <TextBlock Text="Stereo output resolution" Margin="0,10,0,6"/>
+              <ComboBox x:Name="StereoSizeChoice" AutomationProperties.Name="Stereo output resolution"
+                        ToolTip="Sets the maximum size of the packed frame. Half side by side squeezes each eye horizontally for Vision Pro to stretch back."/>
               <CheckBox x:Name="SendAudio" Content="Send this PC's sound to the headset" IsChecked="True" Margin="0,14,0,0"
                         ToolTip="Captures the default playback device while sound is on in the headset. The PC speakers keep playing."/>
+              <CheckBox x:Name="GameDepth" Content="Use game depth for headset 3D" Margin="0,10,0,0"
+                        ToolTip="Requires the NDisplay ReShade add-on in the single-player game. The game must fill the shared display."/>
               <CheckBox x:Name="ScreenOff" Content="Turn off this PC's screen while the headset is connected" Margin="0,10,0,4"
                         ToolTip="Like a Mac running Mac Virtual Display: this PC's screens go black and the headset still shows the desktop."/>
               <TextBlock Text="The screen comes back when the headset disconnects. Ctrl+Alt+Shift+B shows it sooner." Foreground="{StaticResource Muted}" FontSize="11" Margin="21,0,0,0" TextWrapping="Wrap"/>

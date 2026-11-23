@@ -1,0 +1,46 @@
+// Generic Depth binds the selected scene depth to this semantic.
+texture2D NDisplayDepthInput : DEPTH;
+sampler2D NDisplayDepthSampler { Texture = NDisplayDepthInput; };
+
+texture2D NDisplayDepthMap {
+  Width = BUFFER_WIDTH / 4;
+  Height = (BUFFER_HEIGHT / 16) * 4;
+  Format = R16;
+};
+
+uniform bool NDisplayCaptureEnabled = false;
+uniform bool NDisplayDepthReady < source = "bufready_depth"; >;
+
+#ifndef NDISPLAY_REVERSED_Z
+#define NDISPLAY_REVERSED_Z 1
+#endif
+
+float4 NDisplayVS(uint id : SV_VertexID) : SV_Position {
+  float2 uv = float2((id << 1) & 2, id & 2);
+  return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float NDisplayPS(float4 pos : SV_Position) : SV_Target {
+  if (!NDisplayCaptureEnabled || !NDisplayDepthReady) return 0.0;
+  const int2 mapSize = int2(BUFFER_WIDTH / 4, (BUFFER_HEIGHT / 16) * 4);
+  const int2 sourceSize = tex2Dsize(NDisplayDepthSampler);
+  const int2 cell = int2(pos.xy);
+  const int2 start = cell * sourceSize / mapSize;
+  const int2 end = min(sourceSize, max(start + 1, (cell + 1) * sourceSize / mapSize));
+  float nearest = 0.0;
+  for (int y = start.y; y < end.y; ++y) {
+    for (int x = start.x; x < end.x; ++x) {
+      const float d = tex2Dfetch(NDisplayDepthSampler, int2(x, y)).r;
+      nearest = max(nearest, NDISPLAY_REVERSED_Z ? d : 1.0 - d);
+    }
+  }
+  return nearest;
+}
+
+technique NDisplayCaptureDepth < enabled = true; hidden = true; > {
+  pass {
+    VertexShader = NDisplayVS;
+    PixelShader = NDisplayPS;
+    RenderTarget = NDisplayDepthMap;
+  }
+}

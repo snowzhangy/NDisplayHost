@@ -19,8 +19,10 @@ namespace WvdHost {
   public sealed class HostOptions {
     public string Display = "";
     public string Encoder = "auto";
+    public string StereoLayout = "none";
+    public string StereoSize = "";
     public int Fps = 60, Bitrate = 60000, Port = 47800;
-    public bool AllowInput, Synthetic, ScreenOff, NoAudio;
+    public bool AllowInput, Synthetic, ScreenOff, NoAudio, GameDepth;
   }
 
   // Every role runs as a child process of this UI's kill-on-close job, started
@@ -119,6 +121,12 @@ namespace WvdHost {
             "--codec", options.Encoder, "--stop-event", NewStopEvent(out mediaStop)};
           if (!String.IsNullOrEmpty(options.Display)) args.AddRange(new [] {"--monitor", options.Display});
           if (options.Synthetic) args.Add("--synthetic");
+          if (options.StereoLayout != "none") {
+            args.AddRange(new [] {"--stereo-layout", options.StereoLayout});
+            if (!String.IsNullOrEmpty(options.StereoSize))
+              args.AddRange(new [] {"--stereo-size", options.StereoSize});
+          } else if (options.GameDepth && !options.Synthetic)
+            args.Add("--game-depth");
           if (options.ScreenOff) args.Add("--screen-off");
           if (options.NoAudio) args.Add("--no-audio");
           if (options.AllowInput) {

@@ -11,10 +11,12 @@
 //   --monitor \\.\DISPLAY2 --fps 60 --bitrate 60000 --codec auto|null
 //   --input \\.\pipe\wvd.input  forward input to privileged helper
 #include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "discovery.h"
 #include "session/media_session.h"
@@ -50,7 +52,9 @@ void Usage() {
       "                 [--max-pixels N] [--min-bitrate KBPS] [--fixed-bitrate]\n"
       "                 [--gop-sec N] [--box-chroma] [--no-mode-change]\n"
       "                 [--no-audio] [--screen-off] [--no-discovery]\n"
-      "                 [--depth-test-pattern [--depth-test-drop N]] [-v]\n"
+      "                 [--stereo-layout none|sbs|sbs-half|top-bottom|top-bottom-half]\n"
+      "                 [--stereo-size WIDTHxHEIGHT[:half-sbs]]\n"
+      "                 [--game-depth | --depth-test-pattern [--depth-test-drop N]] [-v]\n"
       "Listens on UDP 47800 by default (WIRE v1 over QUIC). --demo runs offline.\n"
       "  --quic [PORT] is also accepted. Pairing uses the local pipe shown in the log.\n"
       "  --pair-auto skips the code comparison and is intended for lab use.\n"
@@ -59,14 +63,20 @@ void Usage() {
       "  it a QUIC session streams picture and sound but cannot touch the PC\n"
       "--bitrate is the ceiling; the target drops while the link is behind and\n"
       "  recovers afterwards (--fixed-bitrate turns that off)\n"
-      "--max-pixels caps the encoded picture (default 8294400 = 3840x2160;\n"
-      "  larger desktops are scaled to fit, 0 = encode at desktop size)\n"
+      "--max-pixels caps the encoded picture (default 8294400, or 16588800 for\n"
+      "  full side-by-side; 0 = no host pixel ceiling)\n"
       "--gop-sec N adds a periodic keyframe (default: on demand only)\n"
       "--no-mode-change stops the headset changing the monitor's size (by\n"
       "  default a size picked on the headset lasts until the session ends)\n"
       "--no-audio never sends this PC's sound, even when the headset asks\n"
       "--screen-off blacks out this PC's screens while a headset is connected\n"
       "  (Ctrl+Alt+Shift+B shows them again; the stream is not affected)\n"
+      "--game-depth accepts scene depth from an opted-in D3D12 game with the\n"
+      "  NDisplay ReShade add-on, while the headset requests 3D for that display\n"
+      "--stereo-layout describes the existing packing on the shared display.\n"
+      "  Full side-by-side falls back to half when the encoder or headset requires it.\n"
+      "--stereo-size limits the packed frame size without upscaling it. Append\n"
+      "  :half-sbs to squeeze a full SBS source and signal half SBS to the headset.\n"
       "--depth-test-pattern feeds the embedded-depth pipeline a synthetic map\n"
       "  (a ramp plus a square that follows the pointer); the headset still\n"
       "  has to ask for depth per monitor. --depth-test-drop N clears\n"
@@ -88,7 +98,9 @@ struct Args {
   uint64_t inputToken = 0;
   bool synthetic = false;
   bool verbose = false;
-  uint64_t maxPixels = 3840ull * 2160ull;
+  std::optional<uint64_t> maxPixels;
+  msg::StereoLayout stereoLayout = msg::StereoLayout::None;
+  StereoOutputSize stereoOutputSize;
   uint32_t minBitrate = 0;
   bool fixedBitrate = false;
   uint32_t gopSeconds = 0;
@@ -96,12 +108,34 @@ struct Args {
   bool noModeChange = false;
   bool noAudio = false;
   bool screenOff = false;
+  bool gameDepth = false;
   bool depthTestPattern = false;
   uint32_t depthTestDropEvery = 0;
   bool pairAuto = false;
   bool noPair = false;
   bool allowInput = false;
 };
+
+bool ParseStereoSize(std::string_view value, StereoOutputSize& size) {
+  constexpr std::string_view halfSuffix = ":half-sbs";
+  if (value.size() >= halfSuffix.size() &&
+      value.substr(value.size() - halfSuffix.size()) == halfSuffix) {
+    size.halfSbs = true;
+    value.remove_suffix(halfSuffix.size());
+  } else {
+    size.halfSbs = false;
+  }
+  const size_t x = value.find('x');
+  if (x == std::string_view::npos) return false;
+  const auto parseDimension = [](std::string_view field, uint32_t& dimension) {
+    const char* end = field.data() + field.size();
+    const auto result = std::from_chars(field.data(), end, dimension);
+    return result.ec == std::errc{} && result.ptr == end && dimension >= 4 &&
+           dimension <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION && !(dimension & 1);
+  };
+  return parseDimension(value.substr(0, x), size.width) &&
+         parseDimension(value.substr(x + 1), size.height);
+}
 
 bool ParseArgs(int argc, char** argv, Args& a) {
   for (int i = 1; i < argc; ++i) {
@@ -142,6 +176,24 @@ bool ParseArgs(int argc, char** argv, Args& a) {
       a.stopEvent = Utf8ToWide(v.c_str());
     else if (s == "--max-pixels" && next(v))
       a.maxPixels = strtoull(v.c_str(), nullptr, 10);
+    else if (s == "--stereo-layout" && next(v)) {
+      using msg::StereoLayout;
+      if (v == "none") a.stereoLayout = StereoLayout::None;
+      else if (v == "sbs") a.stereoLayout = StereoLayout::SideBySide;
+      else if (v == "sbs-half") a.stereoLayout = StereoLayout::SideBySideHalf;
+      else if (v == "top-bottom") a.stereoLayout = StereoLayout::TopBottom;
+      else if (v == "top-bottom-half") a.stereoLayout = StereoLayout::TopBottomHalf;
+      else {
+        fprintf(stderr, "unknown --stereo-layout: %s\n", v.c_str());
+        return false;
+      }
+    }
+    else if (s == "--stereo-size" && next(v)) {
+      if (!ParseStereoSize(v, a.stereoOutputSize)) {
+        fprintf(stderr, "invalid --stereo-size: %s\n", v.c_str());
+        return false;
+      }
+    }
     else if (s == "--min-bitrate" && next(v))
       a.minBitrate = uint32_t(atoi(v.c_str()));
     else if (s == "--fixed-bitrate")
@@ -152,6 +204,8 @@ bool ParseArgs(int argc, char** argv, Args& a) {
       a.noAudio = true;
     else if (s == "--screen-off")
       a.screenOff = true;
+    else if (s == "--game-depth")
+      a.gameDepth = true;
     else if (s == "--depth-test-pattern")
       a.depthTestPattern = true;
     else if (s == "--depth-test-drop" && next(v))
@@ -181,6 +235,19 @@ bool ParseArgs(int argc, char** argv, Args& a) {
       Usage();
       return false;
     }
+  }
+  if (a.gameDepth && (a.synthetic || a.depthTestPattern)) {
+    fprintf(stderr, "--game-depth requires desktop capture and cannot be combined with --depth-test-pattern\n");
+    return false;
+  }
+  if (a.stereoLayout != msg::StereoLayout::None && (a.gameDepth || a.depthTestPattern)) {
+    fprintf(stderr, "--stereo-layout cannot be combined with game or synthetic depth\n");
+    return false;
+  }
+  if ((a.stereoOutputSize.width && a.stereoLayout == msg::StereoLayout::None) ||
+      (a.stereoOutputSize.halfSbs && a.stereoLayout != msg::StereoLayout::SideBySide)) {
+    fprintf(stderr, "--stereo-size requires a stereo layout; :half-sbs requires --stereo-layout sbs\n");
+    return false;
   }
   return true;
 }
@@ -308,12 +375,15 @@ int RoleStream(int argc, char** argv) {
   cfg.inputToken = a.inputToken;
   cfg.chroma = a.boxChroma ? ChromaFilter::Box2x2 : ChromaFilter::TextAware;
   cfg.maxEncodePixels = a.maxPixels;
+  cfg.stereoLayout = a.stereoLayout;
+  cfg.stereoOutputSize = a.stereoOutputSize;
   cfg.minBitrateKbps = a.minBitrate;
   cfg.adaptiveBitrate = !a.fixedBitrate;
   cfg.gopSeconds = a.gopSeconds;
   cfg.allowModeChange = !a.noModeChange;
   cfg.allowAudio = !a.noAudio;
   cfg.screenOff = a.screenOff;
+  cfg.gameDepth = a.gameDepth;
   cfg.depthTestPattern = a.depthTestPattern;
   cfg.depthTestDropEvery = a.depthTestDropEvery;
   if (a.synWidth && a.synHeight) {

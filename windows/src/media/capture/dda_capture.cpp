@@ -27,12 +27,16 @@ HRESULT FrameRing::InitLocked(ID3D11Device* dev, UINT width, UINT height, UINT s
   AcquireSRWLockExclusive(&lock_);
   width_ = width;
   height_ = height;
+  // The consumer can hold one slot while a second is the newest published
+  // frame. A third gives the capture thread a safe destination in either case.
+  slotCount = (std::max)(3u, slotCount);
   slots_32_ = slotCount;
   slots_.assign(slotCount, nullptr);
   srvs_.assign(slotCount, nullptr);
   slotSeq_.assign(slotCount, 0);
   nextWrite_ = 0;
   newestIdx_ = 0;
+  readingIdx_ = UINT_MAX;
   hasNewest_ = false;
   newestSeq_ = 0;
   written_ = consumed_ = overwritten_ = 0;
@@ -78,9 +82,12 @@ void FrameRing::Deinit() {
 
 UINT FrameRing::AcquireWriteSlot() {
   AcquireSRWLockExclusive(&lock_);
-  UINT idx = nextWrite_;
+  UINT idx = 0;
   if (slots_32_) {
-    nextWrite_ = (nextWrite_ + 1) % slots_32_;
+    do {
+      idx = nextWrite_;
+      nextWrite_ = (nextWrite_ + 1) % slots_32_;
+    } while (idx == readingIdx_ || (newestSeq_ && idx == newestIdx_));
     if (slotSeq_[idx] != 0 && slotSeq_[idx] != newestSeq_) ++overwritten_;
   }
   ReleaseSRWLockExclusive(&lock_);
@@ -113,16 +120,23 @@ bool FrameRing::RepublishNewest(uint64_t seq) {
 
 bool FrameRing::AcquireLatest(UINT& idxOut, uint64_t& seqOut) {
   AcquireSRWLockExclusive(&lock_);
-  if (!hasNewest_) {
+  if (!hasNewest_ || readingIdx_ != UINT_MAX) {
     ReleaseSRWLockExclusive(&lock_);
     return false;
   }
   idxOut = newestIdx_;
+  readingIdx_ = newestIdx_;
   seqOut = newestSeq_;
   hasNewest_ = false;
   ++consumed_;
   ReleaseSRWLockExclusive(&lock_);
   return true;
+}
+
+void FrameRing::Release(UINT idx) {
+  AcquireSRWLockExclusive(&lock_);
+  if (readingIdx_ == idx) readingIdx_ = UINT_MAX;
+  ReleaseSRWLockExclusive(&lock_);
 }
 
 FrameRing::Stats FrameRing::GetStats() const {
@@ -172,7 +186,8 @@ HRESULT DdaCapture::Start(const InitDesc& d) {
 
 void DdaCapture::Stop() { dup_.Reset(); }
 
-HRESULT DdaCapture::Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needImage) {
+HRESULT DdaCapture::Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needImage,
+                            bool metadataOnly) {
   if (!dup_ || !ring_) return DXGI_ERROR_INVALID_CALL;
 
   DXGI_OUTDUPL_FRAME_INFO fi{};
@@ -266,7 +281,7 @@ HRESULT DdaCapture::Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needIma
   // full-frame GPU copy per mouse report for a picture nobody encodes.
   const bool imageUpdated = fi.LastPresentTime.QuadPart != 0 || fi.AccumulatedFrames != 0 ||
                             out.hadDirtyRects;
-  if (!imageUpdated && !needImage) {
+  if (metadataOnly || (!imageUpdated && !needImage)) {
     out.qpcCopyDone = out.qpcCapture;
     dup_->ReleaseFrame();
     return S_OK;

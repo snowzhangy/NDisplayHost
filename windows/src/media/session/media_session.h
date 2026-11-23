@@ -17,12 +17,14 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "audio/loopback_capture.h"
 #include "capture/dda_capture.h"
+#include "depth/game_depth_capture.h"
 #include "depth/synthetic_depth.h"
 #include "wvd/depth.h"
 #include "cursor/cursor_source.h"
@@ -38,8 +40,14 @@
 #include "screen_curtain.h"
 #include "wvd/protocol.h"
 #include "wvd/media_channel.h"
+#include "wvd/wire1_msg.h"
 
 namespace wvd {
+
+struct StereoOutputSize {
+  uint32_t width = 0, height = 0;
+  bool halfSbs = false;  // squeeze a full SBS source before applying the size limit
+};
 
 struct SessionConfig {
   std::wstring monitorName;      // "\\\\.\DISPLAYn"; empty = primary
@@ -55,11 +63,11 @@ struct SessionConfig {
   ChromaFilter chroma = ChromaFilter::TextAware;
   uint32_t synWidth = 1280;   // synthetic source size (§--synthetic)
   uint32_t synHeight = 720;
-  // Largest encoded picture, in pixels; a bigger desktop is scaled down to
-  // fit, keeping its aspect ratio. Default 3840×2160: the budget Apple's Mac
-  // Virtual Display gives its encoder even for a 10240×2880 desktop, and a
-  // size every supported hardware encoder sustains at 60 fps. 0 = no limit.
-  uint64_t maxEncodePixels = 3840ull * 2160ull;
+  // Override the default pixel budget (4K, or twice 4K for full SBS).
+  // A value of 0 removes this ceiling; decoder limits still apply to stereo.
+  std::optional<uint64_t> maxEncodePixels;
+  msg::StereoLayout stereoLayout = msg::StereoLayout::None;
+  StereoOutputSize stereoOutputSize;
   // `bitrateKbps` is the ceiling. While the link cannot keep up the session
   // lowers the encoder's target (never below the floor; 0 = ceiling / 8) and
   // raises it again once the backlog is gone.
@@ -85,6 +93,7 @@ struct SessionConfig {
   // is packed only while the headset advertises the capability AND requests
   // depth for this monitor AND a depth source is attached (§3.3 rule 1).
   bool depthTestPattern = false;
+  bool gameDepth = false;  // opted-in D3D12 games running the NDisplay ReShade add-on
   // Clear DEPTH_VALID on every Nth generated frame (0 = never): drives the
   // H1 acceptance cases for depth gaps without a hook.
   uint32_t depthTestDropEvery = 0;
@@ -94,6 +103,18 @@ struct SessionConfig {
 // dimensions, aspect ratio preserved, never larger than the source.
 void FitEncodeSize(uint32_t srcW, uint32_t srcH, uint64_t maxPixels, uint32_t& outW,
                    uint32_t& outH);
+
+struct StereoEncodePlan {
+  uint32_t width, height, fps;
+  msg::StereoLayout layout;
+};
+
+// Chooses coded dimensions and packing for an already packed stereo desktop.
+// A full SBS source that cannot fit is squeezed horizontally to half SBS.
+StereoEncodePlan PlanStereoEncode(uint32_t width, uint32_t height, uint32_t fps,
+                                  msg::StereoLayout layout, uint64_t maxPixels,
+                                  VideoDecodeLimits limits, bool forceHalfSbs = false,
+                                  StereoOutputSize output = {});
 
 class MediaSession {
  public:
@@ -158,10 +179,12 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
     int64_t qpcCapture = 0;
     bool refinement = false;
     uint32_t videoEpoch = 1;
+    std::shared_ptr<const DepthFrame> gameDepth;
   };
-  // Capture thread: record AFTER ring Publish, BEFORE pushing the work item.
+  // Capture thread: record before making a slot and sequence visible to the encoder.
   void RecordFrameIdentity(uint64_t ringSeq, uint64_t contentVer, int64_t qpcCapture,
-                           bool refinement, uint32_t videoEpoch);
+                           bool refinement, uint32_t videoEpoch,
+                           std::shared_ptr<const DepthFrame> gameDepth = {});
   // Encode thread: resolve the acquired frame's identity.
   bool FindFrameIdentity(uint64_t ringSeq, FrameIdentity& out);
 
@@ -188,10 +211,13 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   // Rebuild the encoder for a new surface size (display mode change). Takes
   // encMutex_, bumps codecGen; CodecConfig follows with its first picture.
   bool ReconfigureEncoder(UINT width, UINT height);
+  void ConfigureEncodeSizeLocked(UINT width, UINT height, bool forceHalfSbs = false);
+  bool FallbackToHalfSbsLocked(UINT width, UINT height);
+  StereoEncodePlan ChooseEncodePlan(UINT width, UINT height, bool forceHalfSbs = false) const;
   bool RecreateEncoderLocked();
   uint32_t VideoEpoch() const { return channel_ ? channel_->VideoEpoch() : 1; }
   uint32_t EffectiveFrameRate() const;
-  // Encode thread: move the encoder's target bitrate. False once the encoder
+  // Caller holds encMutex_. False once the encoder
   // turns out not to support it.
   bool ApplyBitrate(uint32_t kbps, const char* why);
   void ForwardInputToHelper(PacketView pv);
@@ -212,6 +238,8 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   // §3.3 rule 1: capability AND request AND an attached source. Caller holds
   // encMutex_; on true, `layout` holds the strip geometry for encColorW×encH.
   bool DepthWantedLocked(EmbeddedDepthPayload& layout);
+  bool DepthRequested();
+  bool DepthLayoutFits(uint32_t width, uint32_t height, EmbeddedDepthPayload& layout) const;
   // Encode thread (encMutex_ held): a packing or layout change is a codec
   // generation change — new coded size, CodecConfig with/without the layout,
   // IDR. Frame-to-frame gaps stay DEPTH_VALID, never a new generation.
@@ -247,6 +275,9 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   std::unique_ptr<IVideoEncoder> encoder_;
   std::string encoderName_;
   std::mutex encMutex_;
+  msg::StereoLayout encodedStereoLayout_ = msg::StereoLayout::None;
+  UINT encSourceW_ = 0, encSourceH_ = 0;  // source dimensions matching the encoder
+  std::atomic<uint32_t> encodeRateLimit_{0};  // stereo pacing cap shared with capture
   bool codecConfigPending_ = true;   // guarded by encMutex_
   std::vector<uint8_t> csd_;         // parameter sets of the current codecGen
 
@@ -260,7 +291,9 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   EmbeddedDepthPayload depthLayout_{};
   uint32_t encColorW_ = 0, encColorH_ = 0;   // colour encode size, without the strip
   uint64_t depthValidFrames_ = 0;            // pictures sent with DEPTH_VALID
-  std::unique_ptr<DepthSource> depthSrc_;    // H2: the hook; H1: the test pattern
+  std::unique_ptr<DepthSource> depthSrc_;   // synthetic test pattern
+  std::unique_ptr<GameDepthCapture> gameDepth_;  // capture thread only
+  std::atomic<bool> gameDepthAttached_{false};
   // Published-frame identity history (see FrameIdentity): written by the
   // capture thread, read by the encode thread.
   std::mutex identMutex_;

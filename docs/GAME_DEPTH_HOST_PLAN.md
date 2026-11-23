@@ -1,7 +1,7 @@
 # Game depth from the Windows host
 
-Status: draft, 2026-11-22. For the Windows host engineer. The Vision Pro side is built (section 10); everything in
-sections 3–9 is host work in NDisplayHost.
+Status: draft, 2026-11-22; side-by-side stereo added 2026-11-23 (section 11). For the Windows host engineer. The
+Vision Pro side of depth is built (section 10); everything in sections 3–9 is host work in NDisplayHost.
 
 ## 1. Goal
 
@@ -18,12 +18,17 @@ the headset can skip the model and warp with true depth:
 When there is no game depth (the desktop, a menu, a game we cannot or may not hook), nothing changes: the headset
 falls back to ZipDepth.
 
+Depth is the second-best source, though. One picture plus depth cannot show what is behind an edge, cannot give each
+eye its own reflections, and flattens particles, glass and the HUD. A game that renders one camera per eye has none
+of those limits. Section 11 covers that path. It needs far less host work, and depth stays the path for every game
+without a stereo mod, and for the PS5.
+
 ## 2. The change in one picture
 
 ```
  game process                       NDisplayHost (Windows)                         Vision Pro app
 +--------------------+    shared   +--------------------------------------+       +---------------------------+
-| hook DLL           |   texture   |raw inverse depth 16-bit -> 8-bit     |  one  | decode                    |
+| hook DLL           |   texture   | depth -> inverse depth -> 8-bit      |  one  | decode                    |
 |  Present           |-----------> | pack under the colour (strip)        | HEVC  | cut colour / depth apart  |
 |  depth buffer copy |  + frame #  | encode as ONE picture, DEPTH_VALID   |------>| depth -> stereo warp      |
 +--------------------+             +--------------------------------------+       | no depth -> ZipDepth      |
@@ -162,10 +167,6 @@ its flat areas.
 The app needs **inverse depth, larger = nearer**, as an 8-bit luma value. It needs neither the near and far planes
 nor the field of view, because the stereo warp is affine-invariant in inverse depth.
 
-Raw texels stay 16-bit (or float) from the source until this stretch. Quantising to 8 bits **before** the percentile
-mapping throws away exactly the precision the stretch exists to recover, and a flat first frame must clamp `hi - lo`
-to a minimum width (a zero-width interval makes `q` infinite/NaN, and NaN-to-integer is undefined).
-
 A perspective depth buffer is already affine in 1/z, whatever its near and far planes:
 
 | The game uses | Depth buffer value `d` | Use `v =` |
@@ -259,18 +260,9 @@ A small signed DLL, installed with the host under Program Files and injected wit
    - The host does the percentiles, normalisation, packing and encoding. Keep the hook as small as possible: a crash
      in it is a crash in the user's game.
 5. **Match depth to colour.**
-   - In H2 the colour still comes from desktop duplication. The proposal is to pair each duplicated frame with the
-     depth whose Present time equals `DXGI_OUTDUPL_FRAME_INFO.LastPresentTime`. No match means `DEPTH_VALID` is
-     clear for that frame. Do not guess.
-   - **Unproven assumption — validate it before H2 relies on it.** A QPC sampled in the hook at `Present` and
-     `LastPresentTime` timestamp *different events* (the app's call vs. the display backend latching the frame),
-     and Microsoft documents no guarantee that they are equal — nor that one duplicated frame maps to exactly one
-     Present (frame pacing can drop, repeat or coalesce). Validate with a marker experiment: the hook paints a
-     changing frame-counter marker at Present; verify in the captured desktop that each marker appears in exactly
-     one duplicated frame and that the QPC delta to `LastPresentTime` is stable and small, then pair by
-     nearest-within-measured-bound, not by equality. If the mapping is not one-to-one and stable, bring the
-     hook-side back-buffer copy forward from H3 and encode that colour instead of shipping pairing that silently
-     mislabels depth.
+   - In H2 the colour still comes from desktop duplication. Pair each duplicated frame with the depth whose Present
+     time equals `DXGI_OUTDUPL_FRAME_INFO.LastPresentTime`. No match means `DEPTH_VALID` is clear for that frame.
+     Do not guess.
    - In H3 the hook also copies the back buffer at Present, as OBS game capture does. The host then encodes that
      colour instead of the duplicated desktop, and pairing is exact by construction.
 6. **Same GPU only.** If the game renders on a different adapter from the host's encoder (some hybrid laptops), do
@@ -303,6 +295,9 @@ show.
 
 **H1 is the important one.** It is the only way to check the headset side end to end before any hook exists, and it
 flushes out every wire and layout mistake while they are cheap.
+
+**Side-by-side stereo (section 11)** has its own phases, S1–S4. S1 needs no host work. S2 and S3 are small and can go
+before H2: suggested order H1, S2, S3, then H2–H5, and S4 only if bitrate turns out to be the limit.
 
 **H1 acceptance**, on a Debug build of the app (3D is Debug-only today):
 
@@ -357,3 +352,120 @@ Built and unit-tested in this repository. It is Debug-only, like the rest of liv
   - full-range and video-range mapping;
   - wrapping the map for the warp.
 - `NDisplayAdapterTests/AdapterSettingsTests.swift`: the request surviving every other settings change.
+
+## 11. True stereo from side-by-side sources
+
+**Decision, 2026-11-23.** The best 3D comes from a game that renders one camera per eye. Depth (sections 1–10) stays
+the path for games without a stereo mod, and for the PS5, whose Remote Play stream is one 2D view. The view stays a
+flat or curved screen. A full-VR or 180° immersive mode is out of scope: a wide view moved by a gamepad camera makes
+people motion sick, and ALVR already covers full VR.
+
+### 11.1 Where the stereo comes from
+
+Third-party tools that the user installs. The host neither bundles nor injects them.
+
+| Tool | Covers | Output |
+| --- | --- | --- |
+| [VRto3D](https://github.com/oneup03/VRto3D), a SteamVR driver (LGPL-3.0; needs Steam and SteamVR, no headset) | anything that renders for SteamVR or OpenXR: UEVR (Unreal 4/5), REFramework (RE Engine), UUVR (Unity, early), Luke Ross's R.E.A.L. mods, native VR games | a fullscreen side-by-side or top-bottom window on the monitor named by its `display_index` |
+| [geo-11](https://helixmod.blogspot.com/2022/06/announcing-new-geo-11-3d-driver.html), a 3D Vision replacement | DX11 games, often with Helix shader fixes | the game's own window, with `direct_mode = sbs` |
+
+- The VRto3D keys that matter: `fov`, `aspect_ratio`, `render_width` and `render_height` (per eye), `depth` and
+  `convergence`. Leave `pitch_enable` and `yaw_enable` off, so the gamepad moves the camera and the head does not.
+- SteamVR has no HDR, so these streams are SDR.
+- The anti-cheat rule of section 7.3 applies to these injectors too: single-player only. It is the user's choice,
+  and the host does nothing about it.
+
+### 11.2 S1: works with today's host
+
+These tools draw both eyes into an ordinary window, so the host captures and encodes it like any other desktop. The
+app has a per-display **3D from** setting (depth, side-by-side, half side-by-side, top-bottom, half top-bottom, plus
+Swap eyes) and gives each half of the picture to one eye. Built in this repository, Debug only like the rest of 3D:
+
+| Step | Where |
+| --- | --- |
+| Eye rectangles, and the shape each eye is shown at, per layout | `WVDCore/Media/Depth/StereoPacking.swift` |
+| The cut: NV12 → two eye surfaces, chroma kept inside each eye so the seam stays clean, own mips per eye | `nd_stereo_unpack` in `DepthShaders.swift`, `StereoUnpacker`, `StereoPresentation.preparePacked` |
+| The stage: no model, no 3D slot, no depth request; never written flat (both eyes squeezed) while it starts | `NDisplayApp/Depth3D.swift` `PackedStereoDriver`, `MonitorController.swift` |
+| Screen shaped to one eye (`MonitorController.aspect`); PC streams only | `MonitorController.swift`, `MonitorView.swift` |
+
+For now, upscaling is off in these layouts and the locally drawn cursor is hidden. Input stays in monitor pixels.
+
+Host notes, no code:
+
+- The stereo window must be on a monitor the host captures: set VRto3D's `display_index` to that virtual monitor.
+- While a display shows a side-by-side or top-bottom picture, the app does not request depth for it (the display
+  leaves `depth_monitors`), so the host sends no strip. Nothing to change.
+- Half side-by-side at 3840×2160 (1920×2160 per eye) fits every encoder and today's `--max-pixels` default.
+
+### 11.3 S2: full resolution per eye
+
+Full side-by-side at 4K per eye is a 7680×2160 monitor.
+
+The Windows host exposes this mode through **Stereo layout → Side by side** or
+`--stereo-layout sbs`. When it needs half side-by-side, it squeezes the picture
+horizontally and advertises the resulting layout. **Half side by side** describes
+a source that already supplies the squeezed picture. The [Windows setup](../windows/README.md#stream-a-side-by-side-source)
+covers both cases.
+
+The **Stereo output resolution** control offers 720p, 1080p, 1440p and 2160p
+packed presets for half side-by-side and the corresponding double-width presets
+for full side-by-side. A 2560×1440 half side-by-side stream carries two
+1280×1440 eye images. Vision Pro stretches each eye horizontally for presentation.
+
+- **Virtual monitor modes.** Offer 7680×2160 (3840×2160 per eye) and 5120×1440 (2560×1440 per eye).
+- **Encode budget.** The `--max-pixels` default is 8,294,400 (3840×2160), so a 7680×2160 desktop is scaled down for
+  encode and its mode is marked `kModeScaledForEncode`. Raise the cap to 16,588,800 when the encoder takes width
+  7680. Scaling keeps working meanwhile: the whole picture is scaled, so the two halves stay aligned.
+- **Encoder.** 7680×2160 is 16.6 M luma samples, over HEVC level 5.1's 8.9 M, so it needs level 6. NVENC takes widths
+  up to 8192. AMF on the Z13 (Strix Halo) is unverified: probe it, and fall back to half side-by-side.
+- **Headset decode budget.** The app advertises at most 8192×4320 and 1,000 M luma samples a second. 7680×2160 at
+  60 Hz is 995 M, which only just fits; 90 or 100 Hz does not. Cap full side-by-side at 60 Hz, or use half
+  side-by-side at higher rates.
+- **Bitrate.** About twice the pixels of a 4K desktop. Measure before raising any default.
+
+The Windows hardware probe encoded 7680×2160 at a configured 60 fps through the AMD
+Media Foundation encoder and verified Level 6 in the SPS. With a simulated headset
+limited to 4096 pixels wide, the same source produced 3840×2160 half side-by-side at
+a configured 90 fps with Level 5.2. Both probes verified the layout and first IDR.
+The 7680×2160 IddCx mode and live headset playback still need hardware validation.
+
+### 11.4 S3: the stereo layout on the wire (proposal)
+
+This lets the app switch by itself instead of the user picking the source. It is a proposal and is not in the app's
+codec yet, so agree the numbers before either side ships it.
+
+The Windows host implements field 11 for compatibility testing. In the existing app,
+select the layout manually under **3D from**.
+
+```proto
+enum StereoLayout {
+  STEREO_NONE = 0;
+  STEREO_SIDE_BY_SIDE = 1;        // left eye in the left half, at full width per eye
+  STEREO_SIDE_BY_SIDE_HALF = 2;   // each eye squeezed to half the width
+  STEREO_TOP_BOTTOM = 3;          // left eye in the top half
+  STEREO_TOP_BOTTOM_HALF = 4;
+}
+
+message CodecConfig {
+  // ... fields 1-10 unchanged
+  StereoLayout stereo_layout = 11;
+}
+```
+
+- First version: the host sets it when the user marks a monitor as stereo in the host UI. Detecting a VRto3D or
+  geo-11 window can come later.
+- A change of layout is a new `codec_gen`, like any other layout change.
+- Never together with `embedded_depth`: a packed stereo picture needs no depth.
+- The app treats the flag as the default and the user's own setting overrides it.
+
+### 11.5 S4: MV-HEVC (NVIDIA only, later)
+
+- NVENC in Video Codec SDK 13.0 encodes MV-HEVC: two views, 8- or 10-bit 4:2:0, up to 27% fewer bits than two
+  separate streams, on Turing (RTX 20) and newer
+  ([NVIDIA](https://developer.nvidia.com/blog/enabling-stereoscopic-and-3d-views-using-mv-hevc-in-nvidia-video-codec-sdk-13-0/)).
+  FFmpeg's nvenc supports it.
+- The Vision Pro decodes MV-HEVC in hardware: it is what spatial video and Apple Immersive Video use.
+- It needs a `DecoderCaps` bit, a `CodecConfig` codec value, a decode path in the app, and the host taking the two
+  eyes as separate textures rather than one packed picture.
+- AMD's AMF documents no MV-HEVC encode, so the Z13 stays on side-by-side.
+- Worth doing only after S2 shows that bitrate is the limit.

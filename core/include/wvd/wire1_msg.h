@@ -14,6 +14,9 @@ namespace wvd {
 namespace msg {
 
 enum class Codec : uint32_t { Unknown = 0, Hevc = 1, H264 = 2, Av1 = 3 };
+enum class StereoLayout : uint32_t {
+  None = 0, SideBySide = 1, SideBySideHalf = 2, TopBottom = 3, TopBottomHalf = 4,
+};
 enum class ThermalState : uint32_t { Nominal = 0, Fair = 1, Serious = 2, Critical = 3 };
 enum class AuthResult : uint32_t { Ok = 0, PairingRequired = 1, PairingStarted = 2,
                                    Rejected = 3, LockedOut = 4, Busy = 5 };
@@ -139,6 +142,7 @@ struct CodecConfig {
   uint32_t frameRateMhz = 0;
   bool hasEmbeddedDepth = false;  // proto3 message presence
   EmbeddedDepthLayout embeddedDepth;
+  StereoLayout stereoLayout = StereoLayout::None;
   void write(pb::Writer& w) const;
   bool read(pb::Reader& r);
 };

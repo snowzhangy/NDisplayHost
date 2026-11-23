@@ -174,7 +174,9 @@ class Wire1Channel : public MediaChannel,
   size_t BacklogBytes() const override;
   uint32_t VideoBitrateLimitKbps() const override { return clientBitrateKbps_; }
   uint32_t VideoFrameRateLimit() const override { return clientFrameRate_; }
-  uint64_t MaxVideoPixelsPerSec() const override { return peerMaxPixelRate_.load(); }
+  VideoDecodeLimits GetVideoDecodeLimits() const override {
+    return {peerMaxWidth_.load(), peerMaxHeight_.load(), peerMaxPixelRate_.load()};
+  }
   bool PreferVideoQuality() const override { return clientPreferQuality_; }
   uint32_t VideoEpoch() const override { return videoEpoch_; }
   void SetWorkstationState(WorkstationState state);
@@ -324,6 +326,7 @@ class Wire1Channel : public MediaChannel,
   // DecoderCaps.embedded_depth / max_pixel_rate (game-depth plan §3.1). Set
   // once at Hello; read without m_ from the pipeline.
   std::atomic<bool> peerEmbeddedDepth_{false};
+  std::atomic<uint32_t> peerMaxWidth_{0}, peerMaxHeight_{0};
   std::atomic<uint64_t> peerMaxPixelRate_{0};
   // The HelloPayload.reserved combination last queued to the pipeline, and
   // the depth monitor list last seen from the headset (both under m_).

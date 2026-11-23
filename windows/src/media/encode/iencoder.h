@@ -55,6 +55,8 @@ struct EncoderInitDesc {
   uint32_t gopSeconds = 0;
   bool lowLatency = true;      // no B-frames, ~1 frame VBV, intra refresh
   bool preferQuality = true;
+  bool hevcOnly = false;      // wide full stereo can exceed the H.264 encoder limit
+  uint32_t hevcLevel = 0;     // HEVC general_level_idc, 0 = chosen by the encoder
   std::string tuningProfile;   // "N-AQ", "N-EMPH", "AMF-RDNA3"… (§4.6)
   // Pin one candidate by name ("mf-hw", "mf-sw-h264", "nvenc-hevc", "null-test");
   // empty = best available by tier.

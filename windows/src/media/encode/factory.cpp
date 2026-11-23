@@ -141,6 +141,7 @@ std::unique_ptr<IVideoEncoder> CreateBestEncoder(const EncoderInitDesc& desc,
   for (auto& c : ProbeEncoderCandidates(desc)) {
     if (!desc.pinEncoder.empty() && c.name != desc.pinEncoder) continue;
     if (!c.available || !c.create) continue;
+    if (desc.hevcOnly && !c.caps.hevc8) continue;
     if (c.vendor == Vendor::Test) continue;  // never automatic
     auto e = c.create(desc);
     if (e) {
@@ -166,6 +167,7 @@ std::unique_ptr<IVideoEncoder> CreateNextTier(const std::string& failedName,
   for (auto& c : ProbeEncoderCandidates(desc)) {
     if (past) {
       if (!c.available || !c.create) continue;
+      if (desc.hevcOnly && !c.caps.hevc8) continue;
       if (c.vendor == Vendor::Test && desc.tuningProfile != "null") continue;
       auto e = c.create(desc);
       if (e) {

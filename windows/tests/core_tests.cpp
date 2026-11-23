@@ -5,6 +5,7 @@
 #include "audio/loopback_capture.h"
 #include "screen_curtain.h"
 #include "session/link_rate.h"
+#include "session/media_session.h"
 #include "wvd/depth.h"
 #include "depth/synthetic_depth.h"
 #include <vector>
@@ -193,16 +194,67 @@ int main() {
   CHECK(d[12] + ((d[14] >> 4) << 8) == 1625);
   // Every advertised mode is something the headset accepts (even, <= 8192)
   // and the size menu has 16:9, 21:9 and 32:9 choices.
-  bool wide = false, ultrawide = false;
+  bool wide = false, ultrawide = false, sbs4k = false, sbs1440 = false, sbs720 = false;
   for (unsigned i = 0; i < kWvdReferenceModeCount; ++i) {
     const WvdMode& m = kWvdReferenceModes[i];
     CHECK(m.width % 2 == 0 && m.height % 2 == 0 && m.width <= 8192 && m.height <= 8192);
     CHECK(m.vSync >= 60 && WvdSignalTiming(m).pixelRate < 0xFFFFFFFFull);
     wide = wide || (m.width * 9 > m.height * 16 + m.height && m.width * 9 < m.height * 32 - m.height);
     ultrawide = ultrawide || m.width * 9 == m.height * 32;
+    sbs4k = sbs4k || (m.width == 7680 && m.height == 2160 && m.vSync == 60);
+    sbs1440 = sbs1440 || (m.width == 5120 && m.height == 1440 && m.vSync == 60);
+    sbs720 = sbs720 || (m.width == 2560 && m.height == 720 && m.vSync == 60);
   }
   CHECK(kWvdReferenceModes[0].width * 9 == kWvdReferenceModes[0].height * 16);
-  CHECK(wide && ultrawide);
+  CHECK(wide && ultrawide && sbs4k && sbs1440 && sbs720);
+
+  {
+    using msg::StereoLayout;
+    const VideoDecodeLimits headset{8192, 4320, 1000000000};
+    const auto full = PlanStereoEncode(7680, 2160, 90, StereoLayout::SideBySide, 16588800, headset);
+    CHECK(full.width == 7680 && full.height == 2160 && full.fps == 60);
+    CHECK(full.layout == StereoLayout::SideBySide);
+    const auto qhd = PlanStereoEncode(5120, 1440, 90, StereoLayout::SideBySide, 16588800, headset);
+    CHECK(qhd.width == 5120 && qhd.height == 1440 && qhd.fps == 90);
+    const auto half = PlanStereoEncode(7680, 2160, 90, StereoLayout::SideBySide, 16588800, headset, true);
+    CHECK(half.width == 3840 && half.height == 2160 && half.fps == 90);
+    CHECK(half.layout == StereoLayout::SideBySideHalf);
+    const auto widthLimited = PlanStereoEncode(7680, 2160, 60, StereoLayout::SideBySide,
+                                               16588800, {4096, 2160, 0});
+    CHECK(widthLimited.width == 3840 && widthLimited.layout == StereoLayout::SideBySideHalf);
+    const auto rateLimited = PlanStereoEncode(7680, 2160, 60, StereoLayout::SideBySide,
+                                              16588800, {8192, 4320, 400000000});
+    CHECK(uint64_t(rateLimited.width) * rateLimited.height * rateLimited.fps <= 400000000);
+    CHECK(rateLimited.layout == StereoLayout::SideBySideHalf && rateLimited.width % 4 == 0);
+    const auto hostLimited = PlanStereoEncode(7680, 2160, 60, StereoLayout::SideBySide,
+                                              8294400, headset);
+    CHECK(hostLimited.width == 3840 && hostLimited.layout == StereoLayout::SideBySideHalf);
+    const auto prepacked = PlanStereoEncode(3840, 2160, 60, StereoLayout::SideBySideHalf,
+                                            8294400, headset);
+    CHECK(prepacked.width == 3840 && prepacked.height == 2160);  // already squeezed
+    const auto topBottom = PlanStereoEncode(3840, 2160, 60, StereoLayout::TopBottomHalf,
+                                            4000000, headset);
+    CHECK(topBottom.height % 4 == 0 && topBottom.layout == StereoLayout::TopBottomHalf);
+    const auto packed1440 = PlanStereoEncode(7680, 2160, 90, StereoLayout::SideBySide,
+                                            16588800, headset, false, {2560, 1440, true});
+    CHECK(packed1440.width == 2560 && packed1440.height == 1440 && packed1440.fps == 90);
+    CHECK(packed1440.layout == StereoLayout::SideBySideHalf);
+    const auto full1440 = PlanStereoEncode(7680, 2160, 60, StereoLayout::SideBySide,
+                                          16588800, headset, false, {5120, 1440});
+    CHECK(full1440.width == 5120 && full1440.height == 1440);
+    CHECK(full1440.layout == StereoLayout::SideBySide);
+    const auto presetFallback = PlanStereoEncode(7680, 2160, 60, StereoLayout::SideBySide,
+                                                16588800, {4096, 2160, 0}, false, {5120, 1440});
+    CHECK(presetFallback.width == 2560 && presetFallback.height == 1440);
+    CHECK(presetFallback.layout == StereoLayout::SideBySideHalf);
+    const auto existingHalf = PlanStereoEncode(2560, 1440, 60, StereoLayout::SideBySideHalf,
+                                              8294400, headset, false, {3840, 2160});
+    CHECK(existingHalf.width == 2560 && existingHalf.height == 1440);
+    CHECK(existingHalf.layout == StereoLayout::SideBySideHalf);
+    const auto nonstandard = PlanStereoEncode(5120, 1600, 60, StereoLayout::SideBySide,
+                                             16588800, headset, false, {2560, 1440, true});
+    CHECK(nonstandard.width == 2304 && nonstandard.height == 1440);
+  }
 
   {
     // Embedded depth layout (GAME_DEPTH_HOST_PLAN.md §4) — the exact table the

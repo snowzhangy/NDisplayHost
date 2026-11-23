@@ -132,6 +132,10 @@ class NvencEncoder final : public IVideoEncoder {
     config.rcParams.enableLookahead = 0;
     config.rcParams.zeroReorderDelay = 1;
     auto& hevc = config.encodeCodecConfig.hevcConfig;
+    if (desc_.hevcLevel == NV_ENC_LEVEL_HEVC_6) {
+      hevc.level = NV_ENC_LEVEL_HEVC_6;
+      if (desc_.bitrateKbps > 60000) hevc.tier = NV_ENC_TIER_HEVC_HIGH;
+    }
     hevc.idrPeriod = config.gopLength;
     hevc.repeatSPSPPS = 1; hevc.chromaFormatIDC = 1;
     auto& vui = hevc.hevcVUIParameters;

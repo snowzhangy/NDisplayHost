@@ -41,6 +41,26 @@ int main() {
   }
   puts("GPU BGRA-to-NV12 BT.709 full-range colors passed");
 
+  {
+    FrameRing ring;
+    CHECK(SUCCEEDED(ring.Init(device.Get(), 2, 2)));
+    const UINT first = ring.AcquireWriteSlot();
+    ring.Publish(first, 1);
+    UINT reading = 0;
+    uint64_t sequence = 0;
+    CHECK(ring.AcquireLatest(reading, sequence) && reading == first && sequence == 1);
+    UINT previous = first;
+    for (uint64_t next = 2; next <= 8; ++next) {
+      const UINT writing = ring.AcquireWriteSlot();
+      CHECK(writing != reading && writing != previous);
+      ring.Publish(writing, next);
+      previous = writing;
+    }
+    ring.Release(reading);
+    CHECK(ring.AcquireLatest(reading, sequence) && reading == previous && sequence == 8);
+    ring.Release(reading);
+  }
+
   // Full-size picture through the session's path: ring slot (CPU upload) →
   // NV12 texture → CPU readback. Catches pitch/plane-layout and pool bugs
   // that a 2×2 solid colour cannot (row pitch is padded at this width).
@@ -114,6 +134,30 @@ int main() {
     for (size_t i = 0; i < size_t(w / 2) * (h / 2); ++i) CHECK(abs(int(out[i]) - 18) <= 1);
     CHECK(abs(int(out[size_t(w / 2) * (h / 2)]) - 255) <= 1);
     puts("GPU scaled conversion (1280x720 -> 640x360) passed");
+  }
+
+  // Half SBS keeps the eye boundary through horizontal squeeze and 4:2:0.
+  {
+    constexpr UINT srcW = 20, w = 8, h = 4;
+    FrameRing ring;
+    CHECK(SUCCEEDED(ring.Init(device.Get(), srcW, h)));
+    uint32_t frame[srcW * h];
+    for (UINT y = 0; y < h; ++y)
+      for (UINT x = 0; x < srcW; ++x)
+        frame[y * srcW + x] = x < srcW / 2 ? cases[0].bgra : cases[1].bgra;
+    const UINT slot = ring.AcquireWriteSlot();
+    ring.WriteCpuFrame(slot, reinterpret_cast<const uint8_t*>(frame), srcW * 4);
+    ID3D11Texture2D* nv12 = nullptr;
+    CHECK(SUCCEEDED(converter.ConvertToTexture(ring.SlotSrv(slot), srcW, h, w, h,
+                                               ChromaFilter::Box2x2, &nv12)));
+    std::vector<uint8_t> out;
+    CHECK(SUCCEEDED(converter.Readback(nv12, out)));
+    for (UINT x = 0; x < w; x += 2) {
+      const auto& eye = cases[x < w / 2 ? 0 : 1];
+      CHECK(abs(int(out[x]) - eye.y) <= 1 && abs(int(out[x + 1]) - eye.y) <= 1);
+      CHECK(abs(int(out[w * h + x]) - eye.u) <= 1);
+      CHECK(abs(int(out[w * h + x + 1]) - eye.v) <= 1);
+    }
   }
 
   // Embedded depth (GAME_DEPTH_HOST_PLAN.md §4): colour + guard band + sliced

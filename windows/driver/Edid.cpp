@@ -5,15 +5,16 @@
 // Entry 0 is the preferred mode (EDID detailed timing). The headset's size
 // menu offers whatever Windows lists for the monitor, so the wide and
 // ultrawide entries are what give it Mac Virtual Display's Standard / Wide /
-// Ultrawide choices (Apple: 16:9, 21:9, 32:9 at a fixed height). Sizes over
-// the 3840x2160 encode budget are scaled to fit before encoding.
+// Ultrawide choices (Apple: 16:9, 21:9, 32:9 at a fixed height). The 32:9
+// modes also carry two 16:9 eyes for full side-by-side stereo. The preferred
+// EDID timing stays at 3840x2160; IddCx callbacks supply the wider modes.
 const WvdMode kWvdReferenceModes[] = {
     {3840, 2160, 60}, {3840, 2160, 90}, {2560, 1440, 60},
-    {1920, 1080, 60}, {1920, 1080, 90}, {1920, 1080, 120},
+    {1920, 1080, 60}, {1920, 1080, 90}, {1920, 1080, 120}, {1280, 720, 60},
     // 21:9
     {5120, 2160, 60}, {3440, 1440, 60}, {2560, 1080, 60},
     // 32:9
-    {5120, 1440, 60}, {3840, 1080, 60}};
+    {7680, 2160, 60}, {5120, 1440, 60}, {3840, 1080, 60}, {2560, 720, 60}};
 const unsigned kWvdReferenceModeCount = sizeof(kWvdReferenceModes) / sizeof(kWvdReferenceModes[0]);
 
 void WvdBuildEdid(WvdEdid& out, const WvdMode& mode, uint32_t serial,

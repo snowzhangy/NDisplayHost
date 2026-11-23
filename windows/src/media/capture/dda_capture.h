@@ -82,7 +82,12 @@ class FrameRing {
 
   // Consumer side: newest published slot (newest-wins, §6.6).
   bool AcquireLatest(UINT& idxOut, uint64_t& seqOut);
-  void Release(UINT idx) { (void)idx; }  // P0: slots are overwritten on write
+  void Release(UINT idx);
+  struct ReadSlot {
+    FrameRing& ring;
+    UINT index;
+    ~ReadSlot() { ring.Release(index); }
+  };
 
   // Slot lifetime guard. A mode change makes the capture thread re-allocate
   // the slots; the encode thread may be holding a raw SRV from the old ones.
@@ -116,6 +121,7 @@ class FrameRing {
   // Ring bookkeeping: seq per slot (0 = never written).
   std::vector<uint64_t> slotSeq_;
   UINT newestIdx_ = 0;
+  UINT readingIdx_ = UINT_MAX;
   uint64_t newestSeq_ = 0;
   bool hasNewest_ = false;
   uint64_t written_ = 0, consumed_ = 0, overwritten_ = 0;
@@ -170,7 +176,8 @@ class DdaCapture {
   //   DXGI_ERROR_ACCESS_LOST  — re-create required (§4.1)
   // The image is copied when the desktop picture changed, or always when
   // `needImage` is set (a full picture is owed regardless of changes).
-  HRESULT Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needImage = true);
+  HRESULT Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needImage = true,
+                  bool metadataOnly = false);
 
  private:
   ComPtr<IDXGIOutputDuplication> dup_;

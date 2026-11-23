@@ -200,6 +200,18 @@ Rules:
 3. The SPS conformance window may crop only the encoder's own alignment padding below the coded
    height — never the strip.
 
+### 6.2 Packed stereo (GAME_DEPTH_HOST_PLAN.md §11)
+
+`CodecConfig.stereo_layout` (field 11) describes the full coded colour picture for this
+generation. Its values are 0 (none), 1 (side-by-side), 2 (half side-by-side), 3 (top-bottom),
+and 4 (half top-bottom). The left eye comes first. Half packing squeezes each eye along the
+split axis. The coded split axis is divisible by four so each eye starts on a 4:2:0 chroma
+boundary. Monitor dimensions and input coordinates still use the original desktop pixels.
+
+When the layout changes, send a new codec generation with its configuration and an IDR.
+Packed stereo and embedded depth are mutually exclusive. Older clients ignore field 11
+and can select the layout manually if they support packed stereo.
+
 ## 7. Pairing and authentication
 
 TLS exporter secrets (RFC 8446 §7.5), 32 bytes each, on the QUIC connection:

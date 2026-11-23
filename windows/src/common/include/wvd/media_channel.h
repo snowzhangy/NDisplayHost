@@ -7,6 +7,11 @@
 
 namespace wvd {
 
+struct VideoDecodeLimits {
+  uint32_t width = 0, height = 0;
+  uint64_t pixelsPerSecond = 0;
+};
+
 // In-process boundary between capture/encode and the WIRE v1 session.
 class MediaChannel {
  public:
@@ -17,9 +22,9 @@ class MediaChannel {
   virtual size_t BacklogBytes() const = 0;
   virtual uint32_t VideoBitrateLimitKbps() const = 0;
   virtual uint32_t VideoFrameRateLimit() const { return 0; }
-  // DecoderCaps.max_pixel_rate: luma samples/s the client will decode. The
-  // embedded depth strip counts against it (game-depth plan §4).
-  virtual uint64_t MaxVideoPixelsPerSec() const { return 0; }
+  // DecoderCaps limits for the full coded picture, including any depth strip.
+  // A zero field means the peer did not specify that limit.
+  virtual VideoDecodeLimits GetVideoDecodeLimits() const { return {}; }
   virtual bool PreferVideoQuality() const { return true; }
   // Odd epochs admit video. A change fences work queued for an earlier view.
   virtual uint32_t VideoEpoch() const { return 1; }

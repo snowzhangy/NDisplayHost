@@ -77,7 +77,7 @@ int CmdModes() {
       const bool scaled = uint64_t(m.width) * m.height > 3840ull * 2160ull;
       printf("  %5ux%-5u @ %3u Hz%s%s%s\n", m.width, m.height, m.refreshHz,
              m.current ? "  current" : "", m.native ? "  native" : "",
-             scaled ? "  (scaled to the 3840x2160 encode budget)" : "");
+             scaled ? "  (larger than the default non-stereo encode budget)" : "");
     }
   }
   if (!outputs) printf("no outputs\n");

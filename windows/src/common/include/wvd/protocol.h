@@ -175,7 +175,7 @@ struct CodecConfigPayload {
   uint8_t codec;        // Codec
   uint8_t hevcProfile;  // e.g. 1 = Main, 2 = Main10
   uint8_t flags;        // bit0 intraRefresh, bit1 sliceOutput, bit2 ltr
-  uint8_t reserved;     // bit0 kCodecConfigEmbeddedDepth (see below)
+  uint8_t reserved;     // bit 0: embedded depth, bits 1–3: stereo layout
   uint32_t width, height;
   uint32_t fpsNum, fpsDen;
   uint32_t bitrateKbps;
@@ -183,7 +183,9 @@ struct CodecConfigPayload {
   uint32_t csdSize;     // parameter sets trail the struct (after the layout when present)
 };
 
-// CodecConfigPayload.reserved bits.
+// CodecConfigPayload.reserved bits. The three stereo bits carry msg::StereoLayout.
+constexpr uint8_t kCodecConfigStereoShift = 1;
+constexpr uint8_t kCodecConfigStereoMask = 0x0e;
 constexpr uint8_t kCodecConfigEmbeddedDepth = 0x01;  // EmbeddedDepthPayload follows this struct,
                                                      // parameter sets follow the layout
 
