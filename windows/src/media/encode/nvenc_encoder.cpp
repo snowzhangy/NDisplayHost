@@ -237,6 +237,7 @@ class NvencEncoder final : public IVideoEncoder {
     forceKey_ = false;
     // NVENC's lock/unlock path is synchronous: these bytes are `source`.
     au.contentVer = source.contentVer; au.qpcCapture = source.qpcCapture;
+    au.layoutGen = source.layoutGen; au.videoEpoch = source.videoEpoch;
     au.refinement = source.qualityBoost; au.depthValid = source.depthValid;
     au.qpcEncodeOut = QpcNow();
     return S_OK;

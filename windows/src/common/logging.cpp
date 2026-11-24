@@ -1,5 +1,7 @@
 #include "wvd/logging.h"
 
+#include <share.h>
+
 #include <cstdio>
 #include <mutex>
 
@@ -42,8 +44,9 @@ void SetFile(const wchar_t* path) {
   }
   if (path && path[0]) {
     // Binary append: the lines are already UTF-8. (A ccs=UTF-8 stream is a
-    // wide-text stream and the CRT rejects narrow fputs on it.)
-    _wfopen_s(&g_file, path, L"ab");
+    // wide-text stream and the CRT rejects narrow fputs on it.) Readers may
+    // open the file while the host runs; a second writer may not.
+    g_file = _wfsopen(path, L"ab", _SH_DENYWR);
   }
 }
 

@@ -42,6 +42,22 @@ BOOL WINAPI CtrlHandler(DWORD type) {
   return TRUE;
 }
 
+// The panel's activity view only keeps the last minutes in memory, so a
+// session that lagged or dropped could not be diagnosed after the fact. The
+// listening host appends to stream.log in the identity store (WVM_HOME
+// redirects it); past 16 MB the file moves to stream.prev.log at startup.
+void OpenStreamLogFile() {
+  const std::string home = WvmHomeDir();
+  if (home.empty()) return;
+  const std::wstring dir = Utf8ToWideStr(home);
+  const std::wstring path = dir + L"\\stream.log";
+  WIN32_FILE_ATTRIBUTE_DATA fa{};
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) &&
+      ((ULONGLONG(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow) > (16ull << 20))
+    MoveFileExW(path.c_str(), (dir + L"\\stream.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+  log::SetFile(path.c_str());
+}
+
 
 void Usage() {
   printf(
@@ -361,10 +377,12 @@ int RoleStream(int argc, char** argv) {
   if (!stopSignal.Watch(a.stopEvent, g_quit)) return 1;
   if (g_quit) return 0;
   log::Init("media", a.verbose ? log::Level::Verbose : log::Level::Info);
+  if (!a.demoSeconds && !a.listenPort) a.listenPort = kQuicDefaultPort;
+  if (a.listenPort) OpenStreamLogFile();
   // A captured log alone must say which host build produced it.
   WVD_LOGI("%s %s", kHostProduct, HostVersion().c_str());
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
-  if (!a.demoSeconds && !a.listenPort) a.listenPort = kQuicDefaultPort;
+  RaiseProcessPriority();
 
   SessionConfig cfg;
   cfg.monitorName = a.monitor;

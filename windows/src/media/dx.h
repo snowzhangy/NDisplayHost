@@ -54,6 +54,11 @@ void EnableD3D11ThreadSafety(ID3D11Device* device);
 // (best effort; see dx.cpp).
 void RaiseGpuPriority(ID3D11Device* device);
 
+// Once per streaming process: GPU scheduling class and CPU priority class
+// above a normal-priority game, so a game that saturates the GPU or the CPU
+// does not delay capture, encode or the network threads (see dx.cpp).
+void RaiseProcessPriority();
+
 // Enumerate attached outputs, then select by exact GDI name or monitor
 // interface. Empty selects the primary display.
 bool FindOutput(IDXGIFactory1* factory, const wchar_t* monitorNameOrNull,

@@ -33,6 +33,7 @@ HRESULT FrameRing::InitLocked(ID3D11Device* dev, UINT width, UINT height, UINT s
   slots_32_ = slotCount;
   slots_.assign(slotCount, nullptr);
   srvs_.assign(slotCount, nullptr);
+  gameColor_.assign(slotCount, {});
   slotSeq_.assign(slotCount, 0);
   nextWrite_ = 0;
   newestIdx_ = 0;
@@ -72,6 +73,7 @@ void FrameRing::Deinit() {
   AcquireSRWLockExclusive(&lock_);
   slots_.clear();
   srvs_.clear();
+  gameColor_.clear();
   slotSeq_.clear();
   slots_32_ = 0;
   hasNewest_ = false;
@@ -302,7 +304,7 @@ HRESULT DdaCapture::Acquire(uint32_t timeoutMs, CapturedFrame& out, bool needIma
     return E_UNEXPECTED;
   }
   UINT slot = ring_->AcquireWriteSlot();
-  ctx_->CopyResource(ring_->SlotTexture(slot), desktop.Get());
+  ctx_->CopyResource(ring_->DesktopWriteTexture(slot), desktop.Get());
   out.ringSlot = slot;
   out.copied = true;
   out.qpcCopyDone = QpcNow();
@@ -459,6 +461,41 @@ bool ConvertDdaPointerShape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& si,
   return true;
 }
 
+HRESULT FrameRing::WriteGpuFrame(UINT idx, ID3D11Texture2D* source) {
+  D3D11_TEXTURE2D_DESC desc{};
+  source->GetDesc(&desc);
+  if (desc.Width != width_ || desc.Height != height_ || desc.MipLevels != 1 ||
+      desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
+    return E_INVALIDARG;
+  ComPtr<ID3D11DeviceContext> ctx;
+  device_->GetImmediateContext(&ctx);
+  if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+    ctx->CopyResource(DesktopWriteTexture(idx), source);
+    return S_OK;
+  }
+  if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+    return DXGI_ERROR_UNSUPPORTED;
+  auto& slot = gameColor_[idx];
+  if (slot.format != desc.Format) {
+    GameColorSlot next;
+    D3D11_TEXTURE2D_DESC local{};
+    local.Width = desc.Width;
+    local.Height = desc.Height;
+    local.MipLevels = local.ArraySize = local.SampleDesc.Count = 1;
+    local.Format = desc.Format;
+    local.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = device_->CreateTexture2D(&local, nullptr, &next.texture);
+    if (FAILED(hr)) return hr;
+    hr = device_->CreateShaderResourceView(next.texture.Get(), nullptr, &next.srv);
+    if (FAILED(hr)) return hr;
+    next.format = desc.Format;
+    slot = std::move(next);
+  }
+  ctx->CopyResource(slot.texture.Get(), source);
+  slot.active = true;
+  return S_OK;
+}
+
 // Full-frame CPU upload into a ring slot (synthetic source / tests).
 void FrameRing::WriteCpuFrame(UINT idx, const uint8_t* bgra, UINT srcPitch) {
   if (idx >= slots_.size() || !slots_[idx] || !device_) return;
@@ -474,7 +511,7 @@ void FrameRing::WriteCpuFrame(UINT idx, const uint8_t* bgra, UINT srcPitch) {
   // The whole subresource: a D3D11_BOX left at back = 0 is EMPTY and makes
   // UpdateSubresource a silent no-op (the slot then stays black — which is
   // what the GDI bootstrap picture and the synthetic source used to show).
-  ctx->UpdateSubresource(slots_[idx].Get(), 0, nullptr, bgra, srcPitch, 0);
+  ctx->UpdateSubresource(DesktopWriteTexture(idx), 0, nullptr, bgra, srcPitch, 0);
 }
 
 }  // namespace wvd

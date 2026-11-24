@@ -76,6 +76,8 @@ struct SourcePicture {
   std::function<HRESULT(const uint8_t** data, size_t* size)> readCpu;
   uint64_t contentVer = 0;
   int64_t qpcCapture = 0;
+  uint64_t layoutGen = 0;
+  uint32_t videoEpoch = 1;
   bool qualityBoost = false;      // refinement frame (low QP, §6.4)
   bool depthValid = false;        // embedded-depth strip in this picture is real
 
@@ -98,6 +100,8 @@ struct EncodedAu {
   // stamps packet deadlines/flags from them.
   uint64_t contentVer = 0;
   int64_t qpcCapture = 0;
+  uint64_t layoutGen = 0;
+  uint32_t videoEpoch = 1;
   bool refinement = false;        // that picture was a quiet-refinement frame
   bool depthValid = false;        // that picture carries a real DEPTH_VALID strip
   int64_t qpcEncodeIn = 0;

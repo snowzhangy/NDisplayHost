@@ -268,8 +268,6 @@ class Wire1Channel : public MediaChannel,
   uint32_t sessionGen() const { return ctx_.sessionGen; }
   void SendPong(const msg::Ping& ping);
   void UpdateFecFromStats(const msg::ClientStats& stats);
-  // Latest layout generation we told the peer about (input validation).
-  uint32_t LayoutGenNow() const { return layoutGenOut_; }
   uint64_t HostMicroseconds() const;
 
   mutable std::mutex m_;
@@ -336,7 +334,7 @@ class Wire1Channel : public MediaChannel,
   WorkstationState workstationState_ = WorkstationState::Available;
   std::set<uint32_t> visibilityExceptions_;
   bool allMonitorsHidden_ = false;
-  bool awaitingVisibleIdr_ = false;
+  bool awaitingIdr_ = false;
 
   // Which monitor the media belongs to is only stated on the packed media
   // packet, so a codec configuration or cursor shape that arrives before the

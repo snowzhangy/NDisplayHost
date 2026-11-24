@@ -8,6 +8,7 @@
 #include "session/media_session.h"
 #include "wvd/depth.h"
 #include "depth/synthetic_depth.h"
+#include "depth/game_depth_ipc.h"
 #include <vector>
 #include <mmreg.h>
 #include <ks.h>
@@ -24,6 +25,40 @@ UINT WINAPI FakeSend(UINT count, LPINPUT inputs, int) {
   sent.insert(sent.end(), inputs, inputs + count); return count;
 }
 int main() {
+  {
+    using namespace game_depth;
+    CHECK(SupportedSize(3840, 2160));
+    CHECK(!SupportedSize(7680, 2160));
+    const auto id = reinterpret_cast<HWND>(uint64_t(GetCurrentProcessId()));
+    Mapping host, game;
+    CHECK(host.Create());
+    Handle pipe(CreateOfferPipe(id));
+    CHECK(pipe);
+    Handle alreadyExists(CreateOfferPipe(id));
+    CHECK(!alreadyExists);
+    const auto open = [&] {
+      return CreateFileW(PipeName(id).c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                         SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+    };
+    Handle client(open());
+    CHECK(client);
+    CHECK(!OfferMapping(pipe.Get(), 0, host));  // only the selected game process gets the handles
+    CHECK(!OfferMapping(pipe.Get(), GetCurrentProcessId(), host));  // re-arm the listener
+    client.Reset(open());
+    CHECK(client && OfferMapping(pipe.Get(), GetCurrentProcessId(), host));
+    Handle hostProcess;
+    CHECK(ImportOffer(client.Get(), game, hostProcess));
+    {
+      Mapping::Access access(host);
+      CHECK(access.frames && access.frames->version == kVersion);
+      access.frames->request.token = 42;
+    }
+    {
+      Mapping::Access access(game);
+      CHECK(access.frames && access.frames->request.token == 42);
+    }
+    DisconnectNamedPipe(pipe.Get());
+  }
   {
     DxOutputInfo primary, other, selected;
     primary.monitorName = LR"(\\.\DISPLAY49)";

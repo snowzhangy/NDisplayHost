@@ -16,7 +16,7 @@ Implemented source paths:
   and preferred-mode indices are supplied. The modes are 16:9 up to
   3840×2160 (60/90/120 Hz at 1080p), 21:9 (2560×1080, 3440×1440, 5120×2160)
   and 32:9 (2560×720, 3840×1080, 5120×1440, 7680×2160 at 60 Hz), all listed
-  in the headset's size menu. The 32:9 modes carry two full 16:9 eye images.
+  in Windows Display Settings. The 32:9 modes carry two full 16:9 eye images.
 * A 128-byte EDID base block has standard timings at bytes 38–53, detailed
   timings at byte 54, a two-byte 10 kHz pixel clock, correct active/blanking
   fields, physical dimensions, monitor name and checksum. `Edid.cpp` builds and

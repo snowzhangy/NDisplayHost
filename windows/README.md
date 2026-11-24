@@ -179,7 +179,8 @@ windows\devcmd.cmd cmake --build --preset amd
 1. Install [ReShade with full add-on support](https://reshade.me/#download) for
    DirectX 12 on the Steam install's `PBZ\platform\steam\PBZ.exe`. Use the
    game executable rather than the smaller `PBZ\steam\PBZ.exe` launcher.
-2. Copy `windows/build/game-depth/NDisplayGameDepth.addon64` next to the
+2. Copy `windows/build/game-depth/NDisplayGameDepth.addon64` from the same
+   build as the host next to the
    game executable. Copy `NDisplayGameDepth.addonfx` from the same build
    folder into an effect search directory in `ReShade.ini`. For
    `EffectSearchPaths=.\reshade-shaders\Shaders\**`, use
@@ -197,8 +198,11 @@ The add-on is for opted-in single-player games. It exports only while the
 game is in the foreground on the selected display, running on the host's
 capture adapter, and the headset requests depth. Supported back buffers are
 8-bit SDR or SDR presented through a 10-bit swap chain, up to 8,294,400
-pixels. The current bridge uses fenced readback and local shared memory.
-When no current scene map is available the video continues and the client
+pixels. The bridge copies colour through a private GPU texture and reads
+back only the quarter-scale depth map. A local pipe scoped to the Windows
+user and the foreground game's process exchanges the private handles.
+Outside the supported size or when GPU sharing is unavailable, the host
+logs the fallback and streams the desktop. When no current scene map is available the video continues and the client
 can use ZipDepth. A log line reading `game depth source attached` confirms
 that the host has received game depth.
 
@@ -214,9 +218,10 @@ that the host has received game depth.
    **2560 × 1440 · half side by side** sends two 1280×1440 eye images, which Vision Pro
    stretches horizontally for presentation. **5120 × 1440 · full side by side** keeps
    2560×1440 samples per eye when the source and encoder support it.
-3. In the headset app, use the display's **3D from** setting and select the streamed
-   layout if your build requires manual selection. The host logs when it switches a
-   full side-by-side source to half side-by-side. Choose **Half side-by-side** in that case.
+3. In the headset's Debug app, turn on 3D and set **3D from** to **Automatic**.
+   The app uses the host's signalled layout and shapes the screen from the decoded
+   frame. A manual selection overrides the host. Match the streamed layout on older
+   app builds that use manual selection.
 
 Full side-by-side defaults to a 16,588,800-pixel encode budget. At 7680×2160, it is
 capped at 60 fps and requests HEVC Level 6. If the encoder or the headset cannot
@@ -412,20 +417,20 @@ While a headset is connected the media worker holds a display-and-system power
 request. Without it the display idles off, Windows stops composing the desktop,
 and the stream freezes on its last picture.
 
-### Display size from the headset
+### Display size
 
-The monitor window's control bar on the headset has a size menu, like Mac
-Virtual Display's Standard / Wide / Ultrawide. Apple's headset sends the Mac a
-resolution request and the Mac re-applies its virtual display's modes; here the
-media worker lists the sizes the streamed monitor reports (`DisplayModes`,
-kind 18) and applies the one picked (`ModeChange`, kind 4) with a dynamic
-`ChangeDisplaySettingsEx`. Desktop Duplication then reports ACCESS_LOST, and the
-normal resize path rebuilds the ring, encoder and layout, so the headset gets a
-new `MonitorLayout` and `CodecConfig` and its window takes the new shape.
+The host advertises the one Windows display selected for sharing, using its
+desktop dimensions and origin. Change its desktop size in Windows Display
+Settings. The host follows the resize with an updated layout and an IDR, and
+sends a new codec configuration if the encoded size changes. Use **Stereo output
+resolution** to cap the packed picture independently of the Windows display size.
 
-* The change lasts for the session. When the headset disconnects the monitor
-  goes back to its configured mode. The headset remembers the last size per
-  host and asks for it again on the next connection.
+The host also implements mode enumeration and session-scoped changes for
+clients that support WIRE v1 `DisplayModes` and `DisplayModeRequest`.
+The current NDisplay app uses Windows for desktop size changes.
+
+* A size applied by a compatible client lasts for the session. When the
+  client disconnects the monitor goes back to its configured mode.
 * The WVD virtual monitor offers 16:9 (up to 3840×2160), 21:9 (2560×1080,
   3440×1440, 5120×2160) and 32:9 (2560×720, 3840×1080, 5120×1440, 7680×2160).
   Sizes that require encoder scaling are marked "streamed scaled" in the menu.

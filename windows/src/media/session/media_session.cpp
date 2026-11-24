@@ -29,6 +29,16 @@ void FitToBounds(uint32_t& width, uint32_t& height, uint32_t maxWidth, uint32_t 
   }
 }
 
+void FitDecoderBudget(uint32_t& width, uint32_t& height, uint32_t fps,
+                      uint64_t maxPixels, VideoDecodeLimits limits) {
+  if (limits.pixelsPerSecond) {
+    const auto peerPixels = (std::max)(uint64_t(1), limits.pixelsPerSecond / fps);
+    maxPixels = maxPixels ? (std::min)(maxPixels, peerPixels) : peerPixels;
+  }
+  FitToBounds(width, height, limits.width, limits.height);
+  FitEncodeSize(width, height, maxPixels, width, height);
+}
+
 bool FullStereoNeedsHevc(const StereoEncodePlan& plan) {
   return (plan.layout == msg::StereoLayout::SideBySide ||
           plan.layout == msg::StereoLayout::TopBottom) &&
@@ -123,15 +133,7 @@ StereoEncodePlan PlanStereoEncode(uint32_t width, uint32_t height, uint32_t fps,
   } else {
     FitToBounds(width, height, output.width, output.height);
   }
-  if (limits.pixelsPerSecond) {
-    const uint64_t peerPixels = limits.pixelsPerSecond / fps;
-    // FitEncodeSize uses zero for no cap; keep a nonzero budget if the
-    // peer reports fewer samples per second than the requested frame rate.
-    maxPixels = maxPixels ? (std::min)(maxPixels, (std::max)(1ull, peerPixels))
-                          : (std::max)(1ull, peerPixels);
-  }
-  FitToBounds(width, height, limits.width, limits.height);
-  FitEncodeSize(width, height, maxPixels, width, height);
+  FitDecoderBudget(width, height, fps, maxPixels, limits);
   // A 4:2:0 chroma sample spans two pixels. Each eye must start on an
   // even coordinate so chroma never straddles the seam during conversion.
   if (layout == StereoLayout::SideBySide || layout == StereoLayout::SideBySideHalf)
@@ -146,11 +148,11 @@ StereoEncodePlan MediaSession::ChooseEncodePlan(UINT width, UINT height, bool fo
   const uint32_t fps = cfg_.fps ? cfg_.fps : 60;
   const uint64_t maxPixels = cfg_.maxEncodePixels.value_or(
       layout == msg::StereoLayout::SideBySide ? 2 * kDesktopEncodePixels : kDesktopEncodePixels);
+  const VideoDecodeLimits limits = channel_ ? channel_->GetVideoDecodeLimits() : VideoDecodeLimits{};
   if (layout == msg::StereoLayout::None) {
-    FitEncodeSize(width, height, maxPixels, width, height);
+    FitDecoderBudget(width, height, fps, maxPixels, limits);
     return {width, height, fps, layout};
   }
-  const VideoDecodeLimits limits = channel_ ? channel_->GetVideoDecodeLimits() : VideoDecodeLimits{};
   const bool h264 = cfg_.codec == "h264" || cfg_.codec == "mf-sw-h264";
   auto plan = PlanStereoEncode(width, height, fps, layout, maxPixels, limits, forceHalfSbs,
                                cfg_.stereoOutputSize);
@@ -306,6 +308,7 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
   } else if (cfg_.stereoLayout == msg::StereoLayout::None && cfg_.gameDepth && dda_) {
     gameDepth_ = std::make_unique<GameDepthCapture>();
     WVD_LOGI("game depth enabled: waiting for a headset request and a full-screen game with the NDisplay add-on");
+    gameDepth_->CheckSize(w, h);
   }
   encDesc_.fpsDen = 1;
   encDesc_.preferQuality = !channel_ || channel_->PreferVideoQuality();
@@ -323,6 +326,7 @@ HRESULT MediaSession::Start(std::shared_ptr<MediaChannel> channel) {
     std::lock_guard<std::mutex> lk(encMutex_);
     encoder_ = CreateBestEncoder(encDesc_, &encoderName_);
     if (!encoder_) FallbackToHalfSbsLocked(w, h);
+    if (encoder_) PublishEncodeModeLocked();
     codecConfigPending_ = true;
     csd_.clear();
   }
@@ -448,59 +452,30 @@ void MediaSession::PushMedia(SendWork sw) {
 }
 
 void MediaSession::BuildLayoutLocked(UINT w, UINT h) {
-  std::vector<MonitorDesc> list;
-  uint16_t captureIndex = 0;
+  MonitorDesc m{};
+  const auto id = synthetic ? std::string("SYNTH0") : WideToUtf8(outputInfo_.monitorName.c_str());
+  memcpy(m.id, id.data(), (std::min)(id.size(), sizeof(m.id) - 1));
+  m.width = w;
+  m.height = h;
+  m.dpiX = m.dpiY = 96;
+  m.refreshMilliHz = (cfg_.fps ? cfg_.fps : 60) * 1000;
+  m.primary = 1;
   if (!synthetic) {
-    // A mode change leaves the factory stale (IsCurrent false): its outputs
-    // would still report the old desktop rectangles.
-    if (factory_ && !factory_->IsCurrent()) factory_ = CreateDxgiFactory();
-    if (factory_) {
-      for (auto& o : EnumerateOutputs(factory_.Get())) {
-        MonitorDesc m{};
-        auto u = WideToUtf8(o.monitorName.c_str());
-        memcpy(m.id, u.data(), (std::min)(u.size(), sizeof(m.id) - 1));
-        m.x = o.desktopCoords.left;
-        m.y = o.desktopCoords.top;
-        m.width = UINT(o.desktopCoords.right - o.desktopCoords.left);
-        m.height = UINT(o.desktopCoords.bottom - o.desktopCoords.top);
-        POINT dpi = MonitorDpi(o.desktopCoords);
-        m.dpiX = UINT(dpi.x);
-        m.dpiY = UINT(dpi.y);
-        DisplayModeInfo currentMode;
-        if (CurrentDisplayMode(o.monitorName, currentMode))
-          m.refreshMilliHz = currentMode.refreshHz * 1000;
-        m.primary = (m.x == 0 && m.y == 0) ? 1 : 0;
-        const bool captured =
-            _wcsicmp(o.monitorName.c_str(), outputInfo_.monitorName.c_str()) == 0;
-        if (captured) {
-          // The captured monitor reports the captured surface size (the
-          // duplication's), not a possibly scaled desktop rect.
-          m.width = w;
-          m.height = h;
-          if (dda_ && dda_->refreshMilliHz()) m.refreshMilliHz = dda_->refreshMilliHz();
-        }
-        list.push_back(m);
-        if (captured) captureIndex = uint16_t(list.size() - 1);
-      }
-    }
+    const auto& rect = outputInfo_.desktopCoords;
+    m.x = rect.left;
+    m.y = rect.top;
+    const POINT dpi = MonitorDpi(rect);
+    m.dpiX = UINT(dpi.x);
+    m.dpiY = UINT(dpi.y);
+    DisplayModeInfo current;
+    if (CurrentDisplayMode(outputInfo_.monitorName, current)) m.refreshMilliHz = current.refreshHz * 1000;
+    if (dda_ && dda_->refreshMilliHz()) m.refreshMilliHz = dda_->refreshMilliHz();
   }
-  if (list.empty()) {
-    // Synthetic / headless: one virtual monitor at the ring size.
-    MonitorDesc m{};
-    strcpy_s(m.id, synthetic ? "SYNTH0" : "WVD0");
-    m.width = w;
-    m.height = h;
-    m.dpiX = m.dpiY = 96;
-    if (synthetic) m.refreshMilliHz = (cfg_.fps ? cfg_.fps : 60) * 1000;
-    m.primary = 1;
-    list.push_back(m);
-    captureIndex = 0;
-  }
-  monitors_ = std::move(list);
-  captureMonitorIndex_ = captureIndex;
+  // The app opens a window and a receiver for every advertised monitor.
+  // Keep the selected output's desktop offset for pointer mapping.
+  monitors_ = {m};
   layout_.Update(monitors_);
-  WVD_LOGI("layout: %zu monitor(s); capturing index %u (%s) %ux%u", monitors_.size(),
-           captureIndex, monitors_[captureIndex].id, w, h);
+  WVD_LOGI("layout: sharing %s %ux%u at (%d,%d)", m.id, w, h, m.x, m.y);
 }
 
 void MediaSession::SendMonitorLayout() {
@@ -513,7 +488,7 @@ void MediaSession::SendMonitorLayoutLocked() {
   MonitorLayoutPayload ml{};
   ml.layoutGen = gens_.layoutGen.load();
   ml.count = uint32_t(monitors_.size());
-  ml.captureIndex = captureMonitorIndex_.load();
+  ml.captureIndex = kCaptureMonitorIndex;
   w.Append(ml);
   w.AppendArray(monitors_);
   PushUrgent(w.Take());
@@ -530,16 +505,18 @@ void MediaSession::SendDisplayModes(uint32_t requestId, ModeChangeStatus status)
 
 void MediaSession::SendDisplayModesLocked(uint32_t requestId, ModeChangeStatus status) {
   std::vector<DisplayModeDesc> list;
-  const uint16_t index = captureMonitorIndex_.load();
+  const uint16_t index = kCaptureMonitorIndex;
+  EncodeMode activeMode;
+  {
+    std::lock_guard<std::mutex> lk(encodeModeMutex_);
+    activeMode = encodeMode_;
+  }
   auto describe = [&](uint32_t mw, uint32_t mh, uint32_t hz, bool current, bool native) {
     uint32_t flags = (current ? kModeCurrent : 0u) | (native ? kModeNative : 0u);
     auto plan = ChooseEncodePlan(mw, mh);
-    if (current) {
-      std::lock_guard<std::mutex> lk(encMutex_);
-      if (mw == encSourceW_ && mh == encSourceH_) {
-        plan.width = encColorW_;
-        plan.height = encColorH_;
-      }
+    if (current && mw == activeMode.sourceW && mh == activeMode.sourceH) {
+      plan.width = activeMode.colorW;
+      plan.height = activeMode.colorH;
     }
     if (plan.width != mw || plan.height != mh) flags |= kModeScaledForEncode;
     list.push_back(DisplayModeDesc{mw, mh, hz * 1000u, flags});
@@ -581,9 +558,9 @@ void MediaSession::HandleModeChange(PacketView pv) {
   if (!r) return;
   const uint32_t hz = (r->refreshMilliHz + 500) / 1000;
   ModeChangeStatus status = ModeChangeStatus::Unsupported;
-  if (r->monitor != captureMonitorIndex_.load()) {
+  if (r->monitor != kCaptureMonitorIndex) {
     WVD_LOGW("mode change for monitor %u, but this session streams monitor %u — refused",
-             r->monitor, captureMonitorIndex_.load());
+             r->monitor, kCaptureMonitorIndex);
   } else if (captureDevice_.empty() || !cfg_.allowModeChange) {
     // Fixed size: only "what it already is" can be granted.
     const bool same = r->width == ring_.width() && r->height == ring_.height();
@@ -726,7 +703,7 @@ bool MediaSession::DepthWantedLocked(EmbeddedDepthPayload& layout) {
 bool MediaSession::DepthRequested() {
   if (cfg_.stereoLayout != msg::StereoLayout::None || !channel_ || !clientDepthCap_.load())
     return false;
-  const uint16_t idx = captureMonitorIndex_.load();
+  const uint16_t idx = kCaptureMonitorIndex;
   std::lock_guard<std::mutex> lk(depthReqMutex_);
   return std::find(depthMonitorsReq_.begin(), depthMonitorsReq_.end(), idx) !=
          depthMonitorsReq_.end();
@@ -819,6 +796,7 @@ void MediaSession::RecordFrameIdentity(uint64_t ringSeq, uint64_t contentVer,
                                        std::shared_ptr<const DepthFrame> gameDepth) {
   std::lock_guard<std::mutex> lk(identMutex_);
   idents_.push_back(FrameIdentity{ringSeq, contentVer, qpcCapture, refinement, videoEpoch,
+                                  gens_.layoutGen.load(),
                                   std::move(gameDepth)});
   while (idents_.size() > 16) idents_.pop_front();
 }
@@ -843,6 +821,7 @@ bool MediaSession::RecreateEncoderLocked() {
   }
   encoder_ = std::move(next);
   encoderName_ = name;
+  PublishEncodeModeLocked();
   gens_.codecGen.fetch_add(1);
   codecConfigPending_ = true;
   csd_.clear();
@@ -851,6 +830,11 @@ bool MediaSession::RecreateEncoderLocked() {
            encDesc_.preferQuality ? "quality" : "speed",
            (unsigned long long)gens_.codecGen.load());
   return true;
+}
+
+void MediaSession::PublishEncodeModeLocked() {
+  std::lock_guard<std::mutex> lk(encodeModeMutex_);
+  encodeMode_ = {encSourceW_, encSourceH_, encColorW_, encColorH_};
 }
 
 uint32_t MediaSession::EffectiveFrameRate() const {
@@ -933,7 +917,8 @@ bool MediaSession::CaptureDda() {
     if (gameDepth_) {
       const auto plan = ChooseEncodePlan(ring_.width(), ring_.height());
       EmbeddedDepthPayload layout{};
-      if (DepthRequested() && DepthLayoutFits(plan.width, plan.height, layout)) {
+      if (DepthRequested() && gameDepth_->CheckSize(ring_.width(), ring_.height()) &&
+          DepthLayoutFits(plan.width, plan.height, layout)) {
         gameFrame = gameDepth_->Capture(outputInfo_.desktopCoords, outputInfo_.adapterLuid,
                                         rate, ring_, f, gameMap);
       } else {
@@ -998,7 +983,7 @@ bool MediaSession::CaptureDda() {
 
       // Cursor packets (shape on change + position) — §6.2.
       std::vector<std::vector<uint8_t>> curPkts;
-      cursor_->OnCapturedFrame(f, captureMonitorIndex_.load(), curPkts);
+      cursor_->OnCapturedFrame(f, kCaptureMonitorIndex, curPkts);
       for (auto& p : curPkts) PushUrgent(std::move(p));
 
       // Encode when content changed, or when a full picture is still owed
@@ -1009,8 +994,7 @@ bool MediaSession::CaptureDda() {
       // owed and is served from the retained frame below.
       const bool force = f.copied && forceFullFrame_.exchange(false);
       if (f.copied && (f.hadDirtyRects || force)) {
-        CaptureWork cw{f.contentVer, f.qpcCapture, false, force, epoch};
-        if (encQueue_.Push(cw)) {
+        if (encQueue_.Push(epoch)) {
           oweFirstPicture = false;
           // Anchor the quiet-refinement timer on the picture we just queued.
           lastContentChangeQpc_ = f.qpcCapture;
@@ -1037,8 +1021,7 @@ bool MediaSession::CaptureDda() {
           ring_.Publish(bslot, publishSeq);
           retainedGameFrame = false;
           lastContentChangeQpc_ = now;
-          CaptureWork cw{cv, now, false, true, epoch};
-          if (encQueue_.Push(cw)) {
+          if (encQueue_.Push(epoch)) {
             oweFirstPicture = false;
             forceFullFrame_ = false;
             WVD_LOGI("queued a GDI bootstrap frame (idle desktop; DDA reports only "
@@ -1053,7 +1036,7 @@ bool MediaSession::CaptureDda() {
         RecordFrameIdentity(++publishSeq, rcv, now, false, epoch);
         if (ring_.RepublishNewest(publishSeq)) {
           forceFullFrame_ = false;
-          encQueue_.Push(CaptureWork{rcv, now, false, true, epoch});
+          encQueue_.Push(epoch);
           nextPictureQpc = now + pictureInterval;
         }
       } else if (!oweFirstPicture && lastContentChangeQpc_ &&
@@ -1064,7 +1047,7 @@ bool MediaSession::CaptureDda() {
         // AcquireLatest used to report "nothing new", so refinement never ran.
         const uint64_t cv = gens_.contentVer.load();
         RecordFrameIdentity(++publishSeq, cv, now, true, epoch);
-        if (ring_.RepublishNewest(publishSeq) && encQueue_.Push(CaptureWork{cv, now, true, false, epoch}))
+        if (ring_.RepublishNewest(publishSeq) && encQueue_.Push(epoch))
           refinedContentVer_ = cv;
       }
     } else {
@@ -1116,6 +1099,7 @@ bool MediaSession::CaptureDda() {
         if (!ReconfigureEncoder(dda_->width(), dda_->height())) break;
       }
       // Re-read the layout after a desktop switch or refresh-only mode change.
+      outputInfo_.desktopCoords = current.desktopCoords;
       {
         std::lock_guard<std::mutex> lk(layoutMutex_);
         BuildLayoutLocked(dda_->width(), dda_->height());
@@ -1126,7 +1110,6 @@ bool MediaSession::CaptureDda() {
         }
       }
       dda_->SetRing(&ring_);
-      outputInfo_.desktopCoords = current.desktopCoords;
       forceFullFrame_ = true;  // new source → owe a full picture (§4.1)
       oweFirstPicture = true;  // ...and it may have to be bootstrapped again
       refinedContentVer_ = 0;
@@ -1223,8 +1206,7 @@ bool MediaSession::CaptureSynthetic() {
 
     RecordFrameIdentity(n, cf.contentVer, cf.qpcCapture, false, epoch);
     ring_.Publish(slot, n);
-    CaptureWork cw{cf.contentVer, cf.qpcCapture, false, false, epoch};
-    encQueue_.Push(cw);
+    encQueue_.Push(epoch);
     {
       std::lock_guard<std::mutex> lk(statsMutex_);
       ++capFrames_;
@@ -1264,6 +1246,7 @@ void MediaSession::EncodeLoop() {
   std::vector<uint8_t> nv12buf;
   bool forcedKeyPending = true;  // first picture = random access point (§6.6)
   uint32_t lastEpoch = 0;
+  uint64_t lastLayoutGen = 0;
 
   // Account for both application and MsQuic queues before encoding more.
   // Stale captures are superseded by the newest contents of the capture ring.
@@ -1291,14 +1274,14 @@ void MediaSession::EncodeLoop() {
   uint64_t lastSubmittedCodecGen = 0;
 
   while (!stopReq_) {
-    auto work = encQueue_.Pop(std::chrono::milliseconds(100));
-    if (!work) {
+    auto epoch = encQueue_.Pop(std::chrono::milliseconds(100));
+    if (!epoch) {
       // A still desktop sends nothing: the target can still climb back.
       if (adapt) linkRate.OnIdle(QpcDeltaMs(rateClock, QpcNow()));
       updateRate();
       continue;
     }
-    if (!(work->videoEpoch & 1u) || work->videoEpoch != VideoEpoch()) continue;
+    if (!(*epoch & 1u) || *epoch != VideoEpoch()) continue;
 
     if (channel_) {
       const int64_t waitStart = QpcNow();
@@ -1323,7 +1306,7 @@ void MediaSession::EncodeLoop() {
         // Pictures queued meanwhile are superseded by the newest one.
         size_t skipped = 1;
         while (auto newer = encQueue_.Pop(std::chrono::milliseconds(0))) {
-          work = newer;
+          epoch = newer;
           ++skipped;
         }
         std::lock_guard<std::mutex> lk(statsMutex_);
@@ -1334,7 +1317,7 @@ void MediaSession::EncodeLoop() {
       if (stopReq_) break;
       if (congested && channel_->BacklogBytes() >= transportBudget) continue;
     }
-    if (work->videoEpoch != VideoEpoch()) continue;
+    if (*epoch != VideoEpoch()) continue;
 
     // Embedded depth: a request/capability change becomes a codec
     // generation change (game-depth plan §3.3/§6).
@@ -1361,7 +1344,8 @@ void MediaSession::EncodeLoop() {
     // AcquireLatest, which would pair frame B's colour with frame A's depth
     // and mark it DEPTH_VALID.
     FrameIdentity fi;
-    if (!FindFrameIdentity(ringSeq, fi) || fi.videoEpoch != VideoEpoch()) continue;
+    if (!FindFrameIdentity(ringSeq, fi) || fi.videoEpoch != VideoEpoch() ||
+        fi.layoutGen != gens_.layoutGen.load()) continue;
 
     if (!converterReady_) continue;
 
@@ -1378,8 +1362,9 @@ void MediaSession::EncodeLoop() {
       std::lock_guard<std::mutex> lk(encMutex_);
       CsGuard cs(encCs_);  // the capture thread's TryEnter depth-layout read sees this window
       if (!encoder_) break;
-      if (fi.videoEpoch != lastEpoch) {
+      if (fi.videoEpoch != lastEpoch || fi.layoutGen != lastLayoutGen) {
         lastEpoch = fi.videoEpoch;
+        lastLayoutGen = fi.layoutGen;
         forcedKeyPending = true;
       }
       const bool quality = !channel_ || channel_->PreferVideoQuality();
@@ -1459,6 +1444,8 @@ void MediaSession::EncodeLoop() {
       };
       sp.contentVer = fi.contentVer;
       sp.qpcCapture = fi.qpcCapture;
+      sp.layoutGen = fi.layoutGen;
+      sp.videoEpoch = fi.videoEpoch;
       sp.qualityBoost = fi.refinement;
       sp.depthValid = depthValidPic;  // travels with the picture through a
                                       // pipelined encoder to its own header
@@ -1490,7 +1477,9 @@ void MediaSession::EncodeLoop() {
           forcedKeyPending = true;
         }
         au.bytes.clear();
-      } else if (!au.bytes.empty() && codecConfigPending_ && !au.key) {
+      } else if (!au.bytes.empty() && (au.videoEpoch != VideoEpoch() ||
+                                     au.layoutGen != gens_.layoutGen.load() ||
+                                     (codecConfigPending_ && !au.key))) {
         au.bytes.clear();
         forcedKeyPending = true;
         forceFullFrame_ = true;
@@ -1539,7 +1528,7 @@ void MediaSession::EncodeLoop() {
     PacketWriter w(PacketKind::Media, picSeq);
     MediaPayloadHeader mh{};
     mh.sessionGen = gens_.sessionGen.load();
-    mh.layoutGen = gens_.layoutGen.load();
+    mh.layoutGen = au.layoutGen;
     mh.codecGen = codecGen;
     mh.picSeq = uint32_t(picSeq);
     // Identity comes from the OUTPUT picture: an async encoder can hand back
@@ -1549,13 +1538,13 @@ void MediaSession::EncodeLoop() {
     const int64_t picQpc = au.qpcCapture ? au.qpcCapture : fi.qpcCapture;
     mh.contentVer = uint32_t(au.contentVer ? au.contentVer : fi.contentVer);
     mh.deadlineQpc = picQpc + MsToQpc(cfg_.deadlineMs);
-    mh.monitor = captureMonitorIndex_.load();
+    mh.monitor = kCaptureMonitorIndex;
     mh.slice = 0;
     mh.sliceCount = 1;  // P0: one unit per picture (§6.6 tile rules later)
     mh.flags = uint16_t((au.key ? 1u : 0u) | (au.refinement ? 2u : 0u) | 4u /*lastSlice*/ |
                         (au.depthValid ? kMediaDepthValid : 0));
     mh.dataSize = uint32_t(au.bytes.size());
-    mh.videoEpoch = fi.videoEpoch;
+    mh.videoEpoch = au.videoEpoch;
     w.Append(mh);
     w.AppendBytes(au.bytes.data(), au.bytes.size());
 
@@ -1765,11 +1754,12 @@ void MediaSession::SetAudioWanted(bool wanted) {
 void MediaSession::HandleRecovery(PacketView pv) {
   auto r = pv.Get<RecoveryRequestPayload>();
   if (!r) return;
-  if (r->codecGen != gens_.codecGen.load()) {
+  std::lock_guard<std::mutex> lk(encMutex_);
+  // The app requests an IDR with generation zero before it has a CodecConfig.
+  if (r->codecGen && r->codecGen != gens_.codecGen.load()) {
     WVD_LOGV("recovery for stale codecGen — ignored (§6.6)");
     return;
   }
-  std::lock_guard<std::mutex> lk(encMutex_);
   if (!encoder_) return;
   // §6.6: try reference invalidation / LTR first (module decides), else IDR;
   // P0 modules implement IDR + intra-refresh; LTR/refval negotiation Phase 1.

@@ -41,7 +41,7 @@ if(WVD_RESHADE_SDK_DIR)
   add_library(NDisplayGameDepth MODULE depth/reshade/game_depth_addon.cpp)
   target_include_directories(NDisplayGameDepth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(NDisplayGameDepth SYSTEM PRIVATE "${WVD_RESHADE_SDK_DIR}/include")
-  target_link_libraries(NDisplayGameDepth PRIVATE user32)
+  target_link_libraries(NDisplayGameDepth PRIVATE user32 advapi32)
   set_target_properties(NDisplayGameDepth PROPERTIES SUFFIX .addon64
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/game-depth"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/game-depth")

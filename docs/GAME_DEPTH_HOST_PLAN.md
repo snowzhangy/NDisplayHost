@@ -267,6 +267,10 @@ A small signed DLL, installed with the host under Program Files and injected wit
      colour instead of the duplicated desktop, and pairing is exact by construction.
 6. **Same GPU only.** If the game renders on a different adapter from the host's encoder (some hybrid laptops), do
    not hook.
+   The D3D12 add-on hands off colour in a same-adapter shared texture. The producer completes its colour
+   copy and depth readback before publishing. The host copies colour into its own ring and signals a
+   shared release fence, so the game can reuse the texture without waiting on the render thread. A
+   user-scoped local pipe binds the anonymous frame mapping to the foreground game's process.
 7. **Fail closed.** If anything is unexpected (wrong format, lost device, swap chain recreated, `Present` from a
    second thread), stop exporting depth and keep the game running. The host notices the missing frames and clears
    `DEPTH_VALID`.
@@ -429,13 +433,11 @@ limited to 4096 pixels wide, the same source produced 3840×2160 half side-by-si
 a configured 90 fps with Level 5.2. Both probes verified the layout and first IDR.
 The 7680×2160 IddCx mode and live headset playback still need hardware validation.
 
-### 11.4 S3: the stereo layout on the wire (proposal)
+### 11.4 S3: the stereo layout on the wire
 
-This lets the app switch by itself instead of the user picking the source. It is a proposal and is not in the app's
-codec yet, so agree the numbers before either side ships it.
-
-The Windows host implements field 11 for compatibility testing. In the existing app,
-select the layout manually under **3D from**.
+The Windows host and NDisplay Debug app use field 11. With
+**3D from → Automatic**, the app uses the host's layout and sizes the screen
+from the decoded picture. A manual layout selection overrides it.
 
 ```proto
 enum StereoLayout {

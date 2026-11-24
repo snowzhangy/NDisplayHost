@@ -625,7 +625,7 @@ void Wire1Channel::UpdateVideoVisibility() {
                        (allMonitorsHidden_ == bool(visibilityExceptions_.count(captureMonitorId_)));
   if (visible == bool(videoEpoch_ & 1u)) return;
   ++videoEpoch_;
-  awaitingVisibleIdr_ = visible;
+  awaitingIdr_ = visible;
   if (!visible) {
     pacer_.Clear();
     history_.clear();
@@ -651,7 +651,8 @@ void Wire1Channel::HandleControl(const msg::Envelope& env) {
       SendPong(env.ping);
       break;
     case K::RecoveryRequest:
-      if (auth_ == Auth::Ready && (videoEpoch_ & 1u))
+      if (auth_ == Auth::Ready && (videoEpoch_ & 1u) &&
+          env.recoveryRequest.monitorId == captureMonitorId_)
         QueueRecovery(env.recoveryRequest.codecGen, uint32_t(env.recoveryRequest.kind),
                       env.recoveryRequest.lastGoodPicSeq);
       break;
@@ -830,13 +831,15 @@ void Wire1Channel::OnLegacyLayout(const uint8_t* payload, uint32_t size) {
   const uint32_t count = ml.count;
   if (count > 16 || ml.captureIndex >= count ||
       size < sizeof(MonitorLayoutPayload) + count * sizeof(MonitorDesc)) return;
+  const uint32_t layoutGen = uint32_t(ml.layoutGen);
+  if (layoutGen < layoutGenOut_) return;
   list.resize(count);
   std::memcpy(list.data(), payload + sizeof(MonitorLayoutPayload),
               size_t(count) * sizeof(MonitorDesc));
 
   msg::Envelope out;
   out.kind = msg::Envelope::Kind::MonitorLayout;
-  out.monitorLayout.layoutGen = uint32_t(ml.layoutGen);
+  out.monitorLayout.layoutGen = layoutGen;
   // A new layout invalidates the monitor we said the media belongs to.
   captureKnown_ = false;
   for (uint32_t i = 0; i < count; ++i) {
@@ -852,7 +855,15 @@ void Wire1Channel::OnLegacyLayout(const uint8_t* payload, uint32_t size) {
     m.primary = list[i].primary != 0;
     out.monitorLayout.monitors.push_back(std::move(m));
   }
-  layoutGenOut_ = out.monitorLayout.layoutGen;
+  if (layoutGen != layoutGenOut_) {
+    layoutGenOut_ = layoutGen;
+    // The app rejects the previous layout. Start this layout with a clean
+    // reference picture and stop spending bandwidth on queued old shards.
+    pacer_.Clear();
+    history_.clear();
+    historyBytes_ = 0;
+    awaitingIdr_ = true;
+  }
   captureMonitorId_ = uint16_t(ml.captureIndex + 1);
   UpdateVideoVisibility();
   SendEnvelopeOn(control_, out, streams_[control_]);
@@ -1051,9 +1062,10 @@ void Wire1Channel::OnAudioPacket(const AudioPayload& a, const int16_t* pcm, uint
 void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size_t auBytes,
                            std::unique_lock<std::mutex>& lock) {
   if (!mediaFlowBound_ || !auBytes || mh.codecGen != codecGenOut_ ||
-      mh.videoEpoch != videoEpoch_ || !(mh.videoEpoch & 1u)) return;
+      mh.layoutGen != layoutGenOut_ || mh.videoEpoch != videoEpoch_ ||
+      !(mh.videoEpoch & 1u)) return;
   const auto monitorId = uint16_t(mh.monitor + 1);
-  if (monitorId != captureMonitorId_ || (awaitingVisibleIdr_ && !(mh.flags & 1u))) return;
+  if (monitorId != captureMonitorId_ || (awaitingIdr_ && !(mh.flags & 1u))) return;
   if (pendingCodecConfig_) {
     pendingCodecConfig_->codecConfig.monitorId = monitorId;
     SendEnvelope(*pendingCodecConfig_);
@@ -1113,7 +1125,7 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   lock.lock();
 
   if (!peerConnected_ || mh.codecGen != codecGenOut_ || mh.videoEpoch != videoEpoch_ ||
-      monitorId != captureMonitorId_) return;
+      mh.layoutGen != layoutGenOut_ || monitorId != captureMonitorId_) return;
   const size_t pictureBytes = size_t(frame.totalDataShards()) *
                               (frame.shardBytes() + dg::MediaShardHeader::kSize);
   if (!pacer_.Enqueue(std::move(datagrams), frameIntervalUs_, targetBitrateBps_, deadline, mh.videoEpoch)) {
@@ -1121,7 +1133,7 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
     return;
   }
   ++picturesOut_;
-  awaitingVisibleIdr_ = false;
+  awaitingIdr_ = false;
   if (desc.randomAccess) ++idrCount_;
   bytesOut_ += pictureBytes;
 

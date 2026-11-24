@@ -33,11 +33,13 @@ class SlowReceiver : public MediaChannel {
   uint32_t VideoBitrateLimitKbps() const override { return 0; }
   uint32_t VideoFrameRateLimit() const override { return frameRate; }
   uint32_t VideoEpoch() const override { return epoch; }
+  VideoDecodeLimits GetVideoDecodeLimits() const override { return decodeLimits; }
   bool PreferVideoQuality() const override { return preferQuality; }
   bool IsConnected() const override { return open_; }
   void Close() override { open_ = false; }
   std::atomic<uint32_t> frameRate{0}, epoch{1};
   std::atomic<bool> preferQuality{true};
+  VideoDecodeLimits decodeLimits;
  private:
   Received& received_;
   DWORD delay_;
@@ -104,15 +106,18 @@ int main() {
     config.codec = "null";
     config.synWidth = 640;
     config.synHeight = 360;
+    config.maxEncodePixels = 0;
     GenCounters generations;
     Received received;
     auto receiver = std::make_shared<SlowReceiver>(received, 0);
     receiver->frameRate = 30;
+    receiver->decodeLimits = {320, 4320, 1000000000};
     MediaSession session(config, generations);
     session.synthetic = true;
     CHECK(SUCCEEDED(session.Start(receiver)));
     Sleep(200);
     const auto before = session.GetSnapshot();
+    CHECK(before.encWidth == 320 && before.encHeight == 180);
     Sleep(1000);
     const auto capped = session.GetSnapshot();
     CHECK(capped.framesCaptured - before.framesCaptured >= 15);

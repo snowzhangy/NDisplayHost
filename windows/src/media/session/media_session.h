@@ -156,13 +156,6 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   Snapshot GetSnapshot();
 
  private:
-  struct CaptureWork {
-    uint64_t contentVer = 0;
-    int64_t qpcCapture = 0;
-    bool refinement = false;
-    bool forcedFull = false;  // first frame after start / re-create
-    uint32_t videoEpoch = 1;
-  };
   struct SendWork {
     std::vector<uint8_t> framed;  // one Media packet
     int64_t deadlineQpc = 0;
@@ -179,6 +172,7 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
     int64_t qpcCapture = 0;
     bool refinement = false;
     uint32_t videoEpoch = 1;
+    uint64_t layoutGen = 0;
     std::shared_ptr<const DepthFrame> gameDepth;
   };
   // Capture thread: record before making a slot and sequence visible to the encoder.
@@ -215,6 +209,7 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   bool FallbackToHalfSbsLocked(UINT width, UINT height);
   StereoEncodePlan ChooseEncodePlan(UINT width, UINT height, bool forceHalfSbs = false) const;
   bool RecreateEncoderLocked();
+  void PublishEncodeModeLocked();
   uint32_t VideoEpoch() const { return channel_ ? channel_->VideoEpoch() : 1; }
   uint32_t EffectiveFrameRate() const;
   // Caller holds encMutex_. False once the encoder
@@ -277,6 +272,11 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   std::mutex encMutex_;
   msg::StereoLayout encodedStereoLayout_ = msg::StereoLayout::None;
   UINT encSourceW_ = 0, encSourceH_ = 0;  // source dimensions matching the encoder
+  // Committed sizes for the display menu. Reporting reads this without
+  // taking encMutex_ or waiting for conversion/encoding.
+  std::mutex encodeModeMutex_;
+  struct EncodeMode { UINT sourceW, sourceH, colorW, colorH; };
+  EncodeMode encodeMode_{};
   std::atomic<uint32_t> encodeRateLimit_{0};  // stereo pacing cap shared with capture
   bool codecConfigPending_ = true;   // guarded by encMutex_
   std::vector<uint8_t> csd_;         // parameter sets of the current codecGen
@@ -307,7 +307,8 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   CRITICAL_SECTION encCs_;
 
   // Queues (§6.6: bounded, newest-wins, reported)
-  BoundedQueue<CaptureWork> encQueue_{2, OverflowPolicy::NewestWins};
+  // The queue wakes the encoder for one video epoch. The ring owns the frame identity.
+  BoundedQueue<uint32_t> encQueue_{2, OverflowPolicy::NewestWins};
   BoundedQueue<SendWork> sendQueue_{4, OverflowPolicy::Reject};
   // Ahead of media: control (layout, codec config, cursor shapes) must all
   // arrive, so it never drops silently; cursor positions are newest-wins.
@@ -353,9 +354,9 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   // desktop yields dirty-rect-free frames and nothing is ever sent.
   std::atomic<bool> forceFullFrame_{true};
 
-  // Index into monitors_ of the monitor this session captures (§7 media
-  // header + cursor mapping). Written under layoutMutex_, read anywhere.
-  std::atomic<uint16_t> captureMonitorIndex_{0};
+  // Windows streams one selected output. Index 0 on the capture side is
+  // always monitor ID 1 on WIRE v1, irrespective of DXGI output ordering.
+  static constexpr uint16_t kCaptureMonitorIndex = 0;
 
   // Display mode of the captured monitor (\\.\DISPLAYn; empty = synthetic).
   // A change made for the headset is undone when the session ends.

@@ -1,13 +1,16 @@
 #include "depth/game_depth_ipc.h"
 
 #include <d3d12.h>
+#include <wrl/client.h>
 #include <reshade.hpp>
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 
 using namespace reshade::api;
 using namespace wvd::game_depth;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -28,18 +31,25 @@ struct Readback {
   uint64_t capacity = 0;
   uint64_t fenceValue = 0;
   Frame frame;
-  format colorFormat{};
-  uint32_t colorPitch = 0, depthPitch = 0, depthOffset = 0;
+  ComPtr<ID3D12Resource> color;
+  Handle colorHandle;
+  uint64_t colorId = 0, consumerRelease = 0;
+  uint32_t depthPitch = 0;
 };
 
 struct __declspec(uuid("e9f06082-1f6e-4f32-becc-6f660c2d1f29")) CaptureState {
   Mapping mapping;
+  Handle pipe, host;
+  uint64_t producerId = 0, nextTexture = 0;
+  bool registered = false;
   int64_t frequency = 0;
   int64_t nextOpen = 0, nextCapture = 0;
   Request request;
   fence gpuFence{};
+  ComPtr<ID3D12Fence> releaseFence;
+  Handle releaseHandle;
   uint64_t nextFence = 0;
-  std::array<Readback, 3> slots;
+  std::array<Readback, kSlotCount> slots;
   Readback* queued = nullptr;
   bool failed = false;
   bool depthLogged = false;
@@ -48,6 +58,7 @@ struct __declspec(uuid("e9f06082-1f6e-4f32-becc-6f660c2d1f29")) CaptureState {
 void Init(effect_runtime* runtime) {
   if (runtime->get_device()->get_api() != device_api::d3d12) return;
   auto* state = runtime->create_private_data<CaptureState>();
+  state->producerId = Qpc();
   LARGE_INTEGER frequency{};
   QueryPerformanceFrequency(&frequency);
   state->frequency = frequency.QuadPart;
@@ -66,59 +77,126 @@ void Destroy(effect_runtime* runtime) {
   runtime->destroy_private_data<CaptureState>();
 }
 
-bool ReadRequest(effect_runtime* runtime, CaptureState& state, int64_t now, Request& request) {
-  if (now < state.nextOpen) return false;
-  if (!state.mapping.Open(false)) {
-    state.nextOpen = now + state.frequency / 4;
-    return false;
-  }
-  const auto window = static_cast<HWND>(runtime->get_hwnd());
-  if (!window || window != GetForegroundWindow()) return false;
-  Mapping::Access access(state.mapping);
-  if (!access.frames) return false;
-  request = access.frames->request;
-  if (!request.token || request.expires <= now || request.window != reinterpret_cast<uint64_t>(window) ||
-      !request.fps || !SupportedSize(request.width, request.height)) return false;
-  auto* device = reinterpret_cast<ID3D12Device*>(runtime->get_device()->get_native());
-  return SameAdapter(request.adapter, device->GetAdapterLuid());
+void RememberReleases(CaptureState& state, const SharedFrames& shared) {
+  if (shared.producerId != state.producerId) return;
+  for (size_t i = 0; i < state.slots.size(); ++i)
+    state.slots[i].consumerRelease =
+        (std::max)(state.slots[i].consumerRelease, shared.releases[i]);
 }
 
-void CopyColor(const Readback& slot, const uint8_t* src, uint32_t* dst) {
-  const uint32_t width = slot.frame.width;
-  for (uint32_t y = 0; y < slot.frame.height; ++y, src += slot.colorPitch, dst += width) {
-    const auto* row = reinterpret_cast<const uint32_t*>(src);
-    if (slot.colorFormat == format::b8g8r8a8_unorm || slot.colorFormat == format::b8g8r8a8_unorm_srgb) {
-      std::memcpy(dst, row, size_t(width) * sizeof(*dst));
-    } else if (slot.colorFormat == format::r10g10b10a2_unorm) {
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint32_t rgba = row[x];
-        dst[x] = 0xff000000u | ((rgba & 0x3fcu) << 14) |
-                 ((rgba >> 4) & 0xff00u) | ((rgba >> 22) & 0xffu);
+bool ReadRequest(effect_runtime* runtime, CaptureState& state, int64_t now, Request& request) {
+  const auto window = static_cast<HWND>(runtime->get_hwnd());
+  if (!window) return false;
+  if (!state.mapping) {
+    if (now < state.nextOpen || window != GetForegroundWindow()) return false;
+    // A replacement host must not signal over a still-pending release on
+    // another GPU queue. Wait by polling, with the game free to render.
+    if (state.releaseFence) {
+      const uint64_t completed = state.releaseFence->GetCompletedValue();
+      if (completed == UINT64_MAX) {
+        state.failed = true;
+        return false;
       }
-    } else {
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint32_t rgba = row[x];
-        dst[x] = (rgba & 0xff00ff00u) | ((rgba & 0xffu) << 16) | ((rgba >> 16) & 0xffu);
-      }
+      for (const auto& slot : state.slots)
+        if (slot.consumerRelease != UINT64_MAX && slot.consumerRelease > completed) return false;
+    }
+    if (!state.pipe) {
+      state.pipe.Reset(CreateFileW(PipeName(window).c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                  SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
+    }
+    if (!state.pipe || !ImportOffer(state.pipe.Get(), state.mapping, state.host)) {
+      if (state.pipe && !PeekNamedPipe(state.pipe.Get(), nullptr, 0, nullptr, nullptr, nullptr))
+        state.pipe.Reset();
+      state.nextOpen = now + state.frequency / 20;
+      return false;
     }
   }
+  {
+    Mapping::Access access(state.mapping);
+    if (!access.frames) return false;
+    auto& shared = *access.frames;
+    RememberReleases(state, shared);
+    request = shared.request;
+    if (request.token && request.expires > now &&
+        WaitForSingleObject(state.host.Get(), 0) == WAIT_TIMEOUT) {
+      auto* device = reinterpret_cast<ID3D12Device*>(runtime->get_device()->get_native());
+      if (window != GetForegroundWindow() || request.window != reinterpret_cast<uint64_t>(window) ||
+          !request.fps || !SupportedSize(request.width, request.height) ||
+          !SameAdapter(request.adapter, device->GetAdapterLuid())) return false;
+      if (!state.registered) {
+        shared.frame = {};
+        shared.releases = {};
+        shared.producerId = state.producerId;
+        shared.releaseFence = 0;
+        state.registered = true;
+      }
+      if (shared.producerId == state.producerId) return true;
+      // A replacement ReShade runtime owns the mapping. This instance can
+      // no longer recover the old release values, so it must stop writing.
+      state.failed = true;
+      return false;
+    }
+  }
+  state.pipe.Reset();
+  state.host.Reset();
+  state.mapping.Close();
+  state.registered = false;
+  return false;
+}
+
+bool PrepareColor(ID3D12Device* device, CaptureState& state, Readback& slot,
+                  uint32_t width, uint32_t height, DXGI_FORMAT format) {
+  if (!state.releaseFence) {
+    HANDLE handle = nullptr;
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
+        FAILED(device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, nullptr, &handle)))
+      return false;
+    state.releaseFence = std::move(fence);
+    state.releaseHandle.Reset(handle);
+  }
+  if (slot.color) {
+    const auto desc = slot.color->GetDesc();
+    if (desc.Width == width && desc.Height == height && desc.Format == format) return true;
+  }
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Format = format;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> texture;
+  HANDLE handle = nullptr;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                             IID_PPV_ARGS(&texture))) ||
+      FAILED(device->CreateSharedHandle(texture.Get(), nullptr, GENERIC_ALL, nullptr, &handle)))
+    return false;
+  slot.color = std::move(texture);
+  slot.colorHandle.Reset(handle);
+  slot.colorId = ++state.nextTexture;
+  return true;
 }
 
 void Publish(device* device, CaptureState& state, const Readback& slot, int64_t now) {
   if (now - slot.frame.qpc >= state.frequency / 10) return;
   void* mapped = nullptr;
-  if (!device->map_buffer_region(slot.buffer, 0, slot.capacity, map_access::read_only, &mapped)) return;
+  if (slot.frame.depthValid &&
+      !device->map_buffer_region(slot.buffer, 0, slot.capacity, map_access::read_only, &mapped)) return;
   {
     Mapping::Access access(state.mapping);
     if (access.frames && access.frames->request.token == slot.frame.token &&
-        access.frames->request.expires > now) {
+        access.frames->request.expires > now && access.frames->producerId == state.producerId) {
       auto& shared = *access.frames;
-      const auto* bytes = static_cast<const uint8_t*>(mapped);
-      CopyColor(slot, bytes, shared.bgra);
       Frame frame = slot.frame;
       if (frame.depthValid) {
         const uint32_t width = frame.width / 4, height = frame.height / 16 * 4;
-        const auto* src = bytes + slot.depthOffset;
+        const auto* src = static_cast<const uint8_t*>(mapped);
         const uint16_t first = *reinterpret_cast<const uint16_t*>(src);
         uint16_t delta = 0;
         for (uint32_t y = 0; y < height; ++y, src += slot.depthPitch) {
@@ -129,6 +207,7 @@ void Publish(device* device, CaptureState& state, const Readback& slot, int64_t 
         // A cleared or placeholder depth texture contains no scene geometry.
         frame.depthValid = delta != 0;
       }
+      shared.releaseFence = reinterpret_cast<uint64_t>(state.releaseHandle.Get());
       shared.frame = frame;
       if (frame.depthValid && !state.depthLogged) {
         reshade::log::message(reshade::log::level::info, "NDisplay: exporting rendered colour and scene depth.");
@@ -136,12 +215,17 @@ void Publish(device* device, CaptureState& state, const Readback& slot, int64_t 
       }
     }
   }
-  device->unmap_buffer_region(slot.buffer);
+  if (mapped) device->unmap_buffer_region(slot.buffer);
 }
 
 void Begin(effect_runtime* runtime, command_list*, resource_view, resource_view) {
   auto* state = runtime->get_private_data<CaptureState>();
-  if (!state || state->failed) return;
+  if (!state) return;
+  const auto uniform = runtime->find_uniform_variable(kEffect, "NDisplayCaptureEnabled");
+  if (state->failed) {
+    if (uniform.handle) runtime->set_uniform_value_bool(uniform, false);
+    return;
+  }
   const int64_t now = Qpc();
   Request request;
   const bool active = ReadRequest(runtime, *state, now, request);
@@ -164,7 +248,6 @@ void Begin(effect_runtime* runtime, command_list*, resource_view, resource_view)
     if (newest) Publish(device, *state, *newest, now);
   }
 
-  const auto uniform = runtime->find_uniform_variable(kEffect, "NDisplayCaptureEnabled");
   if (uniform.handle) runtime->set_uniform_value_bool(uniform, active && now >= state->nextCapture);
 }
 
@@ -172,6 +255,13 @@ bool SupportedColor(format f) {
   return f == format::r8g8b8a8_unorm || f == format::r8g8b8a8_unorm_srgb ||
          f == format::b8g8r8a8_unorm || f == format::b8g8r8a8_unorm_srgb ||
          f == format::r10g10b10a2_unorm;
+}
+
+DXGI_FORMAT SharedColorFormat(format f) {
+  if (f == format::r10g10b10a2_unorm) return DXGI_FORMAT_R10G10B10A2_UNORM;
+  if (f == format::b8g8r8a8_unorm || f == format::b8g8r8a8_unorm_srgb)
+    return DXGI_FORMAT_B8G8R8A8_UNORM;
+  return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
 void Rendered(effect_runtime* runtime, effect_technique technique, command_list* list,
@@ -210,36 +300,65 @@ void Rendered(effect_runtime* runtime, effect_technique technique, command_list*
     state->failed = true;
     return;
   }
-  Readback* slot = nullptr;
-  for (auto& candidate : state->slots) {
-    if (!candidate.fenceValue) { slot = &candidate; break; }
+  size_t index = state->slots.size();
+  {
+    Mapping::Access access(state->mapping);
+    if (!access.frames || access.frames->producerId != state->producerId ||
+        access.frames->request.token != state->request.token) return;
+    RememberReleases(*state, *access.frames);
+    const uint64_t released = state->releaseFence ? state->releaseFence->GetCompletedValue() : 0;
+    if (released == UINT64_MAX) {
+      state->failed = true;
+      return;
+    }
+    for (size_t i = 0; i < state->slots.size(); ++i) {
+      const auto& candidate = state->slots[i];
+      const auto& current = access.frames->frame;
+      if (!candidate.fenceValue && (!current.sequence || current.slot != i) &&
+          candidate.consumerRelease <= released) {
+        index = i;
+        break;
+      }
+    }
   }
-  if (!slot) return;  // the GPU is behind; keep rendering and skip this export
+  if (index == state->slots.size()) return;  // never wait for the host or GPU
+  auto& slot = state->slots[index];
+  auto* native = reinterpret_cast<ID3D12Device*>(device->get_native());
+  if (!PrepareColor(native, *state, slot, width, height, SharedColorFormat(colorDesc.format))) {
+    reshade::log::message(reshade::log::level::warning,
+                         "NDisplay: shared GPU colour is unavailable; desktop capture continues.");
+    state->failed = true;
+    return;
+  }
 
-  slot->frame = {state->request.token, now, width, height, depth.handle != 0};
-  slot->colorFormat = colorDesc.format;
-  slot->colorPitch = Align(width * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-  slot->depthOffset = Align(slot->colorPitch * height, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-  slot->depthPitch = Align((width / 4) * 2, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-  const uint64_t bytes = slot->depthOffset + uint64_t(slot->depthPitch) * (height / 16 * 4);
-  if (slot->capacity < bytes) {
-    if (slot->buffer.handle) device->destroy_resource(slot->buffer);
-    slot->capacity = 0;
-    slot->buffer = {};
+  slot.frame = {state->request.token, now, width, height, depth.handle != 0, uint32_t(index),
+                state->nextFence + 1, reinterpret_cast<uint64_t>(slot.colorHandle.Get()),
+                slot.colorId};
+  slot.depthPitch = Align((width / 4) * 2, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+  const uint64_t bytes = uint64_t(slot.depthPitch) * (height / 16 * 4);
+  if (depth.handle && slot.capacity < bytes) {
+    if (slot.buffer.handle) device->destroy_resource(slot.buffer);
+    slot.capacity = 0;
+    slot.buffer = {};
     const resource_desc desc(bytes, memory_heap::readback, resource_usage::copy_dest);
-    if (!device->create_resource(desc, nullptr, resource_usage::copy_dest, &slot->buffer)) return;
-    slot->capacity = bytes;
+    if (!device->create_resource(desc, nullptr, resource_usage::copy_dest, &slot.buffer)) return;
+    slot.capacity = bytes;
   }
 
+  const resource sharedColor{reinterpret_cast<uint64_t>(slot.color.Get())};
+  // The shared surface crosses the API boundary in COMMON, after production
+  // completed and before the host signals release of its D3D11 copy.
+  list->barrier(sharedColor, resource_usage::general, resource_usage::copy_dest);
   list->barrier(color, resource_usage::render_target, resource_usage::copy_source);
-  list->copy_texture_to_buffer(color, 0, nullptr, slot->buffer, 0);
+  list->copy_texture_region(color, 0, nullptr, sharedColor, 0, nullptr);
   list->barrier(color, resource_usage::copy_source, resource_usage::render_target);
+  list->barrier(sharedColor, resource_usage::copy_dest, resource_usage::general);
   if (depth.handle) {
     list->barrier(depth, resource_usage::shader_resource, resource_usage::copy_source);
-    list->copy_texture_to_buffer(depth, 0, nullptr, slot->buffer, slot->depthOffset);
+    list->copy_texture_to_buffer(depth, 0, nullptr, slot.buffer, 0);
     list->barrier(depth, resource_usage::copy_source, resource_usage::shader_resource);
   }
-  state->queued = slot;
+  state->queued = &slot;
   state->nextCapture = now + state->frequency * 97 / (100 * state->request.fps);
 }
 

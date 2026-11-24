@@ -67,8 +67,19 @@ class FrameRing {
 
   // Producer side.
   UINT AcquireWriteSlot();  // rotating; returns index for CopyFullFrame
-  ID3D11Texture2D* SlotTexture(UINT i) { return slots_[i].Get(); }
-  ID3D11ShaderResourceView* SlotSrv(UINT i) { return srvs_[i].Get(); }
+  ID3D11Texture2D* DesktopWriteTexture(UINT i) {
+    gameColor_[i].active = false;
+    return slots_[i].Get();
+  }
+  ID3D11Texture2D* SlotTexture(UINT i) {
+    return gameColor_[i].active ? gameColor_[i].texture.Get() : slots_[i].Get();
+  }
+  ID3D11ShaderResourceView* SlotSrv(UINT i) {
+    return gameColor_[i].active ? gameColor_[i].srv.Get() : srvs_[i].Get();
+  }
+  // Copies a private shared game texture into local ring storage. The caller
+  // must fence completion before the game can write the shared source again.
+  HRESULT WriteGpuFrame(UINT idx, ID3D11Texture2D* source);
   void Publish(UINT idx, uint64_t seq);
   // Re-offer the newest published slot to the consumer: refinement and
   // recovery on a still desktop re-encode the retained frame (§6.4). False if
@@ -113,6 +124,13 @@ class FrameRing {
   ComPtr<ID3D11Device> device_;
   std::vector<ComPtr<ID3D11Texture2D>> slots_;
   std::vector<ComPtr<ID3D11ShaderResourceView>> srvs_;
+  struct GameColorSlot {
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    bool active = false;
+  };
+  std::vector<GameColorSlot> gameColor_;
   SRWLOCK lock_ = SRWLOCK_INIT;
   // Guards slot ALLOCATION against consumer use (mode change rebuilds slots
   // while the encode thread may hold a raw SRV from the previous set).
@@ -139,17 +157,12 @@ class DdaCapture {
 
   HRESULT Start(const InitDesc& d);
   void Stop();
-  bool active() const { return !!dup_; }
 
   // AUTHORITATIVE source size, in physical pixels, taken from the duplication
   // itself (never from desktop coordinates — those are DPI-scaled unless the
   // process is per-monitor DPI aware). The ring must be sized to this.
   UINT width() const { return desc_.ModeDesc.Width; }
   UINT height() const { return desc_.ModeDesc.Height; }
-  UINT refreshHz() const {
-    UINT den = desc_.ModeDesc.RefreshRate.Denominator;
-    return den ? desc_.ModeDesc.RefreshRate.Numerator / den : 60;
-  }
   uint32_t refreshMilliHz() const {
     const auto& rate = desc_.ModeDesc.RefreshRate;
     return rate.Denominator
@@ -157,7 +170,6 @@ class DdaCapture {
                           rate.Denominator)
                : 0u;
   }
-  DXGI_MODE_ROTATION rotation() const { return desc_.Rotation; }
   void SetRing(FrameRing* r) { ring_ = r; }
 
   // One-shot desktop grab of this output into a ring slot.

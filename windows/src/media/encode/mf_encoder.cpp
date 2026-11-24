@@ -362,8 +362,8 @@ class MfEncoder final : public IVideoEncoder {
       au.key = au.key || ContainsKeyframe(codec_, au.bytes.data(), au.bytes.size());
       // An async MFT can return an EARLIER picture than the one just
       // submitted; AppendSample resolved that picture's identity from the
-      // sample time. Only a picture we could not match falls back to the
-      // current input (never stamp a lagged output with fresh identity).
+      // sample time. Keep generations unset when it cannot be matched, so
+      // the session cannot send an ambiguous picture as current.
       if (!au.qpcCapture) {
         au.qpcCapture = src.qpcCapture;
         au.contentVer = src.contentVer;
@@ -655,13 +655,16 @@ class MfEncoder final : public IVideoEncoder {
   struct Pending {
     int64_t qpcCapture = 0;
     uint64_t contentVer = 0;
+    uint64_t layoutGen = 0;
+    uint32_t videoEpoch = 1;
     bool refinement = false;
     bool depthValid = false;
     LONGLONG time = 0;
   };
   void RegisterPending(const SourcePicture& src, LONGLONG time) {
     pending_.push_back(
-        Pending{src.qpcCapture, src.contentVer, src.qualityBoost, src.depthValid, time});
+        Pending{src.qpcCapture, src.contentVer, src.layoutGen, src.videoEpoch,
+                src.qualityBoost, src.depthValid, time});
     // An input that never produced output must not age the queue forever.
     while (pending_.size() > 64) pending_.pop_front();
   }
@@ -677,6 +680,8 @@ class MfEncoder final : public IVideoEncoder {
       if ((haveTime && it->time == t) || (!haveTime && it == pending_.begin())) {
         au.contentVer = it->contentVer;
         au.qpcCapture = it->qpcCapture;
+        au.layoutGen = it->layoutGen;
+        au.videoEpoch = it->videoEpoch;
         au.refinement = it->refinement;
         au.depthValid = it->depthValid;
         pending_.erase(it);

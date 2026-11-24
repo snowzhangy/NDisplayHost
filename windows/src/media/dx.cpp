@@ -20,11 +20,44 @@ void EnableD3D11ThreadSafety(ID3D11Device* device) {
 void RaiseGpuPriority(ID3D11Device* device) {
   // Capture/convert work is tiny but latency-critical; without this a game
   // that saturates the GPU can starve it for whole frames. Best effort: the
-  // call is refused for processes that may not raise priority.
+  // call is refused for processes that may not raise priority. This is only
+  // the device's rank INSIDE the process's scheduling class — see
+  // RaiseProcessPriority for the class itself.
   ComPtr<IDXGIDevice> dxgi;
   if (device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
-    if (FAILED(dxgi->SetGPUThreadPriority(7))) dxgi->SetGPUThreadPriority(2);
+    if (FAILED(dxgi->SetGPUThreadPriority(7)) && FAILED(dxgi->SetGPUThreadPriority(2)))
+      WVD_LOGW("GPU thread priority could not be raised");
   }
+}
+
+void RaiseProcessPriority() {
+  // A full-screen game keeps the GPU busy at NORMAL scheduling class, the
+  // same class this process gets by default, so the desktop copy and NV12
+  // convert queue behind whole game frames. Each late picture misses its
+  // deadline and costs a keyframe. A HIGH GPU class schedules them ahead of
+  // the game. That is a few hundred microseconds of GPU time per picture, so
+  // the game barely notices. HIGH rather than REALTIME: REALTIME can also
+  // preempt the compositor and is known to freeze some drivers' encoders
+  // with hardware-accelerated GPU scheduling.
+  // The class covers every D3D device of the process, including the ones a
+  // Media Foundation encoder creates for itself. Neither call needs elevation.
+  using SetSchedulingClass = LONG(APIENTRY*)(HANDLE, INT);
+  constexpr INT kGpuClassHigh = 4;  // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH
+  const HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+  const auto setClass = gdi ? reinterpret_cast<SetSchedulingClass>(GetProcAddress(
+                                  gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
+                            : nullptr;
+  const LONG gpuStatus = setClass ? setClass(GetCurrentProcess(), kGpuClassHigh) : -1;
+  // The network threads (QUIC acks, pongs, the datagram pacer) and the
+  // capture/encode threads mostly sleep; HIGH keeps the game's busy threads
+  // from delaying them.
+  const bool cpuHigh = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != FALSE;
+  if (gpuStatus == 0 && cpuHigh)
+    WVD_LOGI("priority: GPU scheduling class high, CPU priority class high");
+  else
+    WVD_LOGW("priority: GPU scheduling class %s (status 0x%08lx), CPU priority class %s",
+             gpuStatus == 0 ? "high" : "unchanged", static_cast<unsigned long>(gpuStatus),
+             cpuHigh ? "high" : "unchanged");
 }
 
 ComPtr<IDXGIFactory1> CreateDxgiFactory() {

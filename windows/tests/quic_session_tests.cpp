@@ -286,11 +286,11 @@ class FakeHeadset : public IQuicSink {
 
 // ---- packed packets, as the capture/encode pipeline would produce them ------
 
-std::vector<uint8_t> PackedLayout() {
+std::vector<uint8_t> PackedLayout(uint64_t layoutGen = 7) {
   PacketWriter w(PacketKind::MonitorLayout);
   MonitorLayoutPayload ml{};
   ml.count = 1;
-  ml.layoutGen = 7;
+  ml.layoutGen = layoutGen;
   w.Append(ml);
   MonitorDesc d{};
   d.width = 1920;
@@ -349,7 +349,7 @@ std::vector<uint8_t> WirePicture(uint32_t picSeq, uint32_t bytes, bool idr, Code
 
 std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t bytes, bool idr,
                                 Codec codec = Codec::HEVC, uint32_t videoEpoch = 1,
-                                uint16_t extraFlags = 0) {
+                                uint16_t extraFlags = 0, uint64_t layoutGen = 7) {
   const auto wire = WirePicture(picSeq, bytes, idr, codec);
   std::vector<uint8_t> annexB;
   if (idr) annexB = ParameterSets(codec);
@@ -364,7 +364,7 @@ std::vector<uint8_t> PackedMedia(uint32_t picSeq, uint64_t codecGen, uint32_t by
   mh.flags = uint16_t((idr ? 1u : 0u) | extraFlags);
   mh.videoEpoch = videoEpoch;
   mh.codecGen = codecGen;
-  mh.layoutGen = 7;
+  mh.layoutGen = layoutGen;
   mh.deadlineQpc = QpcNow() + MsToQpc(50);
   mh.monitor = 0;
   mh.dataSize = uint32_t(annexB.size());
@@ -1079,6 +1079,22 @@ bool Run(bool measure) {
     CHECK(sawDepthData, "no data shard with DEPTH_VALID arrived");
     CHECK(sawDepthParity, "no parity shard with DEPTH_VALID arrived");
   }
+
+  // The app rejects the old layout and needs an IDR on the new one, even
+  // when a refresh-only change leaves the codec generation intact.
+  CHECK(channel->SendPacket(PackedLayout(8)), "updated layout send");
+  CHECK(headset.WaitForEnvelope(Kind::MonitorLayout, 500, &layoutEnv) &&
+        layoutEnv.monitorLayout.layoutGen == 8, "updated layout did not arrive");
+  const uint32_t picture = first + 30;
+  CHECK(channel->SendPacket(PackedMedia(picture, codecGen + 2, 80, true, Codec::HEVC, 5)),
+        "old layout picture send");
+  CHECK(channel->SendPacket(PackedMedia(picture + 1, codecGen + 2, 80, false, Codec::HEVC, 5, 0, 8)),
+        "new layout dependent picture send");
+  CHECK(!takeVideo(picture, 100) && !takeVideo(picture + 1, 100),
+        "old layout or dependent picture made it to the new window layout");
+  CHECK(channel->SendPacket(PackedMedia(picture + 2, codecGen + 2, 80, true, Codec::HEVC, 5, 0, 8)),
+        "new layout IDR send");
+  CHECK(takeVideo(picture + 2, 500), "new layout did not resume from an IDR");
 
   // ---- disconnect ---------------------------------------------------------
   listener.Stop();
