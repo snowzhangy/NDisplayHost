@@ -46,6 +46,27 @@ class SlowReceiver : public MediaChannel {
   std::atomic<bool> open_{true};
 };
 
+// A headset stuck in a Wi-Fi loss burst: it repeats its keyframe request
+// (every T_rec on the real client; faster here) naming the same last picture
+// it decoded, because nothing new reaches it.
+class StormReceiver : public SlowReceiver {
+ public:
+  explicit StormReceiver(Received& received) : SlowReceiver(received, 0) {}
+  std::optional<std::vector<uint8_t>> RecvPacket(uint32_t) override {
+    Sleep(20);
+    if (!storm) return std::nullopt;
+    PacketWriter w(PacketKind::RecoveryRequest);
+    RecoveryRequestPayload r{};
+    r.codecGen = 0;  // generation-agnostic, as before the first CodecConfig
+    r.kind = 0;
+    r.refPicSeq = lastGood;
+    w.Append(r);
+    return w.Take();
+  }
+  std::atomic<bool> storm{false};
+  std::atomic<uint32_t> lastGood{1};
+};
+
 static std::vector<MediaPayloadHeader> Run(uint32_t backpressureMs, MediaSession::Snapshot* stats = nullptr) {
   SessionConfig config;
   config.codec = "null";
@@ -139,5 +160,41 @@ int main() {
     CHECK(first != received.pictures.end() && (first->flags & 1));
     CHECK(first != received.pictures.begin() && first->codecGen > received.pictures.front().codecGen);
   }
-  puts("slow-link delivery, frame-rate cap and pause/resume recovery passed");
+  // Recovery coalescing: ~50 repeated requests in one second must not become
+  // ~50 keyframes. A keyframe sent after the headset's last good picture
+  // answers it while still in flight (WIRE.md §8: 150 ms); then a new one is due.
+  {
+    SessionConfig config;
+    config.codec = "null";
+    config.fps = 60;
+    config.synWidth = 640;
+    config.synHeight = 360;
+    GenCounters generations;
+    Received received;
+    auto receiver = std::make_shared<StormReceiver>(received);
+    MediaSession session(config, generations);
+    session.synthetic = true;
+    CHECK(SUCCEEDED(session.Start(receiver)));
+    Sleep(400);
+    size_t stormBegin = 0, stormEnd = 0;
+    {
+      std::lock_guard<std::mutex> lock(received.mutex);
+      stormBegin = received.pictures.size();
+    }
+    receiver->storm = true;
+    Sleep(1000);
+    receiver->storm = false;
+    Sleep(100);
+    session.Stop();
+    std::lock_guard<std::mutex> lock(received.mutex);
+    stormEnd = received.pictures.size();
+    CHECK(stormEnd > stormBegin + 20);  // pictures kept flowing during the storm
+    unsigned keys = 0;
+    for (size_t i = stormBegin; i < stormEnd; ++i)
+      if (received.pictures[i].flags & 1) ++keys;
+    fprintf(stderr, "recovery storm: %u keyframes in %zu pictures\n", keys, stormEnd - stormBegin);
+    CHECK(keys >= 2);   // a keyframe that is not answered in time is re-sent
+    CHECK(keys <= 10);  // ~1 per 150-170 ms, not one per request (~50)
+  }
+  puts("slow-link delivery, frame-rate cap, pause/resume and recovery coalescing passed");
 }

@@ -3,7 +3,7 @@
 //   ndisplay stream  [options]            capture, encode, QUIC transport
 //   ndisplay input   [options]            console input helper (starts disarmed)
 //   ndisplay owner   [options]            software device, topology, service
-//   ndisplay network [options]            offline direct Wi-Fi access point
+//   ndisplay network [options]            direct connect: this PC as the headset's Wi-Fi
 //   ndisplay diag    <command> [options]  bring-up and measurement probes
 //   ndisplay --version                    host name and version
 //
@@ -31,7 +31,9 @@ constexpr const char* kUsage =
     "  input     keyboard/mouse helper for this session; starts disarmed\n"
     "  owner     software device, topology save/arrange/restore, keep-awake;\n"
     "            --install | --uninstall | --start | --stop need elevation\n"
-    "  network   offline direct Wi-Fi access point (password on stdin)\n"
+    "  network   direct connect: this PC becomes the headset's Wi-Fi network\n"
+    "            --ssid NAME [--band 5|auto|2.4] [--mode auto|hotspot|legacy]\n"
+    "            (password on stdin) | --probe (read-only)\n"
     "  diag      adapters | caps | modes | topology | capture | quic-probe |\n"
     "            owner-ping | coords-selftest | curtain-test\n"
     "\n"

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "wvd/direct_link.h"
 #include "wvd/logging.h"
 
 #pragma comment(lib, "dnsapi.lib")
@@ -55,6 +56,9 @@ LanAddress SelectLanAddress() {
   }
   LanAddress best;
   if (result != ERROR_SUCCESS) return best;
+  // Some drivers (MT7925) expose this PC's own hotspot as a hardware Wi-Fi
+  // port; it is advertised separately as the direct link, never as the LAN.
+  const uint32_t hotspot = IcsScopeAddress();
   for (auto* adapter = adapters(); adapter; adapter = adapter->Next) {
     if (adapter->OperStatus != IfOperStatusUp ||
         (adapter->IfType != IF_TYPE_ETHERNET_CSMACD && adapter->IfType != IF_TYPE_IEEE80211))
@@ -69,6 +73,7 @@ LanAddress SelectLanAddress() {
     for (auto* unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
       if (unicast->DadState != IpDadStatePreferred || !UsableAddress(unicast->Address)) continue;
       const auto* ip = reinterpret_cast<const SOCKADDR_IN*>(unicast->Address.lpSockaddr);
+      if (ip->sin_addr.S_un.S_addr == hotspot) break;
       if (!best.address || (gateway && !best.gateway) ||
           (gateway == best.gateway && adapter->Ipv4Metric < best.metric))
         best = {ip->sin_addr.S_un.S_addr, adapter->IfIndex, adapter->Ipv4Metric, gateway};
@@ -98,13 +103,47 @@ void Deregister(DnsRegistrationCtx& entry) {
   if (result != DNS_REQUEST_PENDING) entry.result = result;
 }
 
+// Prints the address line the control panel parses; `label` is the prefix.
+void Announce(const char* label, uint32_t address) {
+  if (address) printf("%s %s\n", label, FormatIpv4(address).c_str());
+  else printf("%s unavailable\n", label);
+  fflush(stdout);
+}
+
+// Adjusts the address/interface an advertiser should serve; it re-registers on
+// the next Pump when they changed.
+bool Retarget(DnsRegistration::Advertiser& advertiser, uint32_t address, uint32_t index) {
+  if (address == advertiser.address && index == advertiser.interfaceIndex) return false;
+  advertiser.address = address;
+  advertiser.interfaceIndex = index;
+  advertiser.nextRetry = 0;
+  return true;
+}
+
 }  // namespace
+
+DnsRegistration::Advertiser::~Advertiser() {
+  if (registration && !registration->retiring && registration->result == ERROR_SUCCESS)
+    Deregister(*registration);
+  // DNSAPI can finish after the worker exits this scope. The OS withdraws any
+  // registration that is still in flight at process exit.
+  if (registration && registration->result == DNS_REQUEST_PENDING) registration.release();
+}
 
 DnsRegistration::DnsRegistration() = default;
 
 void DnsRegistration::Start(const std::wstring& instanceName, uint16_t port,
                             const std::string& hostId) {
-  instanceFq_ = instanceName + L"._wvd._udp.local.";
+  lan_.instanceFq = instanceName + L"._wvd._udp.local.";
+  // The same name on the PC's own access point. A headset is only ever on one
+  // of the two links, and Vision Pro reconnects to the Bonjour *name* it last
+  // used: a headset that moves from the router to direct connect mid-session
+  // then finds this PC again by itself. Should Windows refuse a second
+  // registration of the name, fall back to a distinct one.
+  direct_.instanceFq = lan_.instanceFq;
+  std::wstring directName = instanceName;
+  if (directName.size() > 50) directName.resize(50);
+  direct_.fallbackFq = directName + L" (Direct)._wvd._udp.local.";
   wchar_t name[256]{};
   DWORD length = ARRAYSIZE(name);
   GetComputerNameExW(ComputerNameDnsHostname, name, &length);
@@ -123,73 +162,71 @@ void DnsRegistration::Refresh() {
     const bool first = nextScan_ == 0;
     nextScan_ = now + 5000;  // covers a route/metric change or unavailable notifications
     const auto lan = SelectLanAddress();
-    if (first || lan.address != address_ || lan.index != interfaceIndex_) {
-      address_ = lan.address;
-      interfaceIndex_ = lan.index;
-      nextRetry_ = 0;
-      if (address_) {
-        IN_ADDR ip{};
-        ip.S_un.S_addr = address_;
-        const auto& b = ip.S_un.S_un_b;
-        printf("HOST_LAN_ADDRESS %u.%u.%u.%u\n", unsigned(b.s_b1), unsigned(b.s_b2),
-               unsigned(b.s_b3), unsigned(b.s_b4));
-      } else {
-        puts("HOST_LAN_ADDRESS unavailable");
-      }
-      fflush(stdout);
-    }
+    if (Retarget(lan_, lan.address, lan.index) || first) Announce("HOST_LAN_ADDRESS", lan_.address);
+    const auto link = FindDirectLink();
+    const bool hadDirect = direct_.address != 0;
+    if (Retarget(direct_, link.address, link.ifIndex) && (link.address || hadDirect))
+      Announce("HOST_DIRECT_ADDRESS", direct_.address);
   }
+  Pump(lan_, now);
+  Pump(direct_, now);
+}
 
-  if (registration_) {
-    auto& entry = *registration_;
+void DnsRegistration::Pump(Advertiser& advertiser, uint64_t now) {
+  if (advertiser.registration) {
+    auto& entry = *advertiser.registration;
     const DWORD result = entry.result;
     if (result == DNS_REQUEST_PENDING) return;
     if (entry.retiring || result != ERROR_SUCCESS) {
       if (result != ERROR_SUCCESS) {
-        WVD_LOGW("DNS-SD %s failed (0x%lx)",
-                 entry.retiring ? "deregistration" : "registration", result);
-        nextRetry_ = now + 5000;
+        WVD_LOGW("DNS-SD %s of %ls failed (0x%lx)",
+                 entry.retiring ? "deregistration" : "registration",
+                 advertiser.instanceFq.c_str(), result);
+        advertiser.nextRetry = now + 5000;
+        if (!entry.retiring && !advertiser.fallbackFq.empty()) {
+          advertiser.instanceFq = advertiser.fallbackFq;
+          advertiser.fallbackFq.clear();
+          advertiser.nextRetry = now;  // retry at once under the distinct name
+        }
       }
-      registration_.reset();
-    } else if (entry.address != address_ || entry.request.InterfaceIndex != interfaceIndex_) {
+      advertiser.registration.reset();
+    } else if (entry.address != advertiser.address ||
+               entry.request.InterfaceIndex != advertiser.interfaceIndex) {
       Deregister(entry);
       return;
     } else if (!entry.logged) {
-      WVD_LOGI("DNS-SD registered %ls on interface %u", instanceFq_.c_str(), interfaceIndex_);
+      WVD_LOGI("DNS-SD registered %ls on interface %u", advertiser.instanceFq.c_str(),
+               advertiser.interfaceIndex);
       entry.logged = true;
     }
   }
-  if (registration_ || !address_ || now < nextRetry_) return;
+  if (advertiser.registration || !advertiser.address || now < advertiser.nextRetry) return;
 
   auto entry = std::make_unique<DnsRegistrationCtx>();
-  entry->address = address_;
+  entry->address = advertiser.address;
   PCWSTR keys[] = {L"v", L"id"};
   PCWSTR values[] = {L"1", hostId_.c_str()};
-  entry->instance = DnsServiceConstructInstance(instanceFq_.c_str(), hostName_.c_str(),
+  entry->instance = DnsServiceConstructInstance(advertiser.instanceFq.c_str(), hostName_.c_str(),
       &entry->address, nullptr, port_, 0, 0, ARRAYSIZE(keys), keys, values);
   if (!entry->instance) {
     WVD_LOGW("DNS-SD could not construct the service instance");
-    nextRetry_ = now + 5000;
+    advertiser.nextRetry = now + 5000;
     return;
   }
   entry->request.Version = DNS_QUERY_REQUEST_VERSION1;
-  entry->request.InterfaceIndex = interfaceIndex_;
+  entry->request.InterfaceIndex = advertiser.interfaceIndex;
   entry->request.pServiceInstance = entry->instance;
   entry->request.pRegisterCompletionCallback = RegisterComplete;
   entry->request.pQueryContext = entry.get();
   const DWORD result = DnsServiceRegister(&entry->request, nullptr);
   if (result != DNS_REQUEST_PENDING) entry->result = result;
-  registration_ = std::move(entry);
+  advertiser.registration = std::move(entry);
 }
 
 DnsRegistration::~DnsRegistration() {
   if (interfaceChange_) CancelMibChangeNotify2(interfaceChange_);
   if (addressChange_) CancelMibChangeNotify2(addressChange_);
-  if (registration_ && !registration_->retiring && registration_->result == ERROR_SUCCESS)
-    Deregister(*registration_);
-  // DNSAPI can finish after the worker exits this scope. The OS withdraws any
-  // registration that is still in flight at process exit.
-  if (registration_ && registration_->result == DNS_REQUEST_PENDING) registration_.release();
+  // lan_ and direct_ withdraw their registrations in ~Advertiser.
 }
 
 }  // namespace wvd

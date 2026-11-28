@@ -26,7 +26,7 @@ the PC and headset when pairing.
 
 | Executable | Role |
 | --- | --- |
-| `bin/NDisplayHostWin.exe` | **NDisplayHostWin**, the control panel: streaming, input consent, connection setup, direct Wi-Fi, tray |
+| `bin/NDisplayHostWin.exe` | **NDisplayHostWin**, the control panel: streaming, input consent, connection setup, direct connect, tray |
 | `bin/ndisplay.exe` | the command-line host: one binary, one role per process |
 | `bin/msquic.dll` | QUIC runtime, loaded by `ndisplay.exe` |
 | `driver/` | UMDF/IddCx virtual monitor provider, separate WDK project |
@@ -252,25 +252,24 @@ Click the NDisplayHostWin monitor icon to reopen it, or right-click for
 **Open NDisplayHostWin** and **Exit NDisplayHostWin**; the tooltip names the running version. The icon
 may be under the notification area's overflow arrow.
 Closing the panel or choosing **Exit NDisplayHostWin** stops all
-processes and any direct Wi-Fi network it created. Existing independently
+processes and turns off direct connect if it is on. Existing independently
 started command-line processes are not managed by this panel.
 
 The panel uses WPF and the .NET Framework compiler included on the development
 PC; CMake builds it without NuGet packages. If that compiler is unavailable,
 CMake reports that the UI target is skipped and the native tools still build.
 
-### No router or internet: direct Wi-Fi fallback
+### Direct connect · Vision Pro (no router)
 
-Expand **Direct Wi-Fi · no router**, choose a network name/password, and click
-**Create direct Wi-Fi**. Join that network from the headset's Wi-Fi settings.
-It is a local access point without internet sharing; an internet uplink is not
-required. The radio is unchanged until the button is clicked. Stop it with the
-same button or close the panel. See [connection details](CONNECTIONS.md).
-
-The laptop's MediaTek MT7925 driver reports Wi-Fi Direct group-owner and 5 GHz
-group-owner support. The helper compiles and its argument/stop paths are tested;
-actual radio startup and a headset joining still need manual validation. Windows
-Mobile Hotspot conflicts with this mode and must be off.
+Switch on **Direct connect · Vision Pro** and the PC becomes the Wi-Fi network
+the headset joins, so no router sits in between. When the PC has a network
+connection (Ethernet, or Wi-Fi to a router), Windows Mobile Hotspot shares it
+and the headset keeps internet access. With no network at all, a local-only
+Wi-Fi Direct network is used instead. The one switch also starts the host and
+stays on across launches. The network name and password are remembered so
+Vision Pro rejoins on its own, and 5 GHz is the default band. The radio is
+unchanged until the switch has been turned on once. See
+[connection details](CONNECTIONS.md#direct-connect--vision-pro-no-router).
 
 ### Command-line launcher
 

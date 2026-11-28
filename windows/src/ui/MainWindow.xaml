@@ -30,6 +30,27 @@
       <Setter Property="CaretBrush" Value="White"/>
     </Style>
     <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#EDF1F9"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+    <!-- An on/off switch: the pill track turns blue and the knob slides right. -->
+    <Style x:Key="Switch" TargetType="CheckBox">
+      <Setter Property="Foreground" Value="#EDF1F9"/><Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="CheckBox">
+        <DockPanel Background="Transparent">
+          <Border x:Name="Track" DockPanel.Dock="Right" Width="46" Height="26" CornerRadius="13" Background="#3A4961" VerticalAlignment="Center" Margin="12,0,0,0">
+            <Ellipse x:Name="Knob" Width="20" Height="20" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+          </Border>
+          <ContentPresenter VerticalAlignment="Center"/>
+        </DockPanel>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsChecked" Value="True">
+            <Setter TargetName="Track" Property="Background" Value="#4A76ED"/>
+            <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right"/>
+            <Setter TargetName="Knob" Property="Margin" Value="0,0,3,0"/>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Track" Property="BorderBrush" Value="#A6D4FF"/><Setter TargetName="Track" Property="BorderThickness" Value="2"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
     <Style x:Key="Card" TargetType="Border">
       <Setter Property="Background" Value="#1A2230"/><Setter Property="CornerRadius" Value="12"/>
       <Setter Property="Padding" Value="20"/><Setter Property="BorderBrush" Value="#2B374B"/><Setter Property="BorderThickness" Value="1"/>
@@ -103,6 +124,45 @@
         <StackPanel Grid.Column="2">
           <Border Style="{StaticResource Card}" Margin="0,0,0,14">
             <StackPanel>
+              <CheckBox x:Name="DirectToggle" Style="{StaticResource Switch}" AutomationProperties.Name="Direct connect Vision Pro"
+                        ToolTip="Vision Pro joins this PC's own Wi-Fi, with no router in between. The host starts too.">
+                <StackPanel>
+                  <TextBlock Text="Direct connect · Vision Pro" FontSize="18" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="DirectState" Text="Off" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,2,0,0"/>
+                </StackPanel>
+              </CheckBox>
+              <TextBlock x:Name="DirectIntro" Text="Vision Pro joins this PC's own Wi-Fi, with no router in between. One switch: the host starts too, and it stays on next time." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+              <!-- What to do on the headset, readable through passthrough. -->
+              <Border x:Name="JoinPanel" Background="#1B293A" BorderBrush="#3A6185" BorderThickness="1" CornerRadius="9" Padding="14,12" Margin="0,12,0,0" Visibility="Collapsed">
+                <StackPanel>
+                  <TextBlock Text="On Vision Pro: Settings → Wi-Fi" Foreground="#B9D6FF" FontSize="12"/>
+                  <TextBlock x:Name="JoinSsid" Text="NDisplay" FontSize="22" FontWeight="SemiBold" Margin="0,4,0,8" TextWrapping="Wrap"/>
+                  <TextBlock Text="Password" Foreground="#B9D6FF" FontSize="12"/>
+                  <TextBox x:Name="JoinPassword" IsReadOnly="True" FontFamily="Consolas" FontSize="22" Background="Transparent" BorderThickness="0" Padding="0,2" AutomationProperties.Name="Wi-Fi password"/>
+                </StackPanel>
+              </Border>
+              <TextBlock x:Name="NetworkStatus" Text="Checking Wi-Fi…" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+              <Expander x:Name="DirectSettingsExpander" Header="Network settings" Foreground="#A4B1C6" FontSize="12" Margin="0,10,0,0">
+                <StackPanel Margin="0,8,0,0">
+                  <TextBlock Text="Network name" FontSize="11" Foreground="{StaticResource Muted}"/><TextBox x:Name="SsidText" Text="NDisplay-Direct" MaxLength="32" Margin="0,5,0,8"/>
+                  <TextBlock Text="Password · saved for this Windows user" FontSize="11" Foreground="{StaticResource Muted}"/>
+                  <DockPanel Margin="0,5,0,8">
+                    <Button x:Name="NewPasswordButton" Content="New" Padding="11,7" DockPanel.Dock="Right" Margin="8,0,0,0" ToolTip="Generate a new password. Vision Pro will ask for it again."/>
+                    <PasswordBox x:Name="WifiPassword" Padding="10,7" Background="#101722" Foreground="White" BorderBrush="#3A4961"/>
+                  </DockPanel>
+                  <TextBlock Text="Wi-Fi band" FontSize="11" Foreground="{StaticResource Muted}" Margin="0,0,0,5"/>
+                  <ComboBox x:Name="BandChoice" AutomationProperties.Name="Wi-Fi band"
+                            ToolTip="5 GHz gives the headroom a video stream needs. Windows falls back to automatic when the adapter cannot host on 5 GHz.">
+                    <ComboBoxItem Content="5 GHz · recommended for streaming" Tag="5" IsSelected="True"/>
+                    <ComboBoxItem Content="Automatic · Windows chooses" Tag="auto"/>
+                    <ComboBoxItem Content="2.4 GHz · longer range, slower" Tag="2.4"/>
+                  </ComboBox>
+                </StackPanel>
+              </Expander>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+            <StackPanel>
               <TextBlock Text="Connection" FontSize="18" FontWeight="SemiBold"/>
               <TextBlock Text="Existing local network" FontWeight="SemiBold" Margin="0,14,0,4"/>
               <TextBlock Text="Use the same Wi-Fi or wired network. Internet is not required." Foreground="{StaticResource Muted}" TextWrapping="Wrap"/>
@@ -110,22 +170,11 @@
               <DockPanel><Button x:Name="CopyAddressButton" Content="Copy" Padding="11,7" DockPanel.Dock="Right" Margin="8,0,0,0"/><TextBox x:Name="AddressText" IsReadOnly="True" Text="Checking…"/></DockPanel>
               <TextBlock x:Name="FirewallStatus" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,8,0,0"/>
               <Button x:Name="FirewallButton" Content="Allow through firewall" HorizontalAlignment="Left" Margin="0,8,0,0"/>
-              <Border Height="1" Background="#344157" Margin="0,17,0,14"/>
-              <Expander x:Name="DirectExpander" Header="Direct Wi-Fi · no router" Foreground="#EDF1F9" FontWeight="SemiBold">
-              <StackPanel Margin="0,9,0,0">
-              <TextBlock Text="Create a private Wi-Fi network on this PC, then join it in Vision Pro Settings → Wi-Fi." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,10"/>
-              <TextBlock Text="Network name" FontSize="11" Foreground="{StaticResource Muted}"/><TextBox x:Name="SsidText" Text="NDisplay-Direct" MaxLength="32" Margin="0,5,0,8"/>
-              <TextBlock Text="Wi-Fi password" FontSize="11" Foreground="{StaticResource Muted}"/>
-              <DockPanel Margin="0,5,0,10"><Button x:Name="CopyPasswordButton" Content="Copy" Padding="11,7" DockPanel.Dock="Right" Margin="8,0,0,0"/><PasswordBox x:Name="WifiPassword" Padding="10,7" Background="#101722" Foreground="White" BorderBrush="#3A4961"/></DockPanel>
-              <Button x:Name="DirectButton" Content="Create direct Wi-Fi"/>
-              <TextBlock x:Name="NetworkStatus" Text="The network stays off until you create it." Foreground="{StaticResource Muted}" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
-              </StackPanel>
-              </Expander>
             </StackPanel>
           </Border>
           <Border Style="{StaticResource Card}" Background="#1B293A" BorderBrush="#3A6185" Margin="0,0,0,14" Padding="16">
             <StackPanel><TextBlock Text="Connect your Vision Pro" Foreground="#B9D6FF" FontWeight="SemiBold"/>
-              <TextBlock Text="Start the host. On Vision Pro, select this PC or add the address above with Secure QUIC. Compare the pairing code on both devices." Foreground="#D0DDEE" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"/></StackPanel>
+              <TextBlock x:Name="ConnectHint" Text="Start the host. On Vision Pro, select this PC or add the address above with Secure QUIC. Compare the pairing code on both devices." Foreground="#D0DDEE" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"/></StackPanel>
           </Border>
           <Button x:Name="ReceiverButton" Content="Test listener" ToolTip="Check the local UDP listener and QUIC handshake."/>
         </StackPanel>

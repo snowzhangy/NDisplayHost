@@ -1523,6 +1523,11 @@ void MediaSession::EncodeLoop() {
     if (au.bytes.empty()) continue;  // pipelined encoder / switched tiers
 
     const uint64_t picSeq = gens_.picSeq.fetch_add(1) + 1;
+    if (au.key) {  // recovery coalescing: the newest keyframe on its way out
+      lastKeyPicSeq_ = uint32_t(picSeq);
+      lastKeyQpc_ = QpcNow();
+      keyOwedSinceQpc_ = 0;
+    }
 
     // Media packet (§7 header with every generation).
     PacketWriter w(PacketKind::Media, picSeq);
@@ -1761,9 +1766,31 @@ void MediaSession::HandleRecovery(PacketView pv) {
     return;
   }
   if (!encoder_) return;
+  const int64_t now = QpcNow();
+  // A forced keyframe not yet produced already answers any request, including
+  // the transport's own (refPicSeq 0: it dropped a picture locally). Stale
+  // after 500 ms in case the encoder never honoured it.
+  const int64_t owedSince = keyOwedSinceQpc_.load();
+  if (owedSince && QpcDeltaMs(owedSince, now) < 500.0) {
+    WVD_LOGV("recovery: kind=%u — a forced IDR is already pending", r->kind);
+    return;
+  }
+  // The headset names the last picture it decoded. A keyframe sent after it
+  // is still in flight unless it is older than WIRE.md §8's 150 ms: then it
+  // was lost too and a new one is due.
+  constexpr double kKeyInFlightMs = 150.0;
+  const uint32_t lastKey = lastKeyPicSeq_.load();
+  const double keyAgeMs = QpcDeltaMs(lastKeyQpc_.load(), now);
+  if (r->refPicSeq != 0 && lastKey != 0 && int32_t(lastKey - r->refPicSeq) > 0 &&
+      keyAgeMs < kKeyInFlightMs) {
+    WVD_LOGI("recovery: kind=%u — IDR #%u (after last good #%u) sent %.0f ms ago, not forcing another",
+             r->kind, lastKey, r->refPicSeq, keyAgeMs);
+    return;
+  }
   // §6.6: try reference invalidation / LTR first (module decides), else IDR;
   // P0 modules implement IDR + intra-refresh; LTR/refval negotiation Phase 1.
   encoder_->ForceKeyframe();
+  keyOwedSinceQpc_ = now;
   forceFullFrame_ = true;  // a still desktop still needs a picture to carry the IDR
   WVD_LOGI("recovery: kind=%u → forced IDR, next picture is a RAP", r->kind);
 }

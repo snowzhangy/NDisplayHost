@@ -147,7 +147,10 @@ parity_j = XOR_i  C[j][i] * data_i      C[j][i] = 1 / ((k + j) XOR i)     j < m,
 - A picture of `frame_bytes` is cut into `N = ceil(frame_bytes / shard_bytes)` data shards; the last one is
   zero-padded. Data shards are grouped into `B = ceil(N / 48)` blocks of near-equal size (the first
   `N mod B` blocks get one extra shard). `m` per block is the host's choice (reference:
-  `ceil(k * fec_ratio)` clamped to `[1, 24]`, `fec_ratio` adapted from loss reports, 6-30%).
+  `ceil(k * fec_ratio)` clamped to `[1, 24]`, `fec_ratio` adapted from loss reports, 6-30%: raised at
+  once, held 30 s after the last loss, then eased down 2 points per report, because Wi-Fi loss bursts
+  repeat; random-access pictures get `2 * fec_ratio`, at least 25%, at most 50%). `m` is per block in
+  every shard header, so clients need no configuration for any of this.
 - Send order (recommended): data shards interleaved across blocks, then parity interleaved, so a Wi-Fi
   burst costs each block only a few shards. Data can leave before parity is computed.
 - Any `k` shards of a block reconstruct it.

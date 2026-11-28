@@ -353,6 +353,14 @@ HRESULT Start(std::shared_ptr<MediaChannel> channel /*may be null*/);
   // newly connected peer always gets a real picture. Without this, a still
   // desktop yields dirty-rect-free frames and nothing is ever sent.
   std::atomic<bool> forceFullFrame_{true};
+  // Recovery coalescing (§6.6). A Wi-Fi loss burst makes the headset repeat
+  // its keyframe request every T_rec (100 ms); forcing an IDR for each one
+  // floods the weakened link with the largest pictures there are (measured:
+  // 15-23 IDRs per 2 s burst). The newest keyframe emitted, and a forced one
+  // still on its way out of the encoder, answer a request already (WIRE.md §8).
+  std::atomic<uint32_t> lastKeyPicSeq_{0};
+  std::atomic<int64_t> lastKeyQpc_{0};
+  std::atomic<int64_t> keyOwedSinceQpc_{0};  // 0 = no forced keyframe pending
 
   // Windows streams one selected output. Index 0 on the capture side is
   // always monitor ID 1 on WIRE v1, irrespective of DXGI output ordering.

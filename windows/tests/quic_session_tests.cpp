@@ -647,6 +647,9 @@ bool Run(bool measure) {
   CHECK(sample.flags & dg::MediaShardHeader::kRandomAccess, "an IDR is marked random access");
   CHECK(sample.k >= 4, "block 0 has several data shards (k=%u)", sample.k);
   CHECK(sample.m >= 2, "block 0 carries parity (m=%u)", sample.m);
+  // Keyframes get double parity, at least 25%: losing one costs a stall plus
+  // another keyframe (default FEC is 10% for other pictures).
+  CHECK(sample.m * 4 >= sample.k, "a keyframe carries at least 25%% parity (k=%u m=%u)", sample.k, sample.m);
   CHECK(sample.shardBytes == 1052, "shard payload for a 1100 B peer limit (%u)", sample.shardBytes);
 
   // Throw two data shards away and let Reed-Solomon put them back.

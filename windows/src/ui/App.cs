@@ -69,7 +69,12 @@ namespace WvdHost {
     bool ready, busy, streaming, inputDisabled, allowClose, closing, lastRunning, initialized;
     string directAddress;
     string lanAddress;
-    bool firewallPrompted, firewallPresent;
+    bool firewallPrompted, firewallPresent, directFirewallPresent;
+    // Direct connect: what the network helper reported for the running network.
+    DirectSettings directSettings;
+    bool wifiAvailable = true, directOn, lastDirect;
+    string directMode, directBand, directInternet, directAdopted, directProbe, directFailure;
+    int directClients = -1, stationMhz;
     T Find<T>(string name) where T : class { return window.FindName(name) as T; }
     void Text(string name, string value) { Find<TextBlock>(name).Text = value; }
     void Footer(string value) { Text("FooterText", value); }
@@ -80,11 +85,13 @@ namespace WvdHost {
       window.Title = HostInfo.Full;
       Text("ProductTitle", HostInfo.Product);
       activity.Add(HostInfo.Full + " control panel");
-      byte[] random = new byte[12]; using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(random);
-      Find<PasswordBox>("WifiPassword").Password = Convert.ToBase64String(random);
       string shortName = Environment.MachineName;
       if (shortName.Length > 16) shortName = shortName.Substring(0, 16);
-      Find<TextBox>("SsidText").Text = "NDisplay-" + shortName;
+      directSettings = DirectSettings.Load("NDisplay-" + shortName);
+      Find<TextBox>("SsidText").Text = directSettings.Ssid;
+      Find<PasswordBox>("WifiPassword").Password = directSettings.Password;
+      foreach (ComboBoxItem item in Find<ComboBox>("BandChoice").Items)
+        if ((string)item.Tag == directSettings.Band) item.IsSelected = true;
       controller.Line += delegate(string line) {
         if (!window.Dispatcher.HasShutdownStarted) window.Dispatcher.BeginInvoke(new Action(delegate { OnLine(line); }));
       };
@@ -95,13 +102,17 @@ namespace WvdHost {
       Find<Button>("StopButton").Click += async delegate { await Run(controller.Stop); };
       Find<Button>("ReceiverButton").Click += async delegate { await Run(controller.ProbeListener); };
       Find<Button>("DisableInputButton").Click += async delegate { await Run(controller.DisableInput); };
-      Find<Button>("DirectButton").Click += async delegate {
-        string ssid = Find<TextBox>("SsidText").Text, password = Find<PasswordBox>("WifiPassword").Password;
-        await Run(delegate { return controller.ToggleDirectNetwork(ssid, password); });
-        if (!controller.NetworkRunning) directAddress = null;
+      // The switch's own IsChecked flip is overwritten by Refresh from the
+      // helper's real state, so a failed start never leaves it showing "on".
+      Find<CheckBox>("DirectToggle").Click += async delegate {
+        if (controller.NetworkRunning) await Run(StopDirect);
+        else await Run(StartDirect);
+      };
+      Find<Button>("NewPasswordButton").Click += delegate {
+        Find<PasswordBox>("WifiPassword").Password = DirectSettings.NewPassword();
+        Footer("New Wi-Fi password generated. Vision Pro will ask for it the next time it joins.");
       };
       Find<Button>("CopyAddressButton").Click += delegate { Copy(Find<TextBox>("AddressText").Text, "Receiver address copied."); };
-      Find<Button>("CopyPasswordButton").Click += delegate { Copy(Find<PasswordBox>("WifiPassword").Password, "Wi-Fi password copied. Join this network in Vision Pro Wi-Fi settings."); };
       Find<Button>("LogsButton").Click += delegate { ShowActivity(); };
       Find<Button>("FirewallButton").Click += async delegate {
         await Run(async delegate {
@@ -115,6 +126,12 @@ namespace WvdHost {
         if (initialized) return;
         initialized = true;
         timer.Start(); await Probe();
+        // It was on when the panel last closed: the user wants it, so bring it
+        // (and the host) straight back. Never in automated smoke/snapshot runs.
+        if (arguments.Length == 0 && ready && wifiAvailable && directSettings.Enabled) {
+          Footer("Direct connect was on last time. Turning it back on…");
+          await Run(StartDirect);
+        }
         if (arguments.Length == 2 && arguments[0] == "--smoke-test") await SmokeTest(arguments[1]);
         if (arguments.Length == 2 && arguments[0] == "--snapshot") Snapshot(arguments[1]);
       };
@@ -188,26 +205,59 @@ namespace WvdHost {
     async Task StartHost() {
       await RefreshDisplays(true);
       lanAddress = null;
-      if (!firewallPrompted) {
-        firewallPrompted = true;
-        await RefreshFirewall();
-        if (!firewallPresent && MessageBox.Show(window,
-            "Allow NDisplayHostWin to receive a Vision Pro connection on trusted local networks? " +
-            "Windows will ask for administrator approval for UDP port 47800.",
-            "Allow through firewall", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes) {
-          try { await controller.AllowFirewall(); }
-          catch (Exception error) { OnLine("Firewall setup: " + error.Message); }
-          await RefreshFirewall();
-        }
-      }
+      await EnsureFirewall();
       await controller.Start(Options());
+    }
+    // One question, once: the elevated step installs both the LAN rule and the
+    // direct-connect rule (the PC's own network counts as Public to Windows).
+    async Task EnsureFirewall() {
+      if (firewallPrompted) return;
+      firewallPrompted = true;
+      await RefreshFirewall();
+      if (firewallPresent && directFirewallPresent) return;
+      if (MessageBox.Show(window,
+          "Let Vision Pro connect to this PC?\n\nWindows will ask for administrator approval once, to allow " +
+          "UDP port 47800 on your local network and on direct connect.",
+          "Allow Vision Pro through the firewall", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+      try { await controller.AllowFirewall(); }
+      catch (Exception error) { OnLine("Firewall setup: " + error.Message); }
+      await RefreshFirewall();
+    }
+    string Band {
+      get { var item = Find<ComboBox>("BandChoice").SelectedItem as ComboBoxItem; return item == null ? "5" : (string)item.Tag; }
+    }
+    async Task StartDirect() {
+      string ssid = Find<TextBox>("SsidText").Text.Trim(), password = Find<PasswordBox>("WifiPassword").Password;
+      HostController.ValidateDirect(ssid, password);
+      directSettings.Ssid = ssid; directSettings.Password = password; directSettings.Band = Band;
+      try { directSettings.Save(); } catch (Exception error) { OnLine("Direct connect settings were not saved: " + error.Message); }
+      ResetDirect(); directFailure = null;
+      await EnsureFirewall();
+      await controller.StartDirectNetwork(ssid, password, Band);
+      directSettings.Enabled = true;
+      try { directSettings.Save(); } catch { }
+      // Nobody turns direct connect on for anything but streaming: start the
+      // host too, so the headset finds this PC as soon as it joins.
+      if (!controller.Running) await StartHost();
+    }
+    async Task StopDirect() {
+      await controller.StopDirectNetwork();
+      directSettings.Enabled = false;
+      try { directSettings.Save(); } catch { }
+    }
+    void ResetDirect() {
+      directOn = false; directMode = directBand = directInternet = directAdopted = directAddress = null;
+      directClients = -1;
     }
     async Task RefreshFirewall() {
       string status;
       try { status = await controller.Probe("diag firewall"); }
       catch (Exception) { status = ""; }
       firewallPresent = status.Contains("FIREWALL_RULE_PRESENT");
-      string details = firewallPresent ? "Windows Firewall rule is installed for trusted local networks."
+      directFirewallPresent = status.Contains("FIREWALL_DIRECT_RULE_PRESENT");
+      string details = firewallPresent && directFirewallPresent
+          ? "Windows Firewall allows the headset on trusted local networks and on direct connect."
+        : firewallPresent ? "Windows Firewall allows the headset on trusted local networks. Direct connect needs one more rule: Allow through firewall."
         : "Allow UDP 47800 through Windows Firewall to accept headset connections.";
       if (status.Contains("FIREWALL_PUBLIC"))
         details = "Windows reports an active Public network. On a trusted LAN, change its profile to Private in Windows Network & Internet settings. " + details;
@@ -257,9 +307,21 @@ namespace WvdHost {
         encoders.SelectedIndex = 0;
         Text("GpuLabel", (gpu.Success ? gpu.Groups[1].Value.Trim() : "Windows graphics adapter") +
           (caps.Contains("mf-hw") && Regex.IsMatch(caps, @"mf-hw[^\r\n]*AVAILABLE") ? " · hardware encoder available" : ""));
+        // Read-only: the radio is unchanged until direct connect is switched on.
         string wifi = await controller.Probe("network --probe");
-        if (wifi.Contains("WIFI_ADAPTER")) Text("NetworkStatus", "Wi-Fi adapter found. Start checks direct-network support; the radio is unchanged until then.");
-        else Text("NetworkStatus", "No Wi-Fi adapter found. Direct Wi-Fi requires a compatible wireless adapter.");
+        wifiAvailable = wifi.Contains("WIFI_ADAPTER ");
+        var station = Regex.Match(wifi, @"DIRECT_WIFI_STATION_MHZ=(\d+)");
+        stationMhz = station.Success ? Int32.Parse(station.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
+        var hotspot = Regex.Match(wifi, @"(?m)^DIRECT_WIFI_HOTSPOT_AVAILABLE internet=(\w+) source=(.*?)\r?$");
+        var unavailable = Regex.Match(wifi, @"(?m)^DIRECT_WIFI_HOTSPOT_UNAVAILABLE (.*?)\r?$");
+        directProbe = !wifiAvailable ? "This PC has no Wi-Fi adapter, so direct connect is unavailable."
+          : wifi.Contains("DIRECT_WIFI_HOTSPOT_ON") ? "Windows Mobile Hotspot is already on; direct connect will use it."
+          : hotspot.Success && hotspot.Groups[1].Value == "shared" ? "The headset keeps internet through this PC."
+          : hotspot.Success ? "Local only: this PC has no internet to share with the headset."
+          : "Local only: the headset has no internet while joined (Mobile Hotspot is unavailable: " +
+            (unavailable.Success ? unavailable.Groups[1].Value : "unknown reason") + ").";
+        if (wifiAvailable && stationMhz > 0 && stationMhz < 3000)
+          directProbe += " This PC's Wi-Fi is on 2.4 GHz, which would slow the headset too.";
         await RefreshFirewall();
         ready = true; Footer("Ready. Start the host, then connect from Vision Pro.");
       } catch (Exception error) { Footer("Device check failed: " + error.Message); }
@@ -290,14 +352,86 @@ namespace WvdHost {
         Text("FpsValue", "—"); Text("BitrateValue", "—"); Text("EncodeValue", "—"); Footer("Host stopped.");
       }
       if (line == "UI_INPUT_DISABLED") { inputDisabled = true; Footer("Keyboard and mouse control disabled. Stop and restart the host to allow it again."); }
-      if (line == "DIRECT_WIFI_STARTED") { directAddress = null; Text("NetworkStatus", "Direct Wi-Fi is on. Join the network above in Vision Pro Settings → Wi-Fi. No internet is needed."); Footer("Direct Wi-Fi network created."); }
-      if (line.StartsWith("DIRECT_WIFI_ADDRESS=")) directAddress = line.Substring("DIRECT_WIFI_ADDRESS=".Length);
+      OnDirectLine(line);
       if (line.StartsWith("HOST_LAN_ADDRESS ", StringComparison.Ordinal))
         lanAddress = line.Substring("HOST_LAN_ADDRESS ".Length);
-      if (line.Contains("DIRECT_WIFI_FAILED")) { Text("NetworkStatus", "Windows could not start direct Wi-Fi. Check Wi-Fi is on and Windows Mobile Hotspot is off. See Activity log for the error."); Footer("Direct Wi-Fi could not start on this adapter/configuration."); }
-      if (line == "DIRECT_WIFI_STOPPED") { directAddress = null; Text("NetworkStatus", "Direct Wi-Fi is off."); }
       if (line.Contains("session start failed")) { streaming = false; Footer("Capture could not start. See Activity log for details."); }
       Refresh();
+    }
+    static string After(string line, string prefix) {
+      return line.StartsWith(prefix, StringComparison.Ordinal) ? line.Substring(prefix.Length) : null;
+    }
+    // Lines from the network helper (see src/network/main.cpp) and the
+    // stream role's HOST_DIRECT_ADDRESS (its Bonjour on the PC's own network).
+    void OnDirectLine(string line) {
+      string value;
+      if ((value = After(line, "DIRECT_WIFI_MODE=")) != null) directMode = value;
+      else if ((value = After(line, "DIRECT_WIFI_BAND=")) != null) directBand = value;
+      else if ((value = After(line, "DIRECT_WIFI_INTERNET=")) != null) directInternet = value;
+      else if ((value = After(line, "DIRECT_WIFI_ADOPTED=")) != null) directAdopted = value;
+      else if ((value = After(line, "DIRECT_WIFI_ADDRESS=")) != null) directAddress = value;
+      else if ((value = After(line, "HOST_DIRECT_ADDRESS ")) != null) { if (controller.NetworkRunning && value != "unavailable") directAddress = value; }
+      else if ((value = After(line, "DIRECT_WIFI_STATION_MHZ=")) != null) Int32.TryParse(value, out stationMhz);
+      else if ((value = After(line, "DIRECT_WIFI_CLIENTS=")) != null) {
+        int count; if (!Int32.TryParse(value, out count)) return;
+        if (count > directClients && directClients >= 0) Footer("A device joined the direct-connect network.");
+        directClients = count;
+      }
+      else if ((value = After(line, "DIRECT_WIFI_NOTE ")) != null) Footer(value);
+      else if (line == "DIRECT_WIFI_STARTED") {
+        directOn = true; directFailure = null;
+        Footer("Direct connect is on. On Vision Pro, open Settings → Wi-Fi and join “" + DirectSsid + "”.");
+      }
+      else if (line == "DIRECT_WIFI_STOPPED" || line == "DIRECT_WIFI_UI_STOPPED") {
+        if (directOn) Footer("Direct connect is off. Vision Pro returns to its usual Wi-Fi.");
+        ResetDirect();
+      }
+      else if (line.StartsWith("DIRECT_WIFI_FAILED", StringComparison.Ordinal)) {
+        directFailure = line.Length > 19 ? line.Substring(19) : "unknown error";
+        Footer("Direct connect could not start. See Activity log for details.");
+      }
+    }
+    string DirectSsid { get { return directAdopted ?? directSettings.Ssid; } }
+    // Written from the user's side: what is happening, and the one next step.
+    void UpdateDirect(bool running) {
+      string pc = Environment.MachineName;
+      const string lanHint = "Start the host. On Vision Pro, select this PC or add the address above with Secure QUIC. Compare the pairing code on both devices.";
+      string state, status, hint = lanHint;
+      bool showJoin = false;
+      if (running && directOn) {
+        bool joined = directClients > 0;
+        state = streaming ? "On · streaming to Vision Pro" : joined ? "On · Vision Pro joined" : "On · waiting for Vision Pro to join";
+        showJoin = !joined;
+        var details = new List<string>();
+        if (directInternet != null && directInternet.StartsWith("shared ")) details.Add("The headset has internet through this PC.");
+        else details.Add("Local only: no internet on the headset while it is joined.");
+        if (stationMhz > 0 && stationMhz < 3000)
+          details.Add("This PC's Wi-Fi is on 2.4 GHz, which slows the headset too. Use Ethernet or 5 GHz Wi-Fi on this PC.");
+        if (!directFirewallPresent) details.Add("Windows Firewall is blocking the headset: click Allow through firewall.");
+        status = String.Join(" ", details);
+        hint = streaming ? "Connected directly to this PC. Turning direct connect off returns Vision Pro to its usual Wi-Fi."
+          : joined ? "In NDisplay on Vision Pro, select “" + pc + "”: it shows as online. The first time only, confirm the same pairing code on both devices."
+          : "On Vision Pro, join “" + DirectSsid + "” with the password shown. NDisplay then finds “" + pc + "” by itself.";
+      } else if (running) {
+        state = "Turning on…";
+        status = "This takes a few seconds.";
+      } else {
+        state = "Off";
+        status = directFailure != null ? "Could not turn on: " + directFailure + ". Check that Wi-Fi is on and airplane mode is off."
+          : directProbe ?? "Checking Wi-Fi…";
+      }
+      Text("DirectState", state);
+      Text("NetworkStatus", status);
+      Text("ConnectHint", hint);
+      Find<Border>("JoinPanel").Visibility = showJoin ? Visibility.Visible : Visibility.Collapsed;
+      Find<TextBlock>("DirectIntro").Visibility = running ? Visibility.Collapsed : Visibility.Visible;
+      if (showJoin) {
+        Text("JoinSsid", DirectSsid);
+        var password = Find<TextBox>("JoinPassword");
+        string shown = directAdopted != null ? "as set in Windows Settings → Mobile hotspot" : directSettings.Password;
+        if (password.Text != shown) password.Text = shown;
+        password.FontSize = directAdopted != null ? 13 : 22;
+      }
     }
     async void ConfirmPairing(ulong requestId, string code, string deviceName) {
       if (!controller.Running) return;
@@ -326,16 +460,21 @@ namespace WvdHost {
       Find<Button>("ReceiverButton").IsEnabled = running && !busy;
       Find<Button>("DisableInputButton").IsEnabled = running && controller.InputAvailable && !inputDisabled && !busy;
       Find<Button>("DisableInputButton").Visibility = controller.InputAvailable ? Visibility.Visible : Visibility.Collapsed;
-      Find<Button>("DirectButton").IsEnabled = ready && !busy;
-      Find<Button>("FirewallButton").IsEnabled = ready && !busy && !firewallPresent;
-      Find<Button>("DirectButton").Content = direct ? "Stop direct Wi-Fi" : "Create direct Wi-Fi";
-      Find<TextBox>("SsidText").IsEnabled = !direct && !busy;
-      Find<PasswordBox>("WifiPassword").IsEnabled = !direct && !busy;
+      // The helper exited without a STOPPED line (crash or Windows ended it).
+      if (lastDirect && !direct && directOn) { Footer("Direct connect stopped unexpectedly. See Activity log."); ResetDirect(); }
+      lastDirect = direct;
+      var toggle = Find<CheckBox>("DirectToggle");
+      toggle.IsChecked = direct;
+      toggle.IsEnabled = ready && !busy && wifiAvailable;
+      Find<Button>("FirewallButton").IsEnabled = ready && !busy && (!firewallPresent || !directFirewallPresent);
+      foreach (string name in new [] {"SsidText", "BandChoice", "WifiPassword", "NewPasswordButton"})
+        ((Control)window.FindName(name)).IsEnabled = !direct && !busy;
+      UpdateDirect(direct);
       string status = busy ? "Working…" : running ? (streaming ? "Streaming" : "Waiting for receiver") : "Host stopped";
       Text("StatusBadge", status);
       tray.SetStatus(status);
       Find<Ellipse>("StatusDot").Fill = new SolidColorBrush(running ? Color.FromRgb(91, 218, 166) : Color.FromRgb(153,166,186));
-      string address = direct
+      string address = direct && directOn
         ? (directAddress == null ? HostController.LocalAddress(controller.Port, true) : directAddress + ":" + controller.Port)
         : lanAddress == "unavailable" ? "No LAN IPv4 address"
         : lanAddress != null ? lanAddress + ":" + controller.Port
@@ -359,7 +498,7 @@ namespace WvdHost {
       if (allowClose) return;
       e.Cancel = true;
       if (closing) return;
-      closing = true; busy = true; timer.Stop(); Footer("Stopping capture, input and direct Wi-Fi…"); Refresh();
+      closing = true; busy = true; timer.Stop(); Footer("Stopping capture, input and direct connect…"); Refresh();
       await Task.Run(delegate { controller.Dispose(); });
       allowClose = true; window.Close();
     }

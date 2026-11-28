@@ -25,6 +25,69 @@ namespace WvdHost {
     public bool AllowInput, Synthetic, ScreenOff, NoAudio, GameDepth;
   }
 
+  // Direct-connect network name, password and band, kept between launches so
+  // Vision Pro rejoins a network it already knows. The password is encrypted
+  // for this Windows user (DPAPI) in the same store as pairings (%WVM_HOME% or
+  // %LOCALAPPDATA%\WVM).
+  public sealed class DirectSettings {
+    public string Ssid, Password, Band = "5";
+    // Was direct connect on when the panel last closed? Then it comes back on.
+    public bool Enabled;
+    static string FilePath {
+      get {
+        string home = Environment.GetEnvironmentVariable("WVM_HOME");
+        if (String.IsNullOrEmpty(home))
+          home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WVM");
+        return Path.Combine(home, "direct-connect.txt");
+      }
+    }
+    public static string NewPassword() {
+      // Typed on the visionOS keyboard while reading it off the PC screen:
+      // lowercase only, no look-alikes (0/o, 1/l/i), three groups of four.
+      // 31 symbols x 12 ~ 59 bits; bytes >= 248 are redrawn to avoid modulo bias.
+      const string alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+      var text = new StringBuilder();
+      var one = new byte[1];
+      using (var rng = RandomNumberGenerator.Create()) {
+        for (int count = 0; count < 12;) {
+          rng.GetBytes(one);
+          if (one[0] >= 248) continue;
+          if (count > 0 && count % 4 == 0) text.Append('-');
+          text.Append(alphabet[one[0] % alphabet.Length]);
+          ++count;
+        }
+      }
+      return text.ToString();
+    }
+    public static DirectSettings Load(string defaultSsid) {
+      var settings = new DirectSettings { Ssid = defaultSsid };
+      try {
+        foreach (string line in File.ReadAllLines(FilePath)) {
+          int split = line.IndexOf('=');
+          if (split < 0) continue;
+          string key = line.Substring(0, split), value = line.Substring(split + 1);
+          if (key == "ssid" && value.Length > 0) settings.Ssid = value;
+          if (key == "band" && (value == "5" || value == "auto" || value == "2.4")) settings.Band = value;
+          if (key == "enabled") settings.Enabled = value == "1";
+          if (key == "password") settings.Password = Encoding.UTF8.GetString(ProtectedData.Unprotect(
+            Convert.FromBase64String(value), null, DataProtectionScope.CurrentUser));
+        }
+      } catch { }  // missing or unreadable: start fresh
+      if (String.IsNullOrWhiteSpace(settings.Ssid) || Encoding.UTF8.GetByteCount(settings.Ssid) > 32)
+        settings.Ssid = defaultSsid;
+      try { HostController.ValidateDirect(settings.Ssid, settings.Password ?? ""); }
+      catch (ArgumentException) { settings.Password = NewPassword(); }
+      return settings;
+    }
+    public void Save() {
+      string path = FilePath;
+      Directory.CreateDirectory(Path.GetDirectoryName(path));
+      string secret = Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(Password), null,
+        DataProtectionScope.CurrentUser));
+      File.WriteAllLines(path, new [] {"ssid=" + Ssid, "band=" + Band, "enabled=" + (Enabled ? "1" : "0"), "password=" + secret});
+    }
+  }
+
   // Every role runs as a child process of this UI's kill-on-close job, started
   // from the single command-line host: ndisplay.exe <role>. Normal stops use an
   // event: the stream role releases/disarms input before the helper shuts down.
@@ -157,10 +220,10 @@ namespace WvdHost {
         } catch { StopCore(); throw; }
       });
     }
-    private static void End(ref Process process, ref EventWaitHandle signal) {
+    private static void End(ref Process process, ref EventWaitHandle signal, int graceMs = 3500) {
       if (signal != null) signal.Set();
       if (process != null) {
-        try { if (!process.HasExited && !process.WaitForExit(signal != null ? 3500 : 0)) process.Kill();
+        try { if (!process.HasExited && !process.WaitForExit(signal != null ? graceMs : 0)) process.Kill();
           process.WaitForExit(2000); } catch { }
         process.Dispose(); process = null;
       }
@@ -225,17 +288,32 @@ namespace WvdHost {
         Emit("UI_INPUT_DISABLED");
       });
     }
-    public Task ToggleDirectNetwork(string ssid, string password) {
+    public static void ValidateDirect(string ssid, string password) {
+      if (String.IsNullOrWhiteSpace(ssid) || Encoding.UTF8.GetByteCount(ssid) > 32)
+        throw new ArgumentException("Use a network name of 1–32 UTF-8 bytes.");
+      if (password.Length < 8 || password.Length > 63 || password.Any(c => c < 32 || c > 126))
+        throw new ArgumentException("Use a Wi-Fi password of 8–63 printable ASCII characters.");
+    }
+    // Direct connect: the network role turns this PC into the headset's access
+    // point (Mobile Hotspot, else a local-only Wi-Fi Direct network).
+    public Task StartDirectNetwork(string ssid, string password, string band) {
       return Task.Run(delegate {
-        if (NetworkRunning) { End(ref network, ref networkStop); return; }
-        if (String.IsNullOrWhiteSpace(ssid) || Encoding.UTF8.GetByteCount(ssid) > 32)
-          throw new ArgumentException("Use a network name of 1–32 UTF-8 bytes.");
-        if (password.Length < 8 || password.Length > 63 || password.Any(c => c < 32 || c > 126))
-          throw new ArgumentException("Use a Wi-Fi password of 8–63 printable ASCII characters.");
-        network = Spawn(new [] {"network", "--ssid", ssid,
+        if (NetworkRunning) return;
+        ValidateDirect(ssid, password);
+        network = Spawn(new [] {"network", "--ssid", ssid, "--band", band,
           "--stop-event", NewStopEvent(out networkStop)}, true);
         network.StandardInput.WriteLine(password); network.StandardInput.Close();
-        Emit("Creating direct Wi-Fi. No internet connection is required.");
+        Emit("Turning on direct connect (" + ssid + ").");
+      });
+    }
+    // Turning a hotspot off and restoring the user's hotspot settings can take
+    // several seconds; a kill would skip that restore.
+    private const int NetworkGraceMs = 10000;
+    public Task StopDirectNetwork() {
+      return Task.Run(delegate {
+        if (network == null) return;
+        End(ref network, ref networkStop, NetworkGraceMs);
+        Emit("DIRECT_WIFI_UI_STOPPED");
       });
     }
     // Runs a command line of the host executable and returns its output.
@@ -259,21 +337,38 @@ namespace WvdHost {
         }
       });
     }
+    // The address ICS gives the PC hosting a hotspot (see wvd/direct_link.h).
+    static IPAddress HotspotAddress() {
+      try {
+        var value = Microsoft.Win32.Registry.GetValue(
+          @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters", "ScopeAddress", null) as string;
+        IPAddress parsed;
+        if (value != null && IPAddress.TryParse(value, out parsed)) return parsed;
+      } catch { }
+      return IPAddress.Parse("192.168.137.1");
+    }
     public static string LocalAddress(int port, bool directOnly = false) {
       try {
+        var hotspot = HotspotAddress();
         var adapters = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up &&
           n.NetworkInterfaceType != NetworkInterfaceType.Loopback && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel);
-        if (directOnly) adapters = adapters.Where(n => n.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0);
-        var address = adapters.SelectMany(n => n.GetIPProperties().UnicastAddresses)
-          .Select(a => a.Address).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork &&
-          !IPAddress.IsLoopback(a) && (directOnly || !a.ToString().StartsWith("169.254.")));
+        var addresses = adapters.SelectMany(n => n.GetIPProperties().UnicastAddresses.Select(a => new { n, a.Address }))
+          .Where(x => x.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(x.Address)).ToList();
+        IPAddress address;
+        if (directOnly)  // the hotspot port may be named after the Wi-Fi card (MT7925) or "Wi-Fi Direct"
+          address = addresses.Where(x => x.Address.Equals(hotspot)).Select(x => x.Address).FirstOrDefault() ??
+            addresses.Where(x => x.n.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0 &&
+              !x.Address.ToString().StartsWith("169.254.")).Select(x => x.Address).FirstOrDefault();
+        else
+          address = addresses.Where(x => !x.Address.Equals(hotspot) && !x.Address.ToString().StartsWith("169.254."))
+            .Select(x => x.Address).FirstOrDefault();
         return address == null && directOnly ? "Waiting for direct Wi-Fi address…" :
           (address == null ? "127.0.0.1" : address.ToString()) + ":" + port;
       } catch { return directOnly ? "Waiting for direct Wi-Fi address…" : "127.0.0.1:" + port; }
     }
     public void Dispose() {
       if (disposed) return; disposed = true;
-      StopCore(); End(ref network, ref networkStop);
+      StopCore(); End(ref network, ref networkStop, NetworkGraceMs);
       if (job != IntPtr.Zero) CloseHandle(job);
     }
     [StructLayout(LayoutKind.Sequential)] private struct BasicLimits {

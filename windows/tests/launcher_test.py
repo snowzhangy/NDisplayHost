@@ -34,6 +34,15 @@ try:
         result = run("network", ["--ssid", ssid], password + "\n")
         assert result.returncode == 2, (ssid, result.returncode, result.stderr)
         assert "DIRECT_WIFI_STARTED" not in result.stdout
+    # Direct connect backend/band choices are validated before any radio use.
+    for extra in (["--mode", "router"], ["--band", "60"], ["--band"], ["--mode"]):
+        result = run("network", ["--ssid", "WVD-Test"] + extra, "TestPassword123\n")
+        assert result.returncode == 2, (extra, result.returncode, result.stderr)
+        assert "DIRECT_WIFI_STARTED" not in result.stdout
+    for extra in (["--mode", "hotspot", "--band", "5"], ["--mode", "legacy", "--band", "auto"]):
+        result = run("network", ["--ssid", "WVD-Stop-Test", "--stop-event", name] + extra, "TestPassword123\n")
+        assert result.returncode == 0, (extra, result.stderr)
+        assert "DIRECT_WIFI_STARTED" not in result.stdout
     for value in ("0", "65536", "abc", "47800garbage"):
         assert run("stream", ["--listen", value]).returncode == 2, value
     kernel.ResetEvent.argtypes = [ctypes.c_void_p]

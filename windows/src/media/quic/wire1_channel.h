@@ -362,6 +362,7 @@ class Wire1Channel : public MediaChannel,
   uint64_t statWindowStartUs_ = 0;
   uint32_t idrCount_ = 0;
   double lossPercent_ = 0, rttMs_ = 0;
+  uint64_t fecHoldUntilUs_ = 0;  // UpdateFecFromStats: elevated FEC held until
   // Audio packet splitting: WIRE wants <=5 ms datagrams that fit the path.
   uint32_t audioSeq_ = 0;
 };

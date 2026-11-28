@@ -761,7 +761,19 @@ void Wire1Channel::UpdateFecFromStats(const msg::ClientStats& stats) {
   lossPercent_ = loss * 100.0;
   rttMs_ = double(stats.rttUs) / 1000.0;
   // Reference: ceil-ish loss*3 + 5%, clamped to 6..30%.
-  packetCfg_.fecRatio = Clamp(0.05 + loss * 3.0, 0.06, 0.30);
+  const double target = Clamp(0.05 + loss * 3.0, 0.06, 0.30);
+  // Rise at once, then hold. Wi-Fi loss comes in bursts that repeat (a
+  // headset or PC radio scanning every ~10-15 s): dropping back to the floor
+  // in the first clean window left every next burst unprotected. Hold the
+  // level for 30 s after the last loss, then ease down 2 points a window.
+  constexpr uint64_t kFecHoldUs = 30'000'000;
+  const uint64_t now = HostMicroseconds();
+  if (target >= packetCfg_.fecRatio) {
+    packetCfg_.fecRatio = target;
+    if (target > 0.06) fecHoldUntilUs_ = now + kFecHoldUs;
+  } else if (now >= fecHoldUntilUs_) {
+    packetCfg_.fecRatio = (std::max)(target, packetCfg_.fecRatio - 0.02);
+  }
 }
 
 // ---- outbound media ---------------------------------------------------------
@@ -1097,6 +1109,11 @@ void Wire1Channel::OnMedia(const MediaPayloadHeader& mh, const uint8_t* au, size
   desc.picSeq = mh.picSeq;
   desc.contentVer = mh.contentVer;
   desc.randomAccess = (mh.flags & 1u) != 0;
+  // A lost keyframe costs a stall plus another keyframe; a lost P-frame only
+  // the pictures up to the next one. Keyframes get double parity, at least
+  // 25%, within the RS block limit (24 parity per 48 data shards = 50%).
+  if (desc.randomAccess)
+    packetConfig.fecRatio = Clamp(packetConfig.fecRatio * 2.0, 0.25, 0.50);
   desc.refinement = (mh.flags & 2u) != 0;
   // Packed bit3 -> WIRE.md §4.1 flag bit4 DEPTH_VALID (identical on data,
   // parity and retransmissions; the Packetizer stamps it from the descriptor).

@@ -20,7 +20,7 @@ file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/MainWindow.xaml" WVD_XAML)
 add_custom_command(OUTPUT "${WVD_UI_EXE}"
   COMMAND "${WVD_CSC}" /nologo /target:winexe /platform:x64 /optimize+ /utf8output
     "/out:${WVD_UI_EXE}" /reference:System.dll /reference:System.Core.dll /reference:System.Xaml.dll
-    /reference:System.Drawing.dll /reference:System.Windows.Forms.dll
+    /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Security.dll
     "/reference:${WVD_FRAMEWORK}/WPF/WindowsBase.dll"
     "/reference:${WVD_FRAMEWORK}/WPF/PresentationCore.dll"
     "/reference:${WVD_FRAMEWORK}/WPF/PresentationFramework.dll"
