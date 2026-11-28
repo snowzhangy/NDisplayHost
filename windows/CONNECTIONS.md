@@ -65,14 +65,20 @@ connect is on and restored afterwards.
   session asks Windows to favour hotspot traffic (`TetheringOverStation`).
   If the PC's router link is 2.4 GHz, the headset network is forced to
   2.4 GHz too, and the panel warns about it.
-* While direct connect is on, the helper turns on WLAN *media streaming mode*
-  and turns off *background scanning* on the PC's Wi-Fi card
-  (`WlanSetInterface`, no elevation). A background scan takes the shared
-  radio off the headset's channel. Measured on an MT7925 before this change:
-  a 1–2 s loss burst (10–30% loss, RTT flat) every 12–15 s. Both settings
-  are restored when direct connect stops, and Windows also reverts them if
-  the helper exits. Side effect while on: the PC's own Wi-Fi does not roam
-  or refresh its list of nearby networks.
+* **Close Settings on Vision Pro after joining.** While the Settings → Wi-Fi
+  page stays open, visionOS rescans for networks every ~14 s and leaves the
+  channel for ~2 s each time: a regular "Recovering stream" stall. Measured
+  2026-11-27 on an MT7925: during every stall a ping to the headset went to
+  80–240 ms with losses while a ping to the router, over the same PC radio
+  and channel, stayed at 1–5 ms. Closing Settings ended the stalls. The panel
+  says so in the join steps.
+* As a precaution, while direct connect is on the helper also turns on WLAN
+  *media streaming mode* and turns off *background scanning* on the PC's
+  Wi-Fi card (`WlanSetInterface`, no elevation), so the PC's own scans do not
+  take the shared radio off the headset's channel. Both settings are restored
+  when direct connect stops, and Windows also reverts them if the helper
+  exits. Side effect while on: the PC's own Wi-Fi does not roam or refresh
+  its list of nearby networks.
 * `netsh wlan show wirelesscapabilities` lists "Wi-Fi Direct GO" and "P2P GO on
   5 GHz" support for an adapter.
 

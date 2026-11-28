@@ -380,7 +380,7 @@ namespace WvdHost {
       else if ((value = After(line, "DIRECT_WIFI_NOTE ")) != null) Footer(value);
       else if (line == "DIRECT_WIFI_STARTED") {
         directOn = true; directFailure = null;
-        Footer("Direct connect is on. On Vision Pro, open Settings → Wi-Fi and join “" + DirectSsid + "”.");
+        Footer("Direct connect is on. On Vision Pro, open Settings → Wi-Fi, join “" + DirectSsid + "”, then close Settings.");
       }
       else if (line == "DIRECT_WIFI_STOPPED" || line == "DIRECT_WIFI_UI_STOPPED") {
         if (directOn) Footer("Direct connect is off. Vision Pro returns to its usual Wi-Fi.");
@@ -410,8 +410,8 @@ namespace WvdHost {
         if (!directFirewallPresent) details.Add("Windows Firewall is blocking the headset: click Allow through firewall.");
         status = String.Join(" ", details);
         hint = streaming ? "Connected directly to this PC. Turning direct connect off returns Vision Pro to its usual Wi-Fi."
-          : joined ? "In NDisplay on Vision Pro, select “" + pc + "”: it shows as online. The first time only, confirm the same pairing code on both devices."
-          : "On Vision Pro, join “" + DirectSsid + "” with the password shown. NDisplay then finds “" + pc + "” by itself.";
+          : joined ? "Close Settings on Vision Pro, then in NDisplay select “" + pc + "”: it shows as online. The first time only, confirm the same pairing code on both devices."
+          : "On Vision Pro, join “" + DirectSsid + "” with the password shown, then close Settings. NDisplay then finds “" + pc + "” by itself.";
       } else if (running) {
         state = "Turning on…";
         status = "This takes a few seconds.";

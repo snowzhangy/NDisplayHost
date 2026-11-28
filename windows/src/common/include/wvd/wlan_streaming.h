@@ -4,8 +4,13 @@
 // Windows periodically background-scans on a connected Wi-Fi interface
 // (roaming, location, network list). A scan takes the radio off-channel for a
 // moment. With direct connect the same single radio also hosts the headset's
-// network, so every scan drops video for ~1-2 s: measured on an MT7925 as a
-// loss burst (10-30%, RTT flat) every 12-15 s.
+// network, so a PC scan would drop the headset's video too. This is a
+// precaution: the regular ~2 s stalls every ~14 s seen on direct connect were
+// the HEADSET scanning while its Settings → Wi-Fi page stayed open (a ping to
+// the router over this same radio stayed at 1-5 ms through every stall).
+//
+// Only the station interface is listed by WlanEnumInterfaces; the Mobile
+// Hotspot port is not, and needs nothing: it shares the station's channel.
 //
 // WlanSetInterface lets an unelevated process turn on media streaming mode
 // and turn off background scanning. Both are tied to the WLAN client handle:
